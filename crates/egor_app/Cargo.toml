@@ -10,15 +10,19 @@ keywords = ["egor"]
 
 [features]
 default = []
+android-native-activity = ["winit/android-native-activity"]
+android-game-activity = ["winit/android-game-activity"]
 log = [
     "dep:log",
     "dep:env_logger",
     "dep:console_log",
     "dep:console_error_panic_hook",
+    "dep:android_logger",
 ]
 
 [dependencies]
 log = { version = "0.4.27", optional = true }
+winit = "0.30.12"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = { version = "0.1.7", optional = true }
@@ -30,8 +34,5 @@ wasm-bindgen-futures = "0.4.50"
 env_logger = { version = "0.11.8", optional = true }
 pollster = "0.4.0"
 
-[target.'cfg(not(target_os = "android"))'.dependencies]
-winit = "0.30.12"
-
 [target.'cfg(target_os = "android")'.dependencies]
-winit = { version = "0.30.12", features = ["android-native-activity"] }
+android_logger = { version = "0.15.1", optional = true }

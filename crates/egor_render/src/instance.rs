@@ -1,21 +1,21 @@
 use wgpu::{BufferAddress, VertexAttribute, VertexBufferLayout, VertexFormat, VertexStepMode};
 
-/// Per-instance data for 2D instanced drawing (56 bytes)
+/// Per-instance data for 2D instanced drawing (60 bytes)
 ///
 /// Uses a compact 2D affine representation instead of a full `mat4x4`:
 /// - `affine`: column-major 2×2 rotation+scale matrix `[col0.x, col0.y, col1.x, col1.y]`
-/// - `translate`: world-space translation `[x, y]`
+/// - `translate`: world-space translation `[x, y, z]` where Z is used for depth testing
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Instance {
     pub affine: [f32; 4],
-    pub translate: [f32; 2],
+    pub translate: [f32; 3],
     pub color: [f32; 4],
     pub uv: [f32; 4],
 }
 
 impl Instance {
-    pub fn new(affine: [f32; 4], translate: [f32; 2], color: [f32; 4], uv: [f32; 4]) -> Self {
+    pub fn new(affine: [f32; 4], translate: [f32; 3], color: [f32; 4], uv: [f32; 4]) -> Self {
         Self {
             affine,
             translate,
@@ -36,21 +36,21 @@ impl Instance {
                     shader_location: 3,
                     format: VertexFormat::Float32x4,
                 },
-                // translate
+                // translate (x, y, z)
                 VertexAttribute {
                     offset: 16,
                     shader_location: 4,
-                    format: VertexFormat::Float32x2,
+                    format: VertexFormat::Float32x3,
                 },
                 // color
                 VertexAttribute {
-                    offset: 24,
+                    offset: 28,
                     shader_location: 5,
                     format: VertexFormat::Float32x4,
                 },
                 // uv rect
                 VertexAttribute {
-                    offset: 40,
+                    offset: 44,
                     shader_location: 6,
                     format: VertexFormat::Float32x4,
                 },
@@ -61,7 +61,7 @@ impl Instance {
     pub(crate) fn identity() -> Self {
         Self {
             affine: [1.0, 0.0, 0.0, 1.0],
-            translate: [0.0, 0.0],
+            translate: [0.0, 0.0, 0.0],
             color: [1.0; 4],
             uv: [0.0, 0.0, 1.0, 1.0],
         }

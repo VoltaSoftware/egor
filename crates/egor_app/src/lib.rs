@@ -1,13 +1,19 @@
 pub mod input;
 pub mod time;
 
+#[cfg(all(
+    target_os = "android",
+    not(any(feature = "android-native-activity", feature = "android-game-activity"))
+))]
+compile_error!("On Android, enable either the `android-native-activity` or `android-game-activity` feature for egor_app");
+
 use crate::{input::Input, time::FrameTimer};
 use std::sync::Arc;
 pub use winit::{
     dpi::PhysicalSize,
-    event::WindowEvent,
+    event::{DeviceEvent, DeviceId, StartCause, WindowEvent},
     event_loop::ControlFlow,
-    window::{Fullscreen, Window},
+    window::{Fullscreen, Icon, Window},
 };
 
 #[cfg(target_os = "android")]
@@ -37,6 +43,7 @@ pub struct AppConfig {
     pub max_size: Option<(u32, u32)>,
     pub simulate_touch_with_mouse: bool,
     pub simulate_mouse_with_touch: bool,
+    pub icon: Option<winit::window::Icon>,
 }
 
 impl Default for AppConfig {
@@ -54,6 +61,7 @@ impl Default for AppConfig {
             max_size: None,
             simulate_touch_with_mouse: false,
             simulate_mouse_with_touch: false,
+            icon: None,
         }
     }
 }
@@ -78,6 +86,16 @@ pub trait AppHandler<R> {
     fn frame(&mut self, _window: &Window, _resource: &mut R, _input: &Input, _timer: &FrameTimer) {}
     /// Called on window resize
     fn resize(&mut self, _w: u32, _h: u32, _resource: &mut R) {}
+    /// Called when new events arrive, before they are dispatched
+    fn new_events(&mut self, _cause: StartCause) {}
+    /// Called when all queued events have been processed
+    fn about_to_wait(&mut self) {}
+    /// Called when the event loop is shutting down
+    fn exiting(&mut self) {}
+    /// Called when the OS signals memory pressure (mobile platforms)
+    fn memory_warning(&mut self) {}
+    /// Called for raw device events (e.g. gamepad, unprocessed input)
+    fn device_event(&mut self, _device_id: DeviceId, _event: &DeviceEvent) {}
 }
 
 /// Generic application entry point
@@ -98,11 +116,7 @@ pub struct AppRunner<R: 'static, H: AppHandler<R> + 'static> {
 #[doc(hidden)]
 impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, H> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if let (Some(window), Some(resource), Some(handler)) = (
-            self.window.clone(),
-            self.resource.as_mut(),
-            self.handler.as_mut(),
-        ) {
+        if let (Some(window), Some(resource), Some(handler)) = (self.window.clone(), self.resource.as_mut(), self.handler.as_mut()) {
             handler.resumed(window, resource);
         }
 
@@ -122,6 +136,7 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
             .with_resizable(self.config.resizable)
             .with_maximized(self.config.maximized)
             .with_fullscreen(fullscreen)
+            .with_window_icon(self.config.icon.take())
             .with_decorations(self.config.decorations);
 
         if let (Some(w), Some(h)) = (self.config.width, self.config.height) {
@@ -135,6 +150,7 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
 
         let window = Arc::new(event_loop.create_window(win_attrs).unwrap());
         self.window = Some(window.clone());
+        self.input.set_scale_factor(window.scale_factor());
 
         if let Some((w, h)) = self.config.min_size {
             window.set_min_inner_size(Some(PhysicalSize::new(w, h)));
@@ -173,8 +189,7 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => {
                 let Some(window) = &self.window else { return };
-                let (Some(resource), Some(handler)) = (&mut self.resource, &mut self.handler)
-                else {
+                let (Some(resource), Some(handler)) = (&mut self.resource, &mut self.handler) else {
                     return;
                 };
 
@@ -191,9 +206,7 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
                     return;
                 }
 
-                if let (Some(resource), Some(handler)) =
-                    (self.resource.as_mut(), self.handler.as_mut())
-                {
+                if let (Some(resource), Some(handler)) = (self.resource.as_mut(), self.handler.as_mut()) {
                     handler.resize(size.width, size.height, resource);
                 }
             }
@@ -216,6 +229,12 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
             WindowEvent::Touch(touch) => {
                 self.input.update_touch(touch);
             }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.input.set_scale_factor(scale_factor);
+            }
+            WindowEvent::Ime(ime) => {
+                self.input.handle_ime(ime);
+            }
             _ => {}
         }
     }
@@ -231,6 +250,36 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
 
         self.resource = Some(resource);
         self.handler = Some(handler);
+    }
+
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
+        if let Some(handler) = self.handler.as_mut() {
+            handler.new_events(cause);
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(handler) = self.handler.as_mut() {
+            handler.about_to_wait();
+        }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(handler) = self.handler.as_mut() {
+            handler.exiting();
+        }
+    }
+
+    fn memory_warning(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(handler) = self.handler.as_mut() {
+            handler.memory_warning();
+        }
+    }
+
+    fn device_event(&mut self, _event_loop: &ActiveEventLoop, device_id: DeviceId, event: DeviceEvent) {
+        if let Some(handler) = self.handler.as_mut() {
+            handler.device_event(device_id, &event);
+        }
     }
 }
 
@@ -260,7 +309,7 @@ impl<R, H: AppHandler<R> + 'static> AppRunner<R, H> {
         #[cfg(target_os = "android")]
         {
             #[cfg(feature = "log")]
-            android_logger::init_once(Default::default().with_max_level(log::LevelFilter::Info));
+            android_logger::init_once(android_logger::Config::default().with_max_level(log::LevelFilter::Info));
 
             use winit::platform::android::EventLoopBuilderExtAndroid;
             let android_app = ANDROID_APP.get().unwrap().clone();
@@ -276,7 +325,10 @@ impl<R, H: AppHandler<R> + 'static> AppRunner<R, H> {
             #[cfg(feature = "log")]
             {
                 std::panic::set_hook(Box::new(console_error_panic_hook::hook));
-                console_log::init_with_level(log::Level::Error).unwrap();
+                // Use .ok() instead of .unwrap() — a logger may already be installed
+                // by the host application (e.g. the web client sets up its own logger
+                // before calling App::run()).
+                let _ = console_log::init_with_level(log::Level::Error);
             }
 
             use winit::platform::web::EventLoopExtWebSys;
@@ -287,7 +339,7 @@ impl<R, H: AppHandler<R> + 'static> AppRunner<R, H> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             #[cfg(all(feature = "log", not(target_os = "android")))]
-            env_logger::init_from_env(env_logger::Env::default().default_filter_or("error"));
+            let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("error")).try_init();
 
             event_loop.run_app(&mut self).unwrap();
         }

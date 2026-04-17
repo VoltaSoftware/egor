@@ -18,28 +18,31 @@ vulkan = ["wgpu/vulkan"]
 [dependencies]
 bytemuck = "1.23.0"
 image = { version = "0.25.6", default-features = false, features = ["png"] }
+log = "0.4"
 
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
-wgpu = { version = "25.0.0", default-features = false, features = [
+wgpu = { version = "29.0.1", default-features = false, features = [
     "wgsl",
     "vulkan",
 ] }
 [target.'cfg(target_os = "windows")'.dependencies]
-wgpu = { version = "25.0.0", default-features = false, features = [
+wgpu = { version = "29.0.1", default-features = false, features = [
     "wgsl",
     "dx12",
 ] }
 [target.'cfg(target_os = "macos")'.dependencies]
-wgpu = { version = "25.0.0", default-features = false, features = [
+wgpu = { version = "29.0.1", default-features = false, features = [
     "wgsl",
     "metal",
 ] }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-wgpu = { version = "25.0.0", default-features = false, features = [
+wgpu = { version = "29.0.1", default-features = false, features = [
     "wgsl",
     "webgpu",
 ] }
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement"] }
+wasm-bindgen = "0.2"
 
 [dev-dependencies]
 winit = "0.30.12"

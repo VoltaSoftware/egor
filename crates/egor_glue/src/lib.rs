@@ -4,7 +4,5 @@ pub mod color;
 pub mod graphics;
 pub mod math;
 pub mod primitives;
+pub mod profiling;
 pub mod text;
-
-#[cfg(feature = "ui")]
-pub mod ui;

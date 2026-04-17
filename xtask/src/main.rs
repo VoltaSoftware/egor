@@ -49,11 +49,9 @@ struct Bin {
 
 fn read_bin_name(demo_dir: &Path) -> String {
     let manifest_path = demo_dir.join("Cargo.toml");
-    let manifest_str = fs::read_to_string(&manifest_path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", manifest_path.display()));
+    let manifest_str = fs::read_to_string(&manifest_path).unwrap_or_else(|e| panic!("failed to read {}: {e}", manifest_path.display()));
 
-    let manifest: Manifest = toml::from_str(&manifest_str)
-        .unwrap_or_else(|e| panic!("failed to parse {}: {e}", manifest_path.display()));
+    let manifest: Manifest = toml::from_str(&manifest_str).unwrap_or_else(|e| panic!("failed to parse {}: {e}", manifest_path.display()));
 
     manifest
         .bins
@@ -66,10 +64,7 @@ fn read_bin_name(demo_dir: &Path) -> String {
 impl Cmd {
     fn run(&self) {
         let Cmd::Run {
-            demo,
-            release,
-            features,
-            ..
+            demo, release, features, ..
         } = self;
 
         let mut features = features.clone();
@@ -98,17 +93,12 @@ impl Cmd {
                 cmd.arg("serve");
                 cmd
             }
-            Cmd::Run {
-                android: Some(device),
-                ..
-            } => {
+            Cmd::Run { android: Some(device), .. } => {
                 let mut cmd = Command::new("x");
                 cmd.args(["run", "--arch", "arm64", "--device", device]);
                 cmd
             }
-            Cmd::Run {
-                hot_reload: true, ..
-            } => {
+            Cmd::Run { hot_reload: true, .. } => {
                 features.push("hot_reload".to_string());
 
                 let mut cmd = Command::new("dx");
