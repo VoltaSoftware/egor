@@ -387,8 +387,8 @@ impl ScreenCaptureState {
             label: None,
             address_mode_u: egor_render::wgpu::AddressMode::ClampToEdge,
             address_mode_v: egor_render::wgpu::AddressMode::ClampToEdge,
-            mag_filter: egor_render::wgpu::FilterMode::Linear,
-            min_filter: egor_render::wgpu::FilterMode::Linear,
+            mag_filter: egor_render::wgpu::FilterMode::Nearest,
+            min_filter: egor_render::wgpu::FilterMode::Nearest,
             ..Default::default()
         });
 
@@ -1003,6 +1003,22 @@ impl<'a> Graphics<'a> {
     pub fn polygon(&mut self) -> PolygonBuilder<'_> {
         PolygonBuilder::new(self.batch, self.current_shader)
     }
+
+    /// Push raw vertex/index geometry directly into the current untextured batch.
+    /// Vertices must have positions in world space and colors as RGBA \[0..1\].
+    /// Indices reference vertices in the provided slice (0-based); they are
+    /// automatically offset to match the batch's vertex base.
+    pub fn push_geometry(&mut self, verts: &[egor_render::vertex::Vertex], indices: &[u16]) {
+        let vert_count = verts.len();
+        let idx_count = indices.len();
+        if let Some((v_slice, i_slice, base)) = self.batch.allocate(vert_count, idx_count, None, self.current_shader) {
+            v_slice.copy_from_slice(verts);
+            for (i, idx) in indices.iter().enumerate() {
+                i_slice[i] = *idx + base;
+            }
+        }
+    }
+
     /// Start building a polyline (stroked path) primitive
     pub fn polyline(&mut self) -> PolylineBuilder<'_> {
         PolylineBuilder::new(self.batch, self.current_shader)
@@ -1026,6 +1042,11 @@ impl<'a> Graphics<'a> {
     /// Typically called once during initialization (when `timer.frame == 0`).
     pub fn load_texture(&mut self, data: &[u8]) -> usize {
         self.renderer.add_texture(data)
+    }
+
+    /// Load a texture with nearest-neighbor (pixel-perfect) filtering
+    pub fn load_texture_nearest(&mut self, data: &[u8]) -> usize {
+        self.renderer.add_texture_nearest(data)
     }
 
     /// Create a texture from raw RGBA8 pixel data.

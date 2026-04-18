@@ -75,6 +75,7 @@ pub mod render {
     pub use egor_render::{
         MemoryHints,
         target::{OffscreenTarget, RenderTarget},
+        vertex::Vertex,
     };
 }
 

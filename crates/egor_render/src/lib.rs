@@ -549,6 +549,11 @@ impl Renderer {
         self.textures.insert(&self.gpu.device, &self.gpu.queue, data)
     }
 
+    /// Adds a new texture from image bytes with nearest-neighbor filtering & returns its id
+    pub fn add_texture_nearest(&mut self, data: &[u8]) -> usize {
+        self.textures.insert_nearest(&self.gpu.device, &self.gpu.queue, data)
+    }
+
     /// Adds a texture from raw RGBA bytes & returns its id
     pub fn add_texture_raw(&mut self, w: u32, h: u32, data: &[u8]) -> usize {
         self.textures.insert_raw(&self.gpu.device, &self.gpu.queue, w, h, data)

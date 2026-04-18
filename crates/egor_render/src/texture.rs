@@ -116,6 +116,7 @@ impl Texture {
 pub(crate) struct Textures {
     layout: BindGroupLayout,
     default_sampler: Sampler,
+    nearest_sampler: Sampler,
     linear_clamp_sampler: Sampler,
     default_texture: Texture,
     store: Vec<Texture>,
@@ -150,8 +151,14 @@ impl Textures {
         let linear_clamp_sampler = device.create_sampler(&SamplerDescriptor {
             address_mode_u: AddressMode::ClampToEdge,
             address_mode_v: AddressMode::ClampToEdge,
-            mag_filter: FilterMode::Linear,
-            min_filter: FilterMode::Linear,
+            mag_filter: FilterMode::Nearest,
+            min_filter: FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        let nearest_sampler = device.create_sampler(&SamplerDescriptor {
+            mag_filter: FilterMode::Nearest,
+            min_filter: FilterMode::Nearest,
             ..Default::default()
         });
 
@@ -160,6 +167,7 @@ impl Textures {
         Self {
             layout,
             default_sampler,
+            nearest_sampler,
             linear_clamp_sampler,
             default_texture,
             store: Vec::new(),
@@ -195,6 +203,14 @@ impl Textures {
 
     pub fn replace_raw(&mut self, device: &Device, queue: &Queue, id: usize, w: u32, h: u32, data: &[u8]) {
         self.store[id] = Texture::from_bytes(device, queue, &self.layout, &self.default_sampler, data, w, h);
+    }
+
+    pub fn insert_nearest(&mut self, device: &Device, queue: &Queue, data: &[u8]) -> usize {
+        let (w, h, img) = Self::decode_rgba(data);
+        let id = self.store.len();
+        self.store
+            .push(Texture::from_bytes(device, queue, &self.layout, &self.nearest_sampler, &img, w, h));
+        id
     }
 
     pub fn insert_offscreen(&mut self, device: &Device, offscreen: &OffscreenTarget) -> usize {
