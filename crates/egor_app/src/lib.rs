@@ -196,10 +196,6 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
                 self.timer.update();
                 handler.frame(window, resource, &self.input, &self.timer);
                 self.input.end_frame();
-
-                if self.config.control_flow == ControlFlow::Poll {
-                    window.request_redraw();
-                }
             }
             WindowEvent::Resized(size) => {
                 if size.width == 0 || size.height == 0 {
@@ -259,6 +255,12 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if self.config.control_flow == ControlFlow::Poll
+            && let Some(window) = &self.window
+        {
+            window.request_redraw();
+        }
+
         if let Some(handler) = self.handler.as_mut() {
             handler.about_to_wait();
         }

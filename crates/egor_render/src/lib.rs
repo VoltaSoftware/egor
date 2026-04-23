@@ -84,10 +84,13 @@ impl Renderer {
             info.name,
             info.driver
         );
+        #[cfg(target_arch = "wasm32")]
+        let required_limits = wgpu::Limits::downlevel_webgl2_defaults();
+        #[cfg(not(target_arch = "wasm32"))]
+        let required_limits = adapter.limits();
         let (device, queue) = adapter
             .request_device(&DeviceDescriptor {
-                #[cfg(target_arch = "wasm32")]
-                required_limits: wgpu::Limits::downlevel_webgl2_defaults(),
+                required_limits,
                 memory_hints: memory_hints.clone(),
                 ..Default::default()
             })
