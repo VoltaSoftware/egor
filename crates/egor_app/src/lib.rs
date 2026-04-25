@@ -147,6 +147,13 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
             use winit::platform::web::WindowAttributesExtWebSys;
             win_attrs = win_attrs.with_append(true);
         }
+        #[cfg(target_os = "ios")]
+        {
+            use winit::platform::ios::{ScreenEdge, WindowAttributesExtIOS};
+            win_attrs = win_attrs
+                .with_prefers_home_indicator_hidden(true)
+                .with_preferred_screen_edges_deferring_system_gestures(ScreenEdge::ALL);
+        }
 
         let window = Arc::new(event_loop.create_window(win_attrs).unwrap());
         self.window = Some(window.clone());
