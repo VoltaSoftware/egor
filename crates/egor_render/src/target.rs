@@ -103,7 +103,7 @@ impl RenderTarget for Backbuffer {
                 None
             }
             other => {
-                eprintln!("Surface error: {:?}", other);
+                //eprintln!("Surface error: {:?}", other);
                 None
             }
         }
