@@ -18,6 +18,18 @@ use egor_render::{
 
 type UpdateFn = dyn FnMut(&mut FrameContext);
 
+fn window_surface_size(window: &Window) -> PhysicalSize<u32> {
+    #[cfg(target_os = "ios")]
+    {
+        window.outer_size()
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    {
+        window.inner_size()
+    }
+}
+
 pub struct AppControl<'a> {
     window: &'a Window,
     requested_size: Option<(u32, u32)>,
@@ -258,7 +270,7 @@ impl AppHandler<Renderer> for App {
 
     async fn with_resource(&mut self, window: Arc<Window>) -> Renderer {
         // WebGPU throws error 'size is zero' if not set
-        let size = window.inner_size();
+        let size = window_surface_size(&window);
         let (w, h) = (
             if size.width == 0 { 800 } else { size.width },
             if size.height == 0 { 600 } else { size.height },
@@ -280,7 +292,8 @@ impl AppHandler<Renderer> for App {
         self.backbuffer.as_mut().unwrap().set_vsync(device, self.vsync);
         self.text_renderer = Some(TextRenderer::new(device, renderer.queue(), format));
 
-        self.resize(window.inner_size().width, window.inner_size().height, renderer);
+        let size = window_surface_size(window);
+        self.resize(size.width, size.height, renderer);
     }
 
     fn frame(&mut self, _window: &Window, renderer: &mut Renderer, input: &Input, timer: &FrameTimer) {
@@ -684,7 +697,7 @@ impl AppHandler<Renderer> for App {
     }
 
     fn resumed(&mut self, window: Arc<Window>, renderer: &mut Renderer) {
-        let size = window.inner_size();
+        let size = window_surface_size(&window);
         let device = renderer.device();
         let mut backbuffer = Backbuffer::new(renderer.instance(), renderer.adapter(), device, window, size.width, size.height);
         backbuffer.set_vsync(device, self.vsync);
