@@ -11,7 +11,7 @@ use egor_app::{
     AppConfig, AppHandler, AppRunner, ControlFlow, Fullscreen, PhysicalSize, Window, WindowEvent, input::Input, time::FrameTimer,
 };
 use egor_render::{
-    MemoryHints, Renderer,
+    MemoryHints, Renderer, TextureFormat,
     instance::Instance,
     target::{Backbuffer, RenderTarget},
 };
@@ -27,6 +27,58 @@ fn window_surface_size(window: &Window) -> PhysicalSize<u32> {
     #[cfg(not(target_os = "ios"))]
     {
         window.inner_size()
+    }
+}
+
+struct CaptureFrameTarget {
+    _texture: egor_render::Texture,
+    view: egor_render::wgpu::TextureView,
+    width: u32,
+    height: u32,
+    format: TextureFormat,
+}
+
+impl CaptureFrameTarget {
+    fn new(device: &egor_render::Device, width: u32, height: u32, format: TextureFormat) -> Self {
+        let width = width.max(1);
+        let height = height.max(1);
+        let texture = device.create_texture(&egor_render::wgpu::TextureDescriptor {
+            label: Some("Screen Capture Frame Target"),
+            size: egor_render::wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: egor_render::wgpu::TextureDimension::D2,
+            format,
+            usage: egor_render::wgpu::TextureUsages::RENDER_ATTACHMENT | egor_render::wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        Self {
+            _texture: texture,
+            view,
+            width,
+            height,
+            format,
+        }
+    }
+
+    fn ensure(slot: &mut Option<Self>, device: &egor_render::Device, width: u32, height: u32, format: TextureFormat) {
+        let width = width.max(1);
+        let height = height.max(1);
+        let needs_new = slot
+            .as_ref()
+            .is_none_or(|target| target.width != width || target.height != height || target.format != format);
+        if needs_new {
+            *slot = Some(Self::new(device, width, height, format));
+        }
+    }
+
+    fn view(&self) -> &egor_render::wgpu::TextureView {
+        &self.view
     }
 }
 
@@ -87,6 +139,7 @@ pub struct App {
     memory_hints: MemoryHints,
     render_targets: RenderTargetStore,
     screen_capture: ScreenCaptureState,
+    capture_frame_target: Option<CaptureFrameTarget>,
     offscreen_batches: Vec<PrimitiveBatch>,
     instance_byte_offsets: Vec<u64>,
 }
@@ -112,6 +165,7 @@ impl App {
             primitive_batch: PrimitiveBatch::default(),
             render_targets: RenderTargetStore::new(),
             screen_capture: ScreenCaptureState::new(),
+            capture_frame_target: None,
             offscreen_batches: Vec::new(),
             instance_byte_offsets: Vec::new(),
         }
@@ -436,6 +490,18 @@ impl AppHandler<Renderer> for App {
 
         let _t_upload = web_time::Instant::now();
 
+        let capture_active = self.screen_capture.is_requested();
+        let use_capture_frame_target = capture_active && !backbuffer.supports_copy_src();
+        if use_capture_frame_target {
+            CaptureFrameTarget::ensure(&mut self.capture_frame_target, &device, w, h, format);
+        }
+        let capture_frame_view = if use_capture_frame_target {
+            self.capture_frame_target.as_ref().map(CaptureFrameTarget::view)
+        } else {
+            None
+        };
+        let main_view = capture_frame_view.unwrap_or(&frame.view);
+
         {
             #[cfg(feature = "profiling")]
             profiling::scope!("render_pass");
@@ -475,7 +541,7 @@ impl AppHandler<Renderer> for App {
                         if is_first {
                             first_pass_on_backbuffer = false;
                         }
-                        (&frame.view, renderer.depth_view(), is_first)
+                        (main_view, renderer.depth_view(), is_first)
                     };
 
                     let (rt_w, rt_h) = if let Some(rt_id) = group_rt {
@@ -560,7 +626,7 @@ impl AppHandler<Renderer> for App {
                 }
 
                 if batches.is_empty() {
-                    let mut r_pass = renderer.begin_render_pass(&mut frame.encoder, &frame.view);
+                    let mut r_pass = renderer.begin_render_pass(&mut frame.encoder, main_view);
                     if has_text {
                         text_renderer.render(&mut r_pass);
                     }
@@ -568,7 +634,7 @@ impl AppHandler<Renderer> for App {
             } else {
                 // Single render pass (no render target overrides)
                 {
-                    let mut r_pass = renderer.begin_render_pass(&mut frame.encoder, &frame.view);
+                    let mut r_pass = renderer.begin_render_pass(&mut frame.encoder, main_view);
 
                     if let Some(first) = batches.first() {
                         renderer.bind_pass_state(&mut r_pass, first.texture_id, first.shader_id);
@@ -637,21 +703,27 @@ impl AppHandler<Renderer> for App {
 
         let _t_pass = web_time::Instant::now();
 
-        // Screen capture: blit-downsample the backbuffer into a small capture
+        // Screen capture: blit-downsample the final frame into a small capture
         // texture and encode a copy_texture_to_buffer for async readback.
-        let capture_active = self.screen_capture.is_requested();
         if capture_active {
             #[cfg(feature = "profiling")]
             profiling::scope!("screen_capture");
-            let bb_ptr = frame.backbuffer_texture().map(|t| t as *const egor_render::Texture);
-            if let Some(ptr) = bb_ptr {
-                // SAFETY: the texture is owned by Frame.presentable which is
-                // not dropped until after this block, and we only read it.
-                let bb_tex = unsafe { &*ptr };
-                self.screen_capture.capture_from_texture(&device, &mut frame.encoder, bb_tex);
+            if let Some(source_view) = capture_frame_view {
+                self.screen_capture
+                    .capture_from_sampled_view(&device, &mut frame.encoder, source_view, format.is_srgb());
+                self.screen_capture
+                    .present_sampled_view(&device, &mut frame.encoder, source_view, &frame.view, format);
             } else {
-                eprintln!("[egor] Screen capture requested but no backbuffer texture available");
-                self.screen_capture.request(0, 0, false);
+                let bb_ptr = frame.backbuffer_texture().map(|t| t as *const egor_render::Texture);
+                if let Some(ptr) = bb_ptr {
+                    // SAFETY: the texture is owned by Frame.presentable which is
+                    // not dropped until after this block, and we only read it.
+                    let bb_tex = unsafe { &*ptr };
+                    self.screen_capture.capture_from_texture(&device, &mut frame.encoder, bb_tex);
+                } else {
+                    eprintln!("[egor] Screen capture requested but no backbuffer texture available");
+                    self.screen_capture.request(0, 0, false);
+                }
             }
         }
 

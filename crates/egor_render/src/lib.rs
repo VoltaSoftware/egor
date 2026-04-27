@@ -35,6 +35,8 @@ pub(crate) struct Gpu {
     pub queue: Queue,
 }
 
+const REQUIRED_MAX_TEXTURE_DIMENSION_2D: u32 = 4096;
+
 /// Low-level GPU renderer built on `wgpu`
 ///
 /// Handles rendering pipelines, surface configuration, resources (textures, buffers), & drawing
@@ -84,10 +86,18 @@ impl Renderer {
             info.name,
             info.driver
         );
+        let adapter_limits = adapter.limits();
+        assert!(
+            adapter_limits.max_texture_dimension_2d >= REQUIRED_MAX_TEXTURE_DIMENSION_2D,
+            "[egor] adapter max_texture_dimension_2d {} is below required {}",
+            adapter_limits.max_texture_dimension_2d,
+            REQUIRED_MAX_TEXTURE_DIMENSION_2D
+        );
         #[cfg(target_arch = "wasm32")]
-        let required_limits = wgpu::Limits::downlevel_webgl2_defaults();
+        let mut required_limits = wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter_limits.clone());
         #[cfg(not(target_arch = "wasm32"))]
-        let required_limits = adapter.limits();
+        let mut required_limits = adapter_limits;
+        required_limits.max_texture_dimension_2d = required_limits.max_texture_dimension_2d.max(REQUIRED_MAX_TEXTURE_DIMENSION_2D);
         let (device, queue) = adapter
             .request_device(&DeviceDescriptor {
                 required_limits,
@@ -97,8 +107,7 @@ impl Renderer {
             .await
             .unwrap();
 
-        let surface_config = surface.get_default_config(&adapter, 1, 1).unwrap();
-        let surface_format = surface_config.format.add_srgb_suffix();
+        let (_surface_config, surface_format, _) = target::surface_config(&surface, &adapter, 1, 1);
         let pipelines = Pipelines::new(&device, surface_format);
 
         let quad_vertex_buffer = device.create_buffer_init(&BufferInitDescriptor {

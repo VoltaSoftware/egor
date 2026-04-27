@@ -1,6 +1,7 @@
 use wgpu::{
-    Adapter, CommandEncoder, CurrentSurfaceTexture, Device, Extent3d, Instance, PresentMode, Surface, SurfaceConfiguration, SurfaceTarget,
-    Texture, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView, TextureViewDescriptor, WindowHandle,
+    Adapter, CommandEncoder, CurrentSurfaceTexture, Device, DownlevelFlags, Extent3d, Instance, PresentMode, Surface, SurfaceConfiguration,
+    SurfaceTarget, Texture, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView, TextureViewDescriptor,
+    WindowHandle,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -19,6 +20,42 @@ pub trait RenderTarget {
     fn set_vsync(&mut self, _device: &Device, _on: bool) {}
 }
 
+pub(crate) fn surface_config(surface: &Surface<'_>, adapter: &Adapter, w: u32, h: u32) -> (SurfaceConfiguration, TextureFormat, bool) {
+    let caps = surface.get_capabilities(adapter);
+    let mut config = surface.get_default_config(adapter, w, h).unwrap();
+    config.present_mode = PresentMode::AutoVsync;
+
+    let surface_copy_src = caps.usages.contains(TextureUsages::COPY_SRC);
+    if surface_copy_src {
+        config.usage |= TextureUsages::COPY_SRC;
+    }
+
+    // Prefer sRGB rendering, but do it in the form each backend can present:
+    //
+    // * WebGPU wants a non-sRGB canvas format plus an sRGB surface view.
+    // * GLES/WebGL and Android Vulkan often do not support surface view
+    //   formats, so use the sRGB surface format directly when it is exposed.
+    // * If neither route exists, fall back to the surface format itself.
+    let srgb_format = config.format.add_srgb_suffix();
+    let can_surface_view_format = adapter
+        .get_downlevel_capabilities()
+        .flags
+        .contains(DownlevelFlags::SURFACE_VIEW_FORMATS);
+    let view_format = if srgb_format == config.format {
+        config.format
+    } else if !can_surface_view_format && caps.formats.contains(&srgb_format) {
+        config.format = srgb_format;
+        srgb_format
+    } else if can_surface_view_format {
+        config.view_formats.push(srgb_format);
+        srgb_format
+    } else {
+        config.format
+    };
+
+    (config, view_format, surface_copy_src)
+}
+
 /// Renders to the window's backbuffer (swapchain)
 pub struct Backbuffer {
     surface: Surface<'static>,
@@ -29,6 +66,7 @@ pub struct Backbuffer {
     /// canvas context only accepts the non-sRGB format but we create sRGB views
     /// via `view_formats`.
     view_format: TextureFormat,
+    surface_copy_src: bool,
 }
 
 impl Backbuffer {
@@ -41,29 +79,18 @@ impl Backbuffer {
         h: u32,
     ) -> Self {
         let surface = instance.create_surface(window).unwrap();
-        let mut config = surface.get_default_config(adapter, w, h).unwrap();
-        config.present_mode = PresentMode::AutoVsync;
-        // Always request COPY_SRC upfront for screen capture.
-        // NOTE: TEXTURE_BINDING is NOT added here because some backends
-        // (DX12) do not support it on the surface texture.  The capture
-        // pipeline copies the backbuffer to an intermediate texture that
-        // has TEXTURE_BINDING instead.
-        config.usage |= TextureUsages::COPY_SRC;
-        // Allow creating sRGB views of the surface texture so that the GPU
-        // encodes linear → sRGB on write. The config.format stays as whatever
-        // the platform prefers (e.g. Bgra8Unorm on WebGPU) because WebGPU
-        // rejects sRGB as a canvas context format. We add the sRGB variant to
-        // view_formats and create views with it instead.
-        let view_format = config.format.add_srgb_suffix();
-        if view_format != config.format {
-            config.view_formats.push(view_format);
-        }
+        let (config, view_format, surface_copy_src) = surface_config(&surface, adapter, w, h);
         surface.configure(device, &config);
         Self {
             surface,
             config,
             view_format,
+            surface_copy_src,
         }
+    }
+
+    pub fn supports_copy_src(&self) -> bool {
+        self.surface_copy_src
     }
 }
 

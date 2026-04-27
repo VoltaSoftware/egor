@@ -131,24 +131,94 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Capture shader for sources sampled as linear color where the displayed
+/// backbuffer uses sRGB encoding. It writes display-encoded RGB into a
+/// non-sRGB readback target so CPU-side packing sees the same byte domain as
+/// the direct surface-copy path.
+const BLIT_ENCODE_SHADER_WGSL: &str = r#"
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
+    let uv = vec2<f32>(f32((idx << 1u) & 2u), f32(idx & 2u));
+    var out: VertexOutput;
+    out.position = vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
+    out.uv = vec2<f32>(uv.x, 1.0 - uv.y);
+    return out;
+}
+
+@group(0) @binding(0) var t_src: texture_2d<f32>;
+@group(0) @binding(1) var s_src: sampler;
+
+fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
+    let x = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+    let lo = x * 12.92;
+    let hi = 1.055 * pow(x, vec3<f32>(1.0 / 2.4)) - 0.055;
+    return select(hi, lo, x <= vec3<f32>(0.0031308));
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let c = textureSample(t_src, s_src, in.uv);
+    return vec4<f32>(linear_to_srgb(c.rgb), c.a);
+}
+"#;
+
+/// Grayscale capture variant for linear sources shown through an sRGB target.
+const BLIT_GRAY_ENCODE_SHADER_WGSL: &str = r#"
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
+    let uv = vec2<f32>(f32((idx << 1u) & 2u), f32(idx & 2u));
+    var out: VertexOutput;
+    out.position = vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
+    out.uv = vec2<f32>(uv.x, 1.0 - uv.y);
+    return out;
+}
+
+@group(0) @binding(0) var t_src: texture_2d<f32>;
+@group(0) @binding(1) var s_src: sampler;
+
+fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
+    let x = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+    let lo = x * 12.92;
+    let hi = 1.055 * pow(x, vec3<f32>(1.0 / 2.4)) - 0.055;
+    return select(hi, lo, x <= vec3<f32>(0.0031308));
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let c = linear_to_srgb(textureSample(t_src, s_src, in.uv).rgb);
+    let lum = dot(c, vec3<f32>(0.299, 0.587, 0.114));
+    return vec4<f32>(lum, 0.0, 0.0, 1.0);
+}
+"#;
+
 // -- Unsafe pixel-format conversion (matches old OpenGL PBO path perf) ------
 
-/// BGRA → RGB565 with row-pitch padding.
+/// RGBA → RGB565 with row-pitch padding.
 ///
 /// # Safety
 /// `src` must point to at least `h * row_pitch` readable bytes.
 /// `dst` must point to at least `w * h * 2` writable bytes.
 #[inline]
-unsafe fn pack_bgra_to_rgb565(src: *const u8, dst: *mut u8, w: usize, h: usize, row_pitch: usize) {
+unsafe fn pack_rgba_to_rgb565(src: *const u8, dst: *mut u8, w: usize, h: usize, row_pitch: usize) {
     let d = dst as *mut u16;
     for y in 0..h {
         let row = unsafe { src.add(y * row_pitch) };
         let dst_off = y * w;
         for x in 0..w {
             let s = unsafe { row.add(x * 4) };
-            let b = unsafe { *s } as u16;
+            let r = unsafe { *s } as u16;
             let g = unsafe { *s.add(1) } as u16;
-            let r = unsafe { *s.add(2) } as u16;
+            let b = unsafe { *s.add(2) } as u16;
             unsafe { *d.add(dst_off + x) = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3) };
         }
     }
@@ -207,8 +277,12 @@ pub struct ScreenCaptureState {
     // -- GPU blit resources (lazily initialised) --
     blit_pipeline: Option<egor_render::wgpu::RenderPipeline>,
     blit_gray_pipeline: Option<egor_render::wgpu::RenderPipeline>,
+    blit_encode_pipeline: Option<egor_render::wgpu::RenderPipeline>,
+    blit_gray_encode_pipeline: Option<egor_render::wgpu::RenderPipeline>,
     blit_sampler: Option<egor_render::wgpu::Sampler>,
     blit_bind_group_layout: Option<egor_render::wgpu::BindGroupLayout>,
+    present_pipeline: Option<egor_render::wgpu::RenderPipeline>,
+    present_pipeline_format: Option<TextureFormat>,
     // Intermediate copy of the backbuffer with TEXTURE_BINDING
     // (surface textures may lack TEXTURE_BINDING on some backends like DX12).
     source_copy: Option<Texture>,
@@ -245,8 +319,12 @@ impl ScreenCaptureState {
         Self {
             blit_pipeline: None,
             blit_gray_pipeline: None,
+            blit_encode_pipeline: None,
+            blit_gray_encode_pipeline: None,
             blit_sampler: None,
             blit_bind_group_layout: None,
+            present_pipeline: None,
+            present_pipeline_format: None,
             source_copy: None,
             source_copy_view: None,
             source_copy_w: 0,
@@ -321,6 +399,16 @@ impl ScreenCaptureState {
             source: egor_render::wgpu::ShaderSource::Wgsl(BLIT_GRAY_SHADER_WGSL.into()),
         });
 
+        let encode_shader = device.create_shader_module(egor_render::wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: egor_render::wgpu::ShaderSource::Wgsl(BLIT_ENCODE_SHADER_WGSL.into()),
+        });
+
+        let gray_encode_shader = device.create_shader_module(egor_render::wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: egor_render::wgpu::ShaderSource::Wgsl(BLIT_GRAY_ENCODE_SHADER_WGSL.into()),
+        });
+
         let bind_group_layout = device.create_bind_group_layout(&egor_render::wgpu::BindGroupLayoutDescriptor {
             label: None,
             entries: &[
@@ -380,8 +468,10 @@ impl ScreenCaptureState {
             })
         };
 
-        let pipeline = make_pipeline(None, &shader, TextureFormat::Bgra8Unorm);
+        let pipeline = make_pipeline(None, &shader, TextureFormat::Rgba8Unorm);
         let gray_pipeline = make_pipeline(None, &gray_shader, TextureFormat::R8Unorm);
+        let encode_pipeline = make_pipeline(None, &encode_shader, TextureFormat::Rgba8Unorm);
+        let gray_encode_pipeline = make_pipeline(None, &gray_encode_shader, TextureFormat::R8Unorm);
 
         let sampler = device.create_sampler(&egor_render::wgpu::SamplerDescriptor {
             label: None,
@@ -394,6 +484,8 @@ impl ScreenCaptureState {
 
         self.blit_pipeline = Some(pipeline);
         self.blit_gray_pipeline = Some(gray_pipeline);
+        self.blit_encode_pipeline = Some(encode_pipeline);
+        self.blit_gray_encode_pipeline = Some(gray_encode_pipeline);
         self.blit_sampler = Some(sampler);
         self.blit_bind_group_layout = Some(bind_group_layout);
     }
@@ -406,7 +498,7 @@ impl ScreenCaptureState {
         let format = if grayscale {
             TextureFormat::R8Unorm
         } else {
-            TextureFormat::Bgra8Unorm
+            TextureFormat::Rgba8Unorm
         };
 
         let texture = device.create_texture(&egor_render::wgpu::TextureDescriptor {
@@ -455,14 +547,7 @@ impl ScreenCaptureState {
         self.source_copy_h = h;
     }
 
-    // -- capture entry point (called by app.rs after rendering) -----------
-
-    /// Blit-downsample the backbuffer into a small capture texture, then
-    /// encode a `copy_texture_to_buffer` for async readback.
-    ///
-    /// `source` is the backbuffer `Texture` (must have `COPY_SRC` usage).
-    /// The encoder must be the same one that will be submitted this frame.
-    pub fn capture_from_texture(&mut self, device: &Device, encoder: &mut CommandEncoder, source: &Texture) {
+    fn prepare_capture(&mut self) -> Option<(usize, u32, u32, bool)> {
         self.requested = false;
 
         let cap_w = self.capture_w.max(1);
@@ -477,53 +562,23 @@ impl ScreenCaptureState {
             if status == MAP_READY {
                 // Harvest the completed readback before reusing this slot.
                 self.complete_slot(idx);
+            } else if status == MAP_FAILED {
+                self.slots[idx].pending = false;
             } else {
                 // Ring full — GPU hasn't finished this slot yet.
                 // Skip capture entirely; no blit, no copy, no allocation.
-                return;
+                return None;
             }
         }
 
-        // Ensure GPU resources exist
-        self.ensure_pipeline(device);
-        self.ensure_capture_texture(device, cap_w, cap_h, grayscale);
+        Some((idx, cap_w, cap_h, grayscale))
+    }
 
-        // The surface texture may not support TEXTURE_BINDING (e.g. DX12),
-        // so copy it to an intermediate texture that does.
-        let src_size = source.size();
-        self.ensure_source_copy(device, src_size.width, src_size.height, source.format());
-        encoder.copy_texture_to_texture(
-            egor_render::wgpu::TexelCopyTextureInfo {
-                texture: source,
-                mip_level: 0,
-                origin: egor_render::wgpu::Origin3d::ZERO,
-                aspect: egor_render::wgpu::TextureAspect::All,
-            },
-            egor_render::wgpu::TexelCopyTextureInfo {
-                texture: self.source_copy.as_ref().unwrap(),
-                mip_level: 0,
-                origin: egor_render::wgpu::Origin3d::ZERO,
-                aspect: egor_render::wgpu::TextureAspect::All,
-            },
-            Extent3d {
-                width: src_size.width,
-                height: src_size.height,
-                depth_or_array_layers: 1,
-            },
-        );
-
+    fn source_bind_group(&self, device: &Device, source_view: &egor_render::wgpu::TextureView) -> egor_render::wgpu::BindGroup {
         let bind_group_layout = self.blit_bind_group_layout.as_ref().expect("pipeline init");
         let sampler = self.blit_sampler.as_ref().expect("pipeline init");
-        let pipeline = if grayscale {
-            self.blit_gray_pipeline.as_ref().expect("pipeline init")
-        } else {
-            self.blit_pipeline.as_ref().expect("pipeline init")
-        };
-        let capture_view = self.capture_view.as_ref().expect("capture texture init");
-        let source_view = self.source_copy_view.as_ref().expect("source copy init");
 
-        // Create bind group sampling from the intermediate copy
-        let bind_group = device.create_bind_group(&egor_render::wgpu::BindGroupDescriptor {
+        device.create_bind_group(&egor_render::wgpu::BindGroupDescriptor {
             label: None,
             layout: bind_group_layout,
             entries: &[
@@ -536,9 +591,33 @@ impl ScreenCaptureState {
                     resource: egor_render::wgpu::BindingResource::Sampler(sampler),
                 },
             ],
-        });
+        })
+    }
 
-        // Blit render pass: draw fullscreen triangle sampling the backbuffer
+    fn capture_prepared_bind_group(
+        &mut self,
+        device: &Device,
+        encoder: &mut CommandEncoder,
+        idx: usize,
+        cap_w: u32,
+        cap_h: u32,
+        grayscale: bool,
+        encode_srgb: bool,
+        bind_group: &egor_render::wgpu::BindGroup,
+    ) {
+        // Ensure GPU resources exist
+        self.ensure_pipeline(device);
+        self.ensure_capture_texture(device, cap_w, cap_h, grayscale);
+
+        let pipeline = match (grayscale, encode_srgb) {
+            (false, false) => self.blit_pipeline.as_ref().expect("pipeline init"),
+            (true, false) => self.blit_gray_pipeline.as_ref().expect("pipeline init"),
+            (false, true) => self.blit_encode_pipeline.as_ref().expect("pipeline init"),
+            (true, true) => self.blit_gray_encode_pipeline.as_ref().expect("pipeline init"),
+        };
+        let capture_view = self.capture_view.as_ref().expect("capture texture init");
+
+        // Blit render pass: draw fullscreen triangle sampling the source.
         {
             let mut rpass = encoder.begin_render_pass(&egor_render::wgpu::RenderPassDescriptor {
                 label: None,
@@ -558,7 +637,7 @@ impl ScreenCaptureState {
             });
 
             rpass.set_pipeline(pipeline);
-            rpass.set_bind_group(0, &bind_group, &[]);
+            rpass.set_bind_group(0, bind_group, &[]);
             rpass.draw(0..3, 0..1);
         }
 
@@ -618,6 +697,163 @@ impl ScreenCaptureState {
 
         self.needs_map = Some(idx);
         self.write_idx = (self.write_idx + 1) % SLOT_COUNT;
+    }
+
+    // -- capture entry point (called by app.rs after rendering) -----------
+
+    /// Blit-downsample the backbuffer into a small capture texture, then
+    /// encode a `copy_texture_to_buffer` for async readback.
+    ///
+    /// `source` is the backbuffer `Texture` (must have `COPY_SRC` usage).
+    /// The encoder must be the same one that will be submitted this frame.
+    pub fn capture_from_texture(&mut self, device: &Device, encoder: &mut CommandEncoder, source: &Texture) {
+        let Some((idx, cap_w, cap_h, grayscale)) = self.prepare_capture() else {
+            return;
+        };
+
+        self.ensure_pipeline(device);
+
+        // The surface texture may not support TEXTURE_BINDING (e.g. DX12),
+        // so copy it to an intermediate texture that does.
+        let src_size = source.size();
+        self.ensure_source_copy(device, src_size.width, src_size.height, source.format());
+        encoder.copy_texture_to_texture(
+            egor_render::wgpu::TexelCopyTextureInfo {
+                texture: source,
+                mip_level: 0,
+                origin: egor_render::wgpu::Origin3d::ZERO,
+                aspect: egor_render::wgpu::TextureAspect::All,
+            },
+            egor_render::wgpu::TexelCopyTextureInfo {
+                texture: self.source_copy.as_ref().unwrap(),
+                mip_level: 0,
+                origin: egor_render::wgpu::Origin3d::ZERO,
+                aspect: egor_render::wgpu::TextureAspect::All,
+            },
+            Extent3d {
+                width: src_size.width,
+                height: src_size.height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let source_view = self.source_copy_view.as_ref().expect("source copy init");
+        let bind_group = self.source_bind_group(device, source_view);
+        self.capture_prepared_bind_group(
+            device,
+            encoder,
+            idx,
+            cap_w,
+            cap_h,
+            grayscale,
+            source.format().is_srgb(),
+            &bind_group,
+        );
+    }
+
+    /// Capture from an already bindable render target. Used on surfaces that
+    /// cannot be configured with `COPY_SRC`; avoids a full-resolution texture
+    /// copy before the downsample pass.
+    pub fn capture_from_sampled_view(
+        &mut self,
+        device: &Device,
+        encoder: &mut CommandEncoder,
+        source_view: &egor_render::wgpu::TextureView,
+        encode_srgb: bool,
+    ) {
+        let Some((idx, cap_w, cap_h, grayscale)) = self.prepare_capture() else {
+            return;
+        };
+
+        self.ensure_pipeline(device);
+        let bind_group = self.source_bind_group(device, source_view);
+        self.capture_prepared_bind_group(device, encoder, idx, cap_w, cap_h, grayscale, encode_srgb, &bind_group);
+    }
+
+    fn ensure_present_pipeline(&mut self, device: &Device, format: TextureFormat) {
+        if self.present_pipeline.is_some() && self.present_pipeline_format == Some(format) {
+            return;
+        }
+
+        self.ensure_pipeline(device);
+
+        let shader = device.create_shader_module(egor_render::wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: egor_render::wgpu::ShaderSource::Wgsl(BLIT_SHADER_WGSL.into()),
+        });
+        let bind_group_layout = self.blit_bind_group_layout.as_ref().expect("pipeline init");
+        let pipeline_layout = device.create_pipeline_layout(&egor_render::wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        self.present_pipeline = Some(device.create_render_pipeline(&egor_render::wgpu::RenderPipelineDescriptor {
+            label: None,
+            layout: Some(&pipeline_layout),
+            vertex: egor_render::wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(egor_render::wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(egor_render::wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: egor_render::wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: egor_render::wgpu::PrimitiveState {
+                topology: egor_render::wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        }));
+        self.present_pipeline_format = Some(format);
+    }
+
+    /// Present an offscreen frame source into the actual surface with a
+    /// fullscreen triangle. This is a render pass, not a texture copy, so it
+    /// works on GLES/WebGL surfaces that only support color attachment usage.
+    pub fn present_sampled_view(
+        &mut self,
+        device: &Device,
+        encoder: &mut CommandEncoder,
+        source_view: &egor_render::wgpu::TextureView,
+        dest_view: &egor_render::wgpu::TextureView,
+        dest_format: TextureFormat,
+    ) {
+        self.ensure_present_pipeline(device, dest_format);
+        let bind_group = self.source_bind_group(device, source_view);
+        let pipeline = self.present_pipeline.as_ref().expect("present pipeline");
+
+        let mut rpass = encoder.begin_render_pass(&egor_render::wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[Some(egor_render::wgpu::RenderPassColorAttachment {
+                view: dest_view,
+                resolve_target: None,
+                ops: egor_render::wgpu::Operations {
+                    load: egor_render::wgpu::LoadOp::Clear(egor_render::wgpu::Color::BLACK),
+                    store: egor_render::wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+
+        rpass.set_pipeline(pipeline);
+        rpass.set_bind_group(0, &bind_group, &[]);
+        rpass.draw(0..3, 0..1);
     }
 
     /// Start the async map request for the most recently written slot.
@@ -690,10 +926,10 @@ impl ScreenCaptureState {
         } else {
             let out_len = pixel_count * 2;
             self.rgb_buf.reserve(out_len.saturating_sub(self.rgb_buf.len()));
-            // SAFETY: we've reserved enough capacity; pack_bgra_to_rgb565
+            // SAFETY: we've reserved enough capacity; pack_rgba_to_rgb565
             // writes exactly pixel_count * 2 bytes.
             unsafe { self.rgb_buf.set_len(out_len) };
-            unsafe { pack_bgra_to_rgb565(src, self.rgb_buf.as_mut_ptr(), w, h, row_pitch) };
+            unsafe { pack_rgba_to_rgb565(src, self.rgb_buf.as_mut_ptr(), w, h, row_pitch) };
         }
 
         drop(data);
