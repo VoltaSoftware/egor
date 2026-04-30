@@ -15,24 +15,33 @@ pub use lyon::path::builder::BorderRadii;
 
 const MIN_THICKNESS: f32 = 0.001;
 
-struct BatchEntry {
-    texture_id: Option<usize>,
-    shader_id: Option<usize>,
-    geometry: GeometryBatch,
+pub(crate) struct BatchEntry {
+    pub texture_id: Option<usize>,
+    pub shader_id: Option<usize>,
+    pub scissor: Option<(u32, u32, u32, u32)>,
+    pub camera_slot: u32,
+    pub render_target: Option<usize>,
+    pub geometry: GeometryBatch,
 }
 
 pub struct PrimitiveBatch {
     batches: Vec<BatchEntry>,
+    drained: Vec<BatchEntry>,
+    recycled: Vec<GeometryBatch>,
     max_vertices: usize,
     max_indices: usize,
+    scissor: Option<(u32, u32, u32, u32)>,
+    camera_slot: u32,
+    camera_matrices: Vec<[[f32; 4]; 4]>,
+    camera_count: usize,
+    render_target: Option<usize>,
+    draw_depth: f32,
+    has_rt_overrides: bool,
 }
 
 impl Default for PrimitiveBatch {
     fn default() -> Self {
-        Self::new(
-            GeometryBatch::DEFAULT_MAX_VERTICES,
-            GeometryBatch::DEFAULT_MAX_INDICES,
-        )
+        Self::new(GeometryBatch::DEFAULT_MAX_VERTICES, GeometryBatch::DEFAULT_MAX_INDICES)
     }
 }
 
@@ -40,16 +49,35 @@ impl PrimitiveBatch {
     pub fn new(max_vertices: usize, max_indices: usize) -> Self {
         Self {
             batches: Vec::new(),
+            drained: Vec::new(),
+            recycled: Vec::new(),
             max_vertices,
             max_indices,
+            scissor: None,
+            camera_slot: 0,
+            camera_matrices: Vec::new(),
+            camera_count: 0,
+            render_target: None,
+            draw_depth: 0.0,
+            has_rt_overrides: false,
         }
     }
 
-    fn new_entry(&self, texture_id: Option<usize>, shader_id: Option<usize>) -> BatchEntry {
+    fn new_entry(&mut self, texture_id: Option<usize>, shader_id: Option<usize>) -> BatchEntry {
+        if self.render_target.is_some() {
+            self.has_rt_overrides = true;
+        }
+        let geometry = self
+            .recycled
+            .pop()
+            .unwrap_or_else(|| GeometryBatch::new(self.max_vertices, self.max_indices));
         BatchEntry {
             texture_id,
             shader_id,
-            geometry: GeometryBatch::new(self.max_vertices, self.max_indices),
+            scissor: self.scissor,
+            camera_slot: self.camera_slot,
+            render_target: self.render_target,
+            geometry,
         }
     }
 
@@ -67,35 +95,28 @@ impl PrimitiveBatch {
         if let Some(last) = self.batches.last()
             && last.texture_id == texture_id
             && last.shader_id == shader_id
+            && last.scissor == self.scissor
+            && last.camera_slot == self.camera_slot
+            && last.render_target == self.render_target
             && !last.geometry.would_overflow(vert_count, idx_count)
         {
-            return self
-                .batches
-                .last_mut()
-                .unwrap()
-                .geometry
-                .try_allocate(vert_count, idx_count);
+            return self.batches.last_mut().unwrap().geometry.try_allocate(vert_count, idx_count);
         }
 
-        self.batches.push(self.new_entry(texture_id, shader_id));
-        self.batches
-            .last_mut()
-            .unwrap()
-            .geometry
-            .try_allocate(vert_count, idx_count)
+        let entry = self.new_entry(texture_id, shader_id);
+        self.batches.push(entry);
+        self.batches.last_mut().unwrap().geometry.try_allocate(vert_count, idx_count)
     }
 
     /// Pushes an instance into the current batch if it matches `texture_id` + `shader_id`,
     /// otherwise starts a new batch. Preserves insertion order for correct draw ordering.
-    pub(crate) fn push_instance(
-        &mut self,
-        instance: Instance,
-        texture_id: Option<usize>,
-        shader_id: Option<usize>,
-    ) {
+    pub(crate) fn push_instance(&mut self, instance: Instance, texture_id: Option<usize>, shader_id: Option<usize>) {
         if let Some(last) = self.batches.last_mut()
             && last.texture_id == texture_id
             && last.shader_id == shader_id
+            && last.scissor == self.scissor
+            && last.camera_slot == self.camera_slot
+            && last.render_target == self.render_target
         {
             last.geometry.push_instance(instance);
             return;
@@ -106,28 +127,150 @@ impl PrimitiveBatch {
         self.batches.push(entry);
     }
 
-    /// Moves all batch entries out, consuming their geometry.
-    /// Used for ephemeral paths (offscreen rendering) where batch reuse isn't needed
-    pub(crate) fn take(&mut self) -> Vec<(Option<usize>, Option<usize>, GeometryBatch)> {
-        std::mem::take(&mut self.batches)
-            .into_iter()
-            .map(|entry| (entry.texture_id, entry.shader_id, entry.geometry))
-            .collect()
+    /// Push an instance into the last batch WITHOUT checking if the batch key
+    /// matches.  The caller MUST guarantee that `ensure_batch` was called
+    /// first with the correct texture/shader, and that scissor/camera/RT
+    /// have not changed since.  This eliminates 5 comparisons per tile.
+    #[inline(always)]
+    pub(crate) fn push_instance_unchecked(&mut self, instance: Instance) {
+        // SAFETY invariant: caller guarantees last batch matches.
+        // Dirty flag was already set by ensure_batch.
+        if let Some(last) = self.batches.last_mut() {
+            last.geometry.push_instance_no_dirty(instance);
+        }
+    }
+
+    /// Ensure a batch exists for the given texture/shader combination.
+    /// Call once before a sequence of `push_instance_unchecked` calls.
+    /// Marks the batch dirty so individual pushes don't need to.
+    /// Returns `true` if a new batch was created (for diagnostics).
+    pub(crate) fn ensure_batch(&mut self, texture_id: Option<usize>, shader_id: Option<usize>) -> bool {
+        if let Some(last) = self.batches.last_mut() {
+            if last.texture_id == texture_id
+                && last.shader_id == shader_id
+                && last.scissor == self.scissor
+                && last.camera_slot == self.camera_slot
+                && last.render_target == self.render_target
+            {
+                last.geometry.mark_instances_dirty();
+                return false;
+            }
+        }
+
+        let entry = self.new_entry(texture_id, shader_id);
+        self.batches.push(entry);
+        self.batches.last_mut().unwrap().geometry.mark_instances_dirty();
+        true
     }
 
     /// Iterates over active batch entries for drawing.
-    /// Returns (texture_id, shader_id, &mut GeometryBatch) for each entry
+    /// Returns (texture_id, shader_id, scissor, &mut GeometryBatch) for each entry
+    #[allow(dead_code)]
     pub(crate) fn iter_mut(
         &mut self,
-    ) -> impl Iterator<Item = (Option<usize>, Option<usize>, &mut GeometryBatch)> {
+    ) -> impl Iterator<Item = (Option<usize>, Option<usize>, Option<(u32, u32, u32, u32)>, &mut GeometryBatch)> {
         self.batches
             .iter_mut()
-            .map(|e| (e.texture_id, e.shader_id, &mut e.geometry))
+            .map(|e| (e.texture_id, e.shader_id, e.scissor, &mut e.geometry))
     }
 
-    /// Clears all batches, dropping their geometry. Called at the end of each frame
+    /// Set the scissor rect for subsequent draw commands.
+    /// `None` disables scissoring. Forces a batch break when the scissor state changes.
+    pub fn set_scissor(&mut self, rect: Option<(u32, u32, u32, u32)>) {
+        self.scissor = rect;
+    }
+
+    /// Set the camera matrix for subsequent draw commands.
+    /// Assigns a slot ID so the hot-path comparison is a single `u32` instead
+    /// of a full 64-byte matrix comparison.
+    pub fn set_camera_matrix(&mut self, mat: [[f32; 4]; 4]) {
+        if let Some(idx) = self.camera_matrices[..self.camera_count].iter().position(|m| *m == mat) {
+            self.camera_slot = (idx as u32) + 1;
+        } else {
+            if self.camera_count >= self.camera_matrices.len() {
+                self.camera_matrices.push(mat);
+            } else {
+                self.camera_matrices[self.camera_count] = mat;
+            }
+            self.camera_count += 1;
+            self.camera_slot = self.camera_count as u32;
+        }
+    }
+
+    /// Reset the camera to the default egor camera (slot 0).
+    pub fn reset_camera_matrix(&mut self) {
+        self.camera_slot = 0;
+    }
+
+    /// Returns custom camera matrices collected this frame as a slice.
+    /// Resets the count for next frame. Index 0 maps to GPU slot 1, etc.
+    pub(crate) fn drain_camera_matrices(&mut self) -> &[[[f32; 4]; 4]] {
+        self.camera_slot = 0;
+        let count = self.camera_count;
+        self.camera_count = 0;
+        &self.camera_matrices[..count]
+    }
+
+    /// Drains all batch entries into owned data, including camera and scissor metadata.
+    /// Clears the batch list. Used for render loops that need multiple render passes
+    /// (e.g. camera changes that require uniform re-upload).
+    /// Set the render target for subsequent draw commands.
+    /// `None` means the main backbuffer.
+    pub fn set_render_target(&mut self, id: Option<usize>) {
+        self.render_target = id;
+    }
+
+    /// Set the depth value for subsequent draw commands.
+    /// Used for GPU depth testing (LessOrEqual).
+    pub fn set_draw_depth(&mut self, depth: f32) {
+        self.draw_depth = depth;
+    }
+
+    /// Returns the current draw depth value.
+    pub fn draw_depth(&self) -> f32 {
+        self.draw_depth
+    }
+
+    /// Returns whether any batch targets an offscreen render target.
+    pub(crate) fn has_rt_overrides(&self) -> bool {
+        self.has_rt_overrides
+    }
+
+    /// Swaps the internal batch list with the drain buffer, returning the
+    /// drain buffer (now containing this frame's batches). Both Vecs retain
+    /// their heap allocations across frames, so no allocation occurs after
+    /// the first few frames stabilize.
+    pub(crate) fn drain_all(&mut self) -> Vec<BatchEntry> {
+        self.has_rt_overrides = false;
+        std::mem::swap(&mut self.batches, &mut self.drained);
+        std::mem::take(&mut self.drained)
+    }
+
+    /// Return rendered batches so their GPU buffers can be reused next frame.
+    /// Stores the now-empty Vec back into `drained` so its allocation is kept.
+    pub(crate) fn recycle(&mut self, mut batches: Vec<BatchEntry>) {
+        self.recycled.extend(batches.drain(..).map(|mut e| {
+            e.geometry.clear();
+            e.geometry
+        }));
+        // Preserve the Vec allocation for next frame's drain_all swap.
+        debug_assert!(self.drained.is_empty());
+        self.drained = batches;
+    }
+
+    /// Clears all batches, dropping their geometry
+    #[allow(dead_code)]
     pub(crate) fn reset(&mut self) {
-        self.batches.clear();
+        if !self.batches.is_empty() {
+            let drained = std::mem::take(&mut self.batches);
+            self.recycle(drained);
+        }
+        self.scissor = None;
+        self.camera_slot = 0;
+        self.camera_count = 0;
+        self.render_target = None;
+        self.draw_depth = 0.0;
+        self.has_rt_overrides = false;
     }
 }
 
@@ -148,11 +291,13 @@ pub struct RectangleBuilder<'a> {
     color: Color,
     uvs: [f32; 4],
     tex_id: Option<usize>,
+    depth: f32,
 }
 
 /// Builds a rectangle with configurable position, size, color, anchor, rotation, & texture
 impl<'a> RectangleBuilder<'a> {
     pub(crate) fn new(batch: &'a mut PrimitiveBatch, shader_id: Option<usize>) -> Self {
+        let depth = batch.draw_depth();
         Self {
             batch,
             shader_id,
@@ -163,6 +308,7 @@ impl<'a> RectangleBuilder<'a> {
             color: Color::WHITE,
             uvs: [0.0, 0.0, 1.0, 1.0],
             tex_id: None,
+            depth,
         }
     }
     /// Sets the position & size from a [`Rect`].
@@ -218,17 +364,17 @@ impl Drop for RectangleBuilder<'_> {
             Anchor::Center => -self.size / 2.0,
         };
         let center = self.position + offset + self.size / 2.0;
-        let rot = Mat2::from_angle(self.rotation);
-        let (col0, col1) = (rot.x_axis * self.size.x, rot.y_axis * self.size.y);
+        let affine = if self.rotation == 0.0 {
+            [self.size.x, 0.0, 0.0, self.size.y]
+        } else {
+            let rot = Mat2::from_angle(self.rotation);
+            let (col0, col1) = (rot.x_axis * self.size.x, rot.y_axis * self.size.y);
+            [col0.x, col0.y, col1.x, col1.y]
+        };
         let color = self.color.components();
 
         self.batch.push_instance(
-            Instance::new(
-                [col0.x, col0.y, col1.x, col1.y],
-                [center.x, center.y],
-                color,
-                self.uvs,
-            ),
+            Instance::new(affine, [center.x, center.y, self.depth], color, self.uvs),
             self.tex_id,
             self.shader_id,
         );
@@ -301,10 +447,7 @@ impl Drop for PolygonBuilder<'_> {
         let vert_count = points.len();
         let idx_count = (points.len().saturating_sub(2)) * 3;
 
-        if let Some((verts, indices, base)) =
-            self.batch
-                .allocate(vert_count, idx_count, None, self.shader_id)
-        {
+        if let Some((verts, indices, base)) = self.batch.allocate(vert_count, idx_count, None, self.shader_id) {
             for (i, p) in points.iter().enumerate() {
                 let world = rot * *p + center;
                 verts[i] = Vertex::new(world.into(), color, [0.0, 0.0]);
@@ -394,10 +537,7 @@ impl Drop for PolylineBuilder<'_> {
         let vert_count = segments * 4;
         let idx_count = segments * 6;
 
-        if let Some((verts, indices, mut base)) =
-            self.batch
-                .allocate(vert_count, idx_count, None, self.shader_id)
-        {
+        if let Some((verts, indices, mut base)) = self.batch.allocate(vert_count, idx_count, None, self.shader_id) {
             let mut vi = 0;
             let mut ii = 0;
 
@@ -420,14 +560,7 @@ impl Drop for PolylineBuilder<'_> {
                     vi += 1;
                 }
 
-                indices[ii..ii + 6].copy_from_slice(&[
-                    base,
-                    base + 1,
-                    base + 2,
-                    base + 2,
-                    base + 3,
-                    base,
-                ]);
+                indices[ii..ii + 6].copy_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
                 ii += 6;
                 base += 4;
             }
@@ -524,8 +657,7 @@ impl<'a> PathBuilder<'a> {
     /// `ctrl` is the control point, `to` is the end point.
     /// Requires an open subpath (`begin()` called)
     pub fn quad_to(mut self, ctrl: Vec2, to: Vec2) -> Self {
-        self.builder
-            .quadratic_bezier_to(point(ctrl.x, ctrl.y), point(to.x, to.y));
+        self.builder.quadratic_bezier_to(point(ctrl.x, ctrl.y), point(to.x, to.y));
         self
     }
     /// Adds a cubic bezier curve to the current subpath.
@@ -546,10 +678,8 @@ impl<'a> PathBuilder<'a> {
 
     /// Adds a rectangle to the path
     pub fn rect(mut self, size: Vec2) -> Self {
-        self.builder.add_rectangle(
-            &Box2D::new(Point2D::new(0.0, 0.0), Point2D::new(size.x, size.y)),
-            Winding::Positive,
-        );
+        self.builder
+            .add_rectangle(&Box2D::new(Point2D::new(0.0, 0.0), Point2D::new(size.x, size.y)), Winding::Positive);
         self
     }
     /// Adds a rounded rectangle to the path, optionally specifying per-corner radii
@@ -563,15 +693,13 @@ impl<'a> PathBuilder<'a> {
             bottom_right: 0.0,
         });
 
-        self.builder
-            .add_rounded_rectangle(&rect, &radii, Winding::Positive);
+        self.builder.add_rounded_rectangle(&rect, &radii, Winding::Positive);
 
         self
     }
     /// Adds a circle to the path
     pub fn circle(mut self, radius: f32) -> Self {
-        self.builder
-            .add_circle(Point::new(0.0, 0.0), radius, Winding::Positive);
+        self.builder.add_circle(Point::new(0.0, 0.0), radius, Winding::Positive);
         self
     }
 }
@@ -614,10 +742,7 @@ impl Drop for PathBuilder<'_> {
         let vert_count = geometry.vertices.len();
         let idx_count = geometry.indices.len();
 
-        if let Some((verts, indices, base)) =
-            self.batch
-                .allocate(vert_count, idx_count, None, self.shader_id)
-        {
+        if let Some((verts, indices, base)) = self.batch.allocate(vert_count, idx_count, None, self.shader_id) {
             for (vi, mut vo) in geometry.vertices.into_iter().enumerate() {
                 let mut p: Vec2 = vo.position.into();
                 p = rot * (self.scale * p) + self.position;

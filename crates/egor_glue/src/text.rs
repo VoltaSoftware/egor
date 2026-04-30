@@ -1,9 +1,8 @@
 use egor_render::{Device, Queue, RenderPass, TextureFormat};
 use glam::Vec2;
 use glyphon::{
-    Attrs, Buffer, Cache, Color as GlyphonColor, Family, FontSystem, Metrics, Resolution, Shaping,
-    Style, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer as GlyphonRenderer, Viewport,
-    Weight,
+    Attrs, Buffer, Cache, Color as GlyphonColor, Family, FontSystem, Metrics, Resolution, Shaping, Style, SwashCache, TextArea, TextAtlas,
+    TextBounds, TextRenderer as GlyphonRenderer, Viewport, Weight,
 };
 
 use crate::{color::Color, math::Rect};
@@ -56,7 +55,13 @@ impl TextRenderer {
         Some(family)
     }
 
-    /// Prepare the text renderer for drawing
+    /// Returns true if any text was queued this frame.
+    pub(crate) fn has_entries(&self) -> bool {
+        !self.entries.is_empty()
+    }
+
+    /// Prepare the text renderer for drawing.
+    /// Skipping this when `has_entries()` is false avoids glyphon overhead.
     pub(crate) fn prepare(&mut self, device: &Device, queue: &Queue, width: u32, height: u32) {
         let text_areas: Vec<TextArea> = self
             .entries
@@ -96,9 +101,7 @@ impl TextRenderer {
     }
 
     pub(crate) fn render<'a>(&'a self, pass: &mut RenderPass<'a>) {
-        self.renderer
-            .render(&self.atlas, &self.viewport, pass)
-            .unwrap();
+        self.renderer.render(&self.atlas, &self.viewport, pass).unwrap();
     }
 
     pub(crate) fn resize(&mut self, width: u32, height: u32, queue: &Queue) {
@@ -247,9 +250,7 @@ impl<'a> TextBuilder<'a> {
 impl Drop for TextBuilder<'_> {
     fn drop(&mut self) {
         let line_height = self.line_height.unwrap_or(self.size * 1.2);
-        let mut buffer = self
-            .renderer
-            .take_buffer(Metrics::new(self.size, line_height));
+        let mut buffer = self.renderer.take_buffer(Metrics::new(self.size, line_height));
         buffer.set_text(
             &mut self.renderer.font_system,
             &self.text,
@@ -259,34 +260,24 @@ impl Drop for TextBuilder<'_> {
                 .weight(self.weight)
                 .style(self.style),
             Shaping::Basic,
+            None,
         );
 
         // compute final position, applying alignment within rect if set
         let position = if let Some(rect) = self.rect {
             buffer.shape_until_scroll(&mut self.renderer.font_system, false);
-            let text_w = buffer
-                .layout_runs()
-                .map(|r| r.line_w)
-                .fold(0.0_f32, f32::max);
+            let text_w = buffer.layout_runs().map(|r| r.line_w).fold(0.0_f32, f32::max);
             let text_h = buffer.layout_runs().count() as f32 * line_height;
 
             let x = match self.align {
                 Align::TopLeft | Align::MiddleLeft | Align::BottomLeft => rect.position.x,
-                Align::TopCenter | Align::MiddleCenter | Align::BottomCenter => {
-                    rect.position.x + (rect.size.x - text_w) * 0.5
-                }
-                Align::TopRight | Align::MiddleRight | Align::BottomRight => {
-                    rect.position.x + rect.size.x - text_w
-                }
+                Align::TopCenter | Align::MiddleCenter | Align::BottomCenter => rect.position.x + (rect.size.x - text_w) * 0.5,
+                Align::TopRight | Align::MiddleRight | Align::BottomRight => rect.position.x + rect.size.x - text_w,
             };
             let y = match self.align {
                 Align::TopLeft | Align::TopCenter | Align::TopRight => rect.position.y,
-                Align::MiddleLeft | Align::MiddleCenter | Align::MiddleRight => {
-                    rect.position.y + (rect.size.y - text_h) * 0.5
-                }
-                Align::BottomLeft | Align::BottomCenter | Align::BottomRight => {
-                    rect.position.y + rect.size.y - text_h
-                }
+                Align::MiddleLeft | Align::MiddleCenter | Align::MiddleRight => rect.position.y + (rect.size.y - text_h) * 0.5,
+                Align::BottomLeft | Align::BottomCenter | Align::BottomRight => rect.position.y + rect.size.y - text_h,
             };
 
             Vec2::new(x, y)

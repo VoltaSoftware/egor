@@ -43,12 +43,7 @@ impl ApplicationHandler for MinimalApp {
         self.backbuffer = Some(backbuffer);
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _window_id: winit::window::WindowId,
-        event: WindowEvent,
-    ) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _window_id: winit::window::WindowId, event: WindowEvent) {
         if let Some(r) = self.renderer.as_mut() {
             match event {
                 WindowEvent::RedrawRequested => {
@@ -66,16 +61,17 @@ impl ApplicationHandler for MinimalApp {
                     ];
                     let indices = [0, 1, 2];
 
-                    if let Some((batch_verts, batch_indices, base)) =
-                        self.batch.try_allocate(vertices.len(), indices.len())
-                    {
+                    if let Some((batch_verts, batch_indices, base)) = self.batch.try_allocate(vertices.len(), indices.len()) {
                         batch_verts.copy_from_slice(&vertices);
                         batch_indices.copy_from_slice(&indices.map(|i| i + base));
                     }
 
                     {
                         let mut r_pass = r.begin_render_pass(&mut frame.encoder, &frame.view);
-                        r.draw_batch(&mut r_pass, &mut self.batch, None, None);
+                        r.bind_pass_state(&mut r_pass, None, None);
+                        let mut cur_tex = None;
+                        let mut cur_shd = None;
+                        r.draw_batch(&mut r_pass, &mut self.batch, None, None, 0, &mut cur_tex, &mut cur_shd);
                     }
                     r.end_frame(frame);
                 }
