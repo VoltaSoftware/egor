@@ -48,5 +48,5 @@ web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlC
 wasm-bindgen = "0.2"
 
 [dev-dependencies]
-winit = "0.30.12"
+winit = { git = "https://github.com/VoltaSoftware/winit", branch = "lot" }
 pollster = "0.4.0"

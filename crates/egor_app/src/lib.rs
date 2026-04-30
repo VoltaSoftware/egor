@@ -108,6 +108,8 @@ pub struct AppRunner<R: 'static, H: AppHandler<R> + 'static> {
     resource: Option<R>,
     window: Option<Arc<Window>>,
     proxy: Option<EventLoopProxy<(R, H)>>,
+    #[cfg(target_os = "ios")]
+    queued_poll_redraw: bool,
     input: Input,
     timer: FrameTimer,
     config: AppConfig,
@@ -203,6 +205,19 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
                 self.timer.update();
                 handler.frame(window, resource, &self.input, &self.timer);
                 self.input.end_frame();
+
+                if self.config.control_flow == ControlFlow::Poll {
+                    #[cfg(target_os = "ios")]
+                    {
+                        // UIKit drops redraw requests issued while handling RedrawRequested,
+                        // so defer the next request until AboutToWait.
+                        self.queued_poll_redraw = true;
+                    }
+                    #[cfg(not(target_os = "ios"))]
+                    {
+                        window.request_redraw();
+                    }
+                }
             }
             WindowEvent::Resized(size) => {
                 if size.width == 0 || size.height == 0 {
@@ -262,9 +277,12 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        #[cfg(target_os = "ios")]
         if self.config.control_flow == ControlFlow::Poll
+            && self.queued_poll_redraw
             && let Some(window) = &self.window
         {
+            self.queued_poll_redraw = false;
             window.request_redraw();
         }
 
@@ -304,6 +322,8 @@ impl<R, H: AppHandler<R> + 'static> AppRunner<R, H> {
             resource: None,
             window: None,
             proxy: None,
+            #[cfg(target_os = "ios")]
+            queued_poll_redraw: false,
             input,
             timer: FrameTimer::default(),
             config,
