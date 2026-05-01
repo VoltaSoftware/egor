@@ -10,7 +10,7 @@ compile_error!("On Android, enable either the `android-native-activity` or `andr
 use crate::{input::Input, time::FrameTimer};
 use std::sync::Arc;
 pub use winit::{
-    dpi::PhysicalSize,
+    dpi::{PhysicalPosition, PhysicalSize},
     event::{DeviceEvent, DeviceId, StartCause, WindowEvent},
     event_loop::ControlFlow,
     window::{Fullscreen, Icon, Window},
@@ -35,6 +35,7 @@ pub struct AppConfig {
     pub title: String,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    pub position: Option<(i32, i32)>,
     pub resizable: bool,
     pub maximized: bool,
     pub fullscreen: bool,
@@ -53,6 +54,7 @@ impl Default for AppConfig {
             title: "Egor App".to_string(),
             width: None,
             height: None,
+            position: None,
             resizable: true,
             maximized: false,
             fullscreen: false,
@@ -144,6 +146,10 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
         if let (Some(w), Some(h)) = (self.config.width, self.config.height) {
             win_attrs = win_attrs.with_inner_size(PhysicalSize::new(w, h));
         }
+        #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios")))]
+        if let Some((x, y)) = self.config.position {
+            win_attrs = win_attrs.with_position(PhysicalPosition::new(x, y));
+        }
         #[cfg(target_arch = "wasm32")]
         {
             use winit::platform::web::WindowAttributesExtWebSys;
@@ -158,6 +164,10 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
         }
 
         let window = Arc::new(event_loop.create_window(win_attrs).unwrap());
+        #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios")))]
+        if let Some((x, y)) = self.config.position {
+            window.set_outer_position(PhysicalPosition::new(x, y));
+        }
         self.window = Some(window.clone());
         self.input.set_scale_factor(window.scale_factor());
 

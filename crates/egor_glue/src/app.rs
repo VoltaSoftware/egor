@@ -8,7 +8,8 @@ use crate::{
 };
 
 use egor_app::{
-    AppConfig, AppHandler, AppRunner, ControlFlow, Fullscreen, PhysicalSize, Window, WindowEvent, input::Input, time::FrameTimer,
+    AppConfig, AppHandler, AppRunner, ControlFlow, Fullscreen, PhysicalPosition, PhysicalSize, Window, WindowEvent, input::Input,
+    time::FrameTimer,
 };
 use egor_render::{
     MemoryHints, Renderer, TextureFormat,
@@ -99,6 +100,18 @@ impl<'a> AppControl<'a> {
     pub fn set_size(&mut self, w: u32, h: u32) {
         let _ = self.window.request_inner_size(PhysicalSize::new(w, h));
         self.requested_size = Some((w, h));
+    }
+
+    /// Set the outer window position in physical desktop coordinates.
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios")))]
+    pub fn set_position(&self, x: i32, y: i32) {
+        self.window.set_outer_position(PhysicalPosition::new(x, y));
+    }
+
+    /// Return the outer window position in physical desktop coordinates.
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios")))]
+    pub fn outer_position(&self) -> Option<(i32, i32)> {
+        self.window.outer_position().ok().map(|pos| (pos.x, pos.y))
     }
 
     /// Enable or disable borderless fullscreen mode
@@ -192,6 +205,15 @@ impl App {
         if let Some(c) = self.config.as_mut() {
             c.width = Some(width);
             c.height = Some(height);
+        }
+        self
+    }
+
+    /// Set initial outer window position in physical desktop coordinates.
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios")))]
+    pub fn window_position(mut self, x: i32, y: i32) -> Self {
+        if let Some(c) = self.config.as_mut() {
+            c.position = Some((x, y));
         }
         self
     }
