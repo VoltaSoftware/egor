@@ -9,12 +9,16 @@ compile_error!("On Android, enable either the `android-native-activity` or `andr
 
 use crate::{input::Input, time::FrameTimer};
 use std::sync::Arc;
+use web_time::{Duration, Instant};
 pub use winit::{
     dpi::{PhysicalPosition, PhysicalSize},
     event::{DeviceEvent, DeviceId, StartCause, WindowEvent},
     event_loop::ControlFlow,
     window::{Fullscreen, Icon, Window},
 };
+
+#[cfg(target_os = "ios")]
+pub use winit::platform::ios::WindowExtIOS;
 
 #[cfg(target_os = "android")]
 use std::sync::OnceLock;
@@ -29,6 +33,36 @@ use winit::{
     event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy},
     window::WindowId,
 };
+
+#[cfg(target_os = "ios")]
+fn platform_control_flow(control_flow: ControlFlow, poll_frame_interval: Option<Duration>) -> ControlFlow {
+    match control_flow {
+        ControlFlow::Poll => poll_frame_interval
+            .map(|interval| ControlFlow::WaitUntil(Instant::now() + interval))
+            .unwrap_or(ControlFlow::Wait),
+        control_flow => control_flow,
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
+fn platform_control_flow(control_flow: ControlFlow, poll_frame_interval: Option<Duration>) -> ControlFlow {
+    match control_flow {
+        ControlFlow::Poll => poll_frame_interval
+            .map(|interval| ControlFlow::WaitUntil(Instant::now() + interval))
+            .unwrap_or(ControlFlow::Poll),
+        control_flow => control_flow,
+    }
+}
+
+#[cfg(target_os = "ios")]
+fn should_request_poll_redraw_manually() -> bool {
+    false
+}
+
+#[cfg(not(target_os = "ios"))]
+fn should_request_poll_redraw_manually() -> bool {
+    true
+}
 
 pub struct AppConfig {
     pub control_flow: ControlFlow,
@@ -92,6 +126,10 @@ pub trait AppHandler<R> {
     fn new_events(&mut self, _cause: StartCause) {}
     /// Called when all queued events have been processed
     fn about_to_wait(&mut self) {}
+    /// Return a frame interval when `ControlFlow::Poll` should be paced instead of busy-polled.
+    fn poll_frame_interval(&self, _window: &Window) -> Option<Duration> {
+        None
+    }
     /// Called when the event loop is shutting down
     fn exiting(&mut self) {}
     /// Called when the OS signals memory pressure (mobile platforms)
@@ -110,8 +148,8 @@ pub struct AppRunner<R: 'static, H: AppHandler<R> + 'static> {
     resource: Option<R>,
     window: Option<Arc<Window>>,
     proxy: Option<EventLoopProxy<(R, H)>>,
-    #[cfg(target_os = "ios")]
     queued_poll_redraw: bool,
+    queued_poll_redraw_at: Option<Instant>,
     input: Input,
     timer: FrameTimer,
     config: AppConfig,
@@ -212,19 +250,29 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
                     return;
                 };
 
+                if self.config.control_flow == ControlFlow::Poll
+                    && self.queued_poll_redraw
+                    && let Some(redraw_at) = self.queued_poll_redraw_at
+                {
+                    let now = Instant::now();
+                    if now < redraw_at {
+                        event_loop.set_control_flow(ControlFlow::WaitUntil(redraw_at));
+                        return;
+                    }
+
+                    self.queued_poll_redraw = false;
+                    self.queued_poll_redraw_at = None;
+                }
+
                 self.timer.update();
                 handler.frame(window, resource, &self.input, &self.timer);
                 self.input.end_frame();
 
                 if self.config.control_flow == ControlFlow::Poll {
-                    #[cfg(target_os = "ios")]
-                    {
-                        // UIKit drops redraw requests issued while handling RedrawRequested,
-                        // so defer the next request until AboutToWait.
+                    if let Some(interval) = Self::poll_frame_interval_for_handler(handler, window) {
                         self.queued_poll_redraw = true;
-                    }
-                    #[cfg(not(target_os = "ios"))]
-                    {
+                        self.queued_poll_redraw_at = Some(Instant::now() + interval);
+                    } else if should_request_poll_redraw_manually() {
                         window.request_redraw();
                     }
                 }
@@ -274,7 +322,16 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
         handler.frame(window, &mut resource, &self.input, &self.timer);
 
         window.set_visible(true);
-        window.request_redraw();
+        if self.config.control_flow == ControlFlow::Poll {
+            if let Some(interval) = Self::poll_frame_interval_for_handler(&handler, window) {
+                self.queued_poll_redraw = true;
+                self.queued_poll_redraw_at = Some(Instant::now() + interval);
+            } else if should_request_poll_redraw_manually() {
+                window.request_redraw();
+            }
+        } else {
+            window.request_redraw();
+        }
 
         self.resource = Some(resource);
         self.handler = Some(handler);
@@ -286,14 +343,27 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        #[cfg(target_os = "ios")]
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if self.config.control_flow == ControlFlow::Poll
             && self.queued_poll_redraw
             && let Some(window) = &self.window
         {
-            self.queued_poll_redraw = false;
-            window.request_redraw();
+            if let Some(redraw_at) = self.queued_poll_redraw_at {
+                if Instant::now() >= redraw_at {
+                    self.queued_poll_redraw = false;
+                    self.queued_poll_redraw_at = None;
+                    window.request_redraw();
+                    event_loop.set_control_flow(ControlFlow::Wait);
+                } else {
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(redraw_at));
+                }
+            } else {
+                self.queued_poll_redraw = false;
+                window.request_redraw();
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
+        } else if self.config.control_flow == ControlFlow::Poll {
+            event_loop.set_control_flow(platform_control_flow(self.config.control_flow, self.poll_frame_interval()));
         }
 
         if let Some(handler) = self.handler.as_mut() {
@@ -332,12 +402,21 @@ impl<R, H: AppHandler<R> + 'static> AppRunner<R, H> {
             resource: None,
             window: None,
             proxy: None,
-            #[cfg(target_os = "ios")]
             queued_poll_redraw: false,
+            queued_poll_redraw_at: None,
             input,
             timer: FrameTimer::default(),
             config,
         }
+    }
+
+    fn poll_frame_interval(&self) -> Option<Duration> {
+        let window = self.window.as_deref()?;
+        self.handler.as_ref().and_then(|handler| handler.poll_frame_interval(window))
+    }
+
+    fn poll_frame_interval_for_handler(handler: &H, window: &Window) -> Option<Duration> {
+        handler.poll_frame_interval(window)
     }
 
     /// Runs the app’s event loop on the current platform
@@ -356,7 +435,7 @@ impl<R, H: AppHandler<R> + 'static> AppRunner<R, H> {
         }
 
         let event_loop = event_loop_builder.build().unwrap();
-        event_loop.set_control_flow(self.config.control_flow);
+        event_loop.set_control_flow(platform_control_flow(self.config.control_flow, None));
         self.proxy = Some(event_loop.create_proxy());
 
         #[cfg(target_arch = "wasm32")]

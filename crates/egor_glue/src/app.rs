@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use web_time::Duration;
+
 use crate::{
     graphics::{Graphics, RenderTargetStore, ScreenCaptureState},
     primitives::PrimitiveBatch,
@@ -7,9 +9,12 @@ use crate::{
     text::TextRenderer,
 };
 
+#[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios")))]
+use egor_app::PhysicalPosition;
+#[cfg(target_os = "ios")]
+use egor_app::WindowExtIOS;
 use egor_app::{
-    AppConfig, AppHandler, AppRunner, ControlFlow, Fullscreen, PhysicalPosition, PhysicalSize, Window, WindowEvent, input::Input,
-    time::FrameTimer,
+    AppConfig, AppHandler, AppRunner, ControlFlow, Fullscreen, PhysicalSize, Window, WindowEvent, input::Input, time::FrameTimer,
 };
 use egor_render::{
     MemoryHints, Renderer, TextureFormat,
@@ -18,6 +23,43 @@ use egor_render::{
 };
 
 type UpdateFn = dyn FnMut(&mut FrameContext);
+
+#[cfg(not(target_os = "ios"))]
+fn frame_interval_for_fps(fps: u16) -> Duration {
+    let fps = u64::from(fps.max(1));
+    Duration::from_nanos((1_000_000_000u64 + fps / 2) / fps)
+}
+
+#[cfg(target_os = "ios")]
+fn software_frame_interval_for_fps_limit(_fps: u16) -> Option<Duration> {
+    None
+}
+
+#[cfg(not(target_os = "ios"))]
+fn software_frame_interval_for_fps_limit(fps: u16) -> Option<Duration> {
+    Some(frame_interval_for_fps(fps))
+}
+
+#[cfg(target_os = "ios")]
+fn set_native_preferred_fps(window: &Window, fps: u16) {
+    let fps = i32::from(fps.max(1));
+    window.set_preferred_frames_per_second(fps);
+    window.set_native_display_link_enabled(true);
+}
+
+#[cfg(not(target_os = "ios"))]
+fn set_native_preferred_fps(_window: &Window, _fps: u16) {}
+
+fn refresh_rate_fps(window: &Window) -> Option<u16> {
+    window
+        .current_monitor()
+        .and_then(|monitor| monitor.refresh_rate_millihertz())
+        .filter(|refresh_rate_millihertz| *refresh_rate_millihertz > 0)
+        .map(|refresh_rate_millihertz| {
+            let fps = (refresh_rate_millihertz + 500) / 1000;
+            fps.clamp(1, u32::from(u16::MAX)) as u16
+        })
+}
 
 fn window_surface_size(window: &Window) -> PhysicalSize<u32> {
     #[cfg(target_os = "ios")]
@@ -87,6 +129,7 @@ pub struct AppControl<'a> {
     window: &'a Window,
     requested_size: Option<(u32, u32)>,
     requested_vsync: Option<bool>,
+    requested_fps_limit: Option<u16>,
 }
 
 impl<'a> AppControl<'a> {
@@ -126,6 +169,16 @@ impl<'a> AppControl<'a> {
         self.requested_vsync = Some(on);
     }
 
+    /// Limit continuous redraws to the requested frames per second.
+    pub fn set_fps_limit(&mut self, fps: u16) {
+        self.requested_fps_limit = Some(fps.max(1));
+    }
+
+    /// Returns the current display refresh rate rounded to frames per second, if known.
+    pub fn refresh_rate_fps(&self) -> Option<u16> {
+        refresh_rate_fps(self.window)
+    }
+
     /// Returns the window's DPI scale factor
     pub fn scale_factor(&self) -> f64 {
         self.window.scale_factor()
@@ -152,6 +205,7 @@ pub struct App {
     memory_hints: MemoryHints,
     render_targets: RenderTargetStore,
     screen_capture: ScreenCaptureState,
+    fps_limit: Option<u16>,
     capture_frame_target: Option<CaptureFrameTarget>,
     offscreen_batches: Vec<PrimitiveBatch>,
     instance_byte_offsets: Vec<u64>,
@@ -178,6 +232,7 @@ impl App {
             primitive_batch: PrimitiveBatch::default(),
             render_targets: RenderTargetStore::new(),
             screen_capture: ScreenCaptureState::new(),
+            fps_limit: None,
             capture_frame_target: None,
             offscreen_batches: Vec::new(),
             instance_byte_offsets: Vec::new(),
@@ -274,6 +329,12 @@ impl App {
         self
     }
 
+    /// Set the maximum redraw rate while using `ControlFlow::Poll`.
+    pub fn fps_limit(mut self, fps: u16) -> Self {
+        self.fps_limit = Some(fps.max(1));
+        self
+    }
+
     /// Set the event loop control flow (defaults to [`ControlFlow::Poll`])
     ///
     /// - `ControlFlow::Poll`: continuously redraws (game-style loop)
@@ -367,9 +428,16 @@ impl AppHandler<Renderer> for App {
         let (device, format) = (renderer.device(), self.backbuffer.as_ref().unwrap().format());
         self.backbuffer.as_mut().unwrap().set_vsync(device, self.vsync);
         self.text_renderer = Some(TextRenderer::new(device, renderer.queue(), format));
+        if let Some(fps_limit) = self.fps_limit {
+            set_native_preferred_fps(window, fps_limit);
+        }
 
         let size = window_surface_size(window);
         self.resize(size.width, size.height, renderer);
+    }
+
+    fn poll_frame_interval(&self, _window: &Window) -> Option<Duration> {
+        self.fps_limit.and_then(software_frame_interval_for_fps_limit)
     }
 
     fn frame(&mut self, _window: &Window, renderer: &mut Renderer, input: &Input, timer: &FrameTimer) {
@@ -393,14 +461,6 @@ impl AppHandler<Renderer> for App {
             return;
         };
 
-        let _ta = web_time::Instant::now();
-
-        let Some(mut frame) = renderer.begin_frame(backbuffer) else {
-            return;
-        };
-
-        let _t0 = web_time::Instant::now();
-
         let (w, h) = backbuffer.size();
         renderer.ensure_depth_size(w, h);
         let (device, queue) = (renderer.device().clone(), renderer.queue().clone());
@@ -410,57 +470,62 @@ impl AppHandler<Renderer> for App {
         self.events_drained.clear();
         std::mem::swap(&mut self.events, &mut self.events_drained);
 
-        let _t_ctx = web_time::Instant::now();
+        let (requested_size, requested_vsync, requested_fps_limit) = {
+            let mut ctx = FrameContext {
+                events: std::mem::take(&mut self.events_drained),
+                app: AppControl {
+                    window: _window,
+                    requested_size: None,
+                    requested_vsync: None,
+                    requested_fps_limit: None,
+                },
+                gfx: Graphics::new(
+                    renderer,
+                    &mut self.primitive_batch,
+                    text_renderer,
+                    &mut self.render_targets,
+                    &mut self.screen_capture,
+                    &mut self.offscreen_batches,
+                    format,
+                    w,
+                    h,
+                ),
+                input,
+                timer,
+            };
 
-        let mut ctx = FrameContext {
-            events: std::mem::take(&mut self.events_drained),
-            app: AppControl {
-                window: _window,
-                requested_size: None,
-                requested_vsync: None,
-            },
-            gfx: Graphics::new(
-                renderer,
-                &mut self.primitive_batch,
-                text_renderer,
-                &mut self.render_targets,
-                &mut self.screen_capture,
-                &mut self.offscreen_batches,
-                format,
-                w,
-                h,
-            ),
-            input,
-            timer,
+            {
+                #[cfg(feature = "profiling")]
+                profiling::scope!("user_callback");
+                update(&mut ctx);
+            }
+
+            ctx.events.clear();
+            self.events_drained = ctx.events;
+
+            let requested_size = ctx.app.requested_size;
+            let requested_vsync = ctx.app.requested_vsync;
+            let requested_fps_limit = ctx.app.requested_fps_limit;
+            if let Some((pw, ph)) = requested_size {
+                ctx.gfx.set_target_size(pw, ph);
+            }
+
+            ctx.gfx.upload_camera();
+
+            (requested_size, requested_vsync, requested_fps_limit)
         };
 
-        let _t_update_start = web_time::Instant::now();
-        {
-            #[cfg(feature = "profiling")]
-            profiling::scope!("user_callback");
-            update(&mut ctx);
+        if let Some(fps_limit) = requested_fps_limit {
+            if self.fps_limit != Some(fps_limit) {
+                set_native_preferred_fps(_window, fps_limit);
+            }
+            self.fps_limit = Some(fps_limit);
         }
-        let _t_update_end = web_time::Instant::now();
-
-        ctx.events.clear();
-        self.events_drained = ctx.events;
-
-        let requested_size = ctx.app.requested_size;
-        let requested_vsync = ctx.app.requested_vsync;
-        if let Some((pw, ph)) = requested_size {
-            ctx.gfx.set_target_size(pw, ph);
-        }
-
-        ctx.gfx.upload_camera();
-
-        let _t1 = web_time::Instant::now();
 
         let has_text = text_renderer.has_entries();
         if has_text {
             text_renderer.prepare(&device, &queue, w, h);
         }
-
-        let _t2 = web_time::Instant::now();
 
         // Use the flag tracked during batch building instead of scanning all batches.
         let has_rt_overrides = self.primitive_batch.has_rt_overrides();
@@ -477,8 +542,6 @@ impl AppHandler<Renderer> for App {
                 renderer.write_camera_slot((i as u32) + 1, *cam);
             }
         }
-
-        let _t_drain = web_time::Instant::now();
 
         {
             #[cfg(feature = "profiling")]
@@ -510,8 +573,6 @@ impl AppHandler<Renderer> for App {
             }
         } // profile_scope batch_upload
 
-        let _t_upload = web_time::Instant::now();
-
         let capture_active = self.screen_capture.is_requested();
         let use_capture_frame_target = capture_active && !backbuffer.supports_copy_src();
         if use_capture_frame_target {
@@ -522,6 +583,12 @@ impl AppHandler<Renderer> for App {
         } else {
             None
         };
+
+        let Some(mut frame) = renderer.begin_frame(backbuffer) else {
+            self.primitive_batch.recycle(batches);
+            return;
+        };
+
         let main_view = capture_frame_view.unwrap_or(&frame.view);
 
         {
@@ -723,8 +790,6 @@ impl AppHandler<Renderer> for App {
             self.primitive_batch.recycle(batches);
         } // profile_scope render_pass
 
-        let _t_pass = web_time::Instant::now();
-
         // Screen capture: blit-downsample the final frame into a small capture
         // texture and encode a copy_texture_to_buffer for async readback.
         if capture_active {
@@ -749,27 +814,21 @@ impl AppHandler<Renderer> for App {
             }
         }
 
-        let _t_submit0 = web_time::Instant::now();
         {
             #[cfg(feature = "profiling")]
             profiling::scope!("submit_present");
             let (commands, presentable) = renderer.finish_encoder(frame);
-            let _t_encode = web_time::Instant::now();
             renderer.submit_commands(commands);
-            let _t_submit1 = web_time::Instant::now();
             if let Some(p) = presentable {
                 p.present();
             }
         } // profile_scope submit_present
-        let _t_present = web_time::Instant::now();
 
         // Start the async map AFTER submit so the staging buffer isn't
         // in a pending-map state when the command buffer is submitted.
         if capture_active {
             self.screen_capture.begin_readback_map();
         }
-
-        let _t_end = web_time::Instant::now();
 
         if let Some((rw, rh)) = requested_size {
             self.backbuffer.as_mut().unwrap().resize(&device, rw, rh);
