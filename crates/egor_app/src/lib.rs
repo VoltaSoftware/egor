@@ -264,6 +264,7 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
                     self.queued_poll_redraw_at = None;
                 }
 
+                let frame_started_at = Instant::now();
                 self.timer.update();
                 handler.frame(window, resource, &self.input, &self.timer);
                 self.input.end_frame();
@@ -271,7 +272,7 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
                 if self.config.control_flow == ControlFlow::Poll {
                     if let Some(interval) = Self::poll_frame_interval_for_handler(handler, window) {
                         self.queued_poll_redraw = true;
-                        self.queued_poll_redraw_at = Some(Instant::now() + interval);
+                        self.queued_poll_redraw_at = Some(frame_started_at + interval);
                     } else if should_request_poll_redraw_manually() {
                         window.request_redraw();
                     }
@@ -318,6 +319,7 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
     fn user_event(&mut self, _: &ActiveEventLoop, (mut resource, mut handler): (R, H)) {
         let Some(window) = &self.window else { return };
 
+        let frame_started_at = Instant::now();
         handler.on_ready(window, &mut resource);
         handler.frame(window, &mut resource, &self.input, &self.timer);
 
@@ -325,7 +327,7 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
         if self.config.control_flow == ControlFlow::Poll {
             if let Some(interval) = Self::poll_frame_interval_for_handler(&handler, window) {
                 self.queued_poll_redraw = true;
-                self.queued_poll_redraw_at = Some(Instant::now() + interval);
+                self.queued_poll_redraw_at = Some(frame_started_at + interval);
             } else if should_request_poll_redraw_manually() {
                 window.request_redraw();
             }
