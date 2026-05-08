@@ -4,9 +4,24 @@ use std::collections::HashMap;
 
 use winit::{
     dpi::PhysicalPosition,
-    event::{DeviceId, ElementState, KeyEvent},
+    event::{DeviceId, ElementState, Ime, KeyEvent},
     keyboard::PhysicalKey,
 };
+
+/// Represents a text input event from the windowing system.
+#[derive(Debug, Clone)]
+pub enum TextInputEvent {
+    /// A character was entered via keyboard.
+    Char(char),
+    /// IME preedit/composition text with optional cursor range.
+    Preedit { text: String, cursor: Option<(usize, usize)> },
+    /// IME committed final text.
+    Commit(String),
+    /// IME was enabled on the window.
+    ImeEnabled,
+    /// IME was disabled on the window.
+    ImeDisabled,
+}
 
 pub struct Input {
     keyboard: HashMap<KeyCode, (ElementState, ElementState)>, // (current, previous) state
@@ -14,11 +29,15 @@ pub struct Input {
     mouse_position: (f32, f32),
     mouse_delta: (f32, f32),
     mouse_wheel_delta: f32,
-    touches: HashMap<u64, Touch>,
+    touches: Vec<Touch>,
+    text_events: Vec<TextInputEvent>,
     simulate_touch_with_mouse: bool,
     simulate_mouse_with_touch: bool,
     /// Tracks which touch id is acting as the primary mouse (for touch→mouse simulation)
     primary_touch_id: Option<u64>,
+    /// DPI scale factor from the window, used to convert physical → logical pixels.
+    /// All public coordinate APIs return logical pixels (physical / scale_factor).
+    scale_factor: f32,
 }
 
 impl Default for Input {
@@ -29,10 +48,12 @@ impl Default for Input {
             mouse_position: (0.0, 0.0),
             mouse_delta: (0.0, 0.0),
             mouse_wheel_delta: 0.0,
-            touches: HashMap::default(),
+            touches: Vec::new(),
+            text_events: Vec::new(),
             simulate_touch_with_mouse: false,
             simulate_mouse_with_touch: false,
             primary_touch_id: None,
+            scale_factor: 1.0,
         }
     }
 }
@@ -64,28 +85,65 @@ impl Input {
 
     /// Update keyboard state from a `winit` KeyEvent
     pub(crate) fn update_key(&mut self, event: KeyEvent) {
+        if event.state == ElementState::Pressed {
+            if let Some(ref text) = event.text {
+                for c in text.chars() {
+                    self.text_events.push(TextInputEvent::Char(c));
+                }
+            }
+        }
         if let PhysicalKey::Code(key_code) = event.physical_key {
-            let prev = self
-                .keyboard
-                .get(&key_code)
-                .map_or(ElementState::Released, |(curr, _)| *curr);
+            let prev = self.keyboard.get(&key_code).map_or(ElementState::Released, |(curr, _)| *curr);
             self.keyboard.insert(key_code, (event.state, prev));
         }
     }
 
+    /// Handle an IME event from the windowing system
+    pub(crate) fn handle_ime(&mut self, ime: Ime) {
+        let event = match ime {
+            Ime::Enabled => TextInputEvent::ImeEnabled,
+            Ime::Preedit(text, cursor) => TextInputEvent::Preedit { text, cursor },
+            Ime::Commit(text) => TextInputEvent::Commit(text),
+            Ime::Disabled => TextInputEvent::ImeDisabled,
+        };
+        self.text_events.push(event);
+    }
+
     /// Update mouse button state
     pub(crate) fn update_mouse_button(&mut self, button: MouseButton, state: ElementState) {
-        let prev = self
-            .mouse_buttons
-            .get(&button)
-            .map_or(ElementState::Released, |(curr, _)| *curr);
+        let prev = self.mouse_buttons.get(&button).map_or(ElementState::Released, |(curr, _)| *curr);
         self.mouse_buttons.insert(button, (state, prev));
     }
 
-    /// Update cursor position & compute delta
+    /// Set the DPI scale factor (from window.scale_factor()).
+    /// All public coordinate APIs will divide physical pixels by this value
+    /// to return logical pixels, matching macroquad's coordinate convention.
+    pub fn set_scale_factor(&mut self, factor: f64) {
+        self.scale_factor = factor as f32;
+    }
+
+    /// Returns the current DPI scale factor.
+    pub fn scale_factor(&self) -> f32 {
+        self.scale_factor
+    }
+
+    /// Convert a physical position to logical pixels using the current scale factor.
+    fn to_logical(&self, x: f64, y: f64) -> (f32, f32) {
+        let s = self.scale_factor;
+        (x as f32 / s, y as f32 / s)
+    }
+
+    /// Set the mouse position from already-logical coordinates (no further scaling).
+    fn set_mouse_position_logical(&mut self, pos: (f32, f32)) {
+        let prev_pos = self.mouse_position;
+        self.mouse_delta = (pos.0 - prev_pos.0, pos.1 - prev_pos.1);
+        self.mouse_position = pos;
+    }
+
+    /// Update cursor position & compute delta (stores as logical pixels)
     pub(crate) fn update_cursor(&mut self, position: PhysicalPosition<f64>) {
         let prev_pos = self.mouse_position;
-        let pos: (f32, f32) = position.into();
+        let pos = self.to_logical(position.x, position.y);
         self.mouse_delta = (pos.0 - prev_pos.0, pos.1 - prev_pos.1);
         self.mouse_position = pos;
     }
@@ -95,31 +153,36 @@ impl Input {
         self.mouse_wheel_delta += delta;
     }
 
-    /// Update touch state from a winit Touch event
+    /// Update touch state from a winit Touch event.
+    /// The stored touch location is converted to logical pixels.
     pub(crate) fn update_touch(&mut self, touch: Touch) {
         let id = touch.id;
         let phase = touch.phase;
-        let location = touch.location;
+        let logical = self.to_logical(touch.location.x, touch.location.y);
+        let logical_touch = Touch {
+            location: PhysicalPosition::new(logical.0 as f64, logical.1 as f64),
+            ..touch
+        };
 
-        self.touches.insert(id, touch);
+        self.touches.push(logical_touch);
 
         if self.simulate_mouse_with_touch {
             match phase {
                 TouchPhase::Started => {
                     if self.primary_touch_id.is_none() {
                         self.primary_touch_id = Some(id);
-                        self.update_cursor(location);
+                        self.set_mouse_position_logical(logical);
                         self.update_mouse_button(MouseButton::Left, ElementState::Pressed);
                     }
                 }
                 TouchPhase::Moved => {
                     if self.primary_touch_id == Some(id) {
-                        self.update_cursor(location);
+                        self.set_mouse_position_logical(logical);
                     }
                 }
                 TouchPhase::Ended | TouchPhase::Cancelled => {
                     if self.primary_touch_id == Some(id) {
-                        self.update_cursor(location);
+                        self.set_mouse_position_logical(logical);
                         self.update_mouse_button(MouseButton::Left, ElementState::Released);
                         self.primary_touch_id = None;
                     }
@@ -139,16 +202,14 @@ impl Input {
             ElementState::Released => TouchPhase::Ended,
         };
         // Use id 0 for mouse-simulated touch
-        self.touches.insert(
-            0,
-            Touch {
-                device_id: DeviceId::dummy(),
-                id: 0,
-                phase,
-                location: PhysicalPosition::new(pos.0 as f64, pos.1 as f64),
-                force: None,
-            },
-        );
+        let touch = Touch {
+            device_id: DeviceId::dummy(),
+            id: 0,
+            phase,
+            location: PhysicalPosition::new(pos.0 as f64, pos.1 as f64),
+            force: None,
+        };
+        self.touches.push(touch);
     }
 
     /// Simulate a touch move from mouse cursor movement (called internally when simulation is enabled)
@@ -156,21 +217,16 @@ impl Input {
         if !self.simulate_touch_with_mouse {
             return;
         }
-        // Only generate a move if the simulated touch is already active
-        if let Some(touch) = self.touches.get(&0)
-            && matches!(touch.phase, TouchPhase::Started | TouchPhase::Moved)
-        {
+        if self.mouse_held(MouseButton::Left) {
             let pos = self.mouse_position;
-            self.touches.insert(
-                0,
-                Touch {
-                    device_id: DeviceId::dummy(),
-                    id: 0,
-                    phase: TouchPhase::Moved,
-                    location: PhysicalPosition::new(pos.0 as f64, pos.1 as f64),
-                    force: None,
-                },
-            );
+            let touch = Touch {
+                device_id: DeviceId::dummy(),
+                id: 0,
+                phase: TouchPhase::Moved,
+                location: PhysicalPosition::new(pos.0 as f64, pos.1 as f64),
+                force: None,
+            };
+            self.touches.push(touch);
         }
     }
 
@@ -184,38 +240,45 @@ impl Input {
         }
 
         // Drop released keys/buttons to avoid buildup
-        self.keyboard
-            .retain(|_, (curr, _)| *curr != ElementState::Released);
-        self.mouse_buttons
-            .retain(|_, (curr, _)| *curr != ElementState::Released);
+        self.keyboard.retain(|_, (curr, _)| *curr != ElementState::Released);
+        self.mouse_buttons.retain(|_, (curr, _)| *curr != ElementState::Released);
 
         self.mouse_delta = (0.0, 0.0);
         self.mouse_wheel_delta = 0.0;
 
-        // Remove ended/cancelled touches
-        self.touches
-            .retain(|_, touch| !matches!(touch.phase, TouchPhase::Ended | TouchPhase::Cancelled));
+        // Collapse touches by id: keep last event per id, remove ended/cancelled
+        let mut map = HashMap::with_capacity(self.touches.len());
+        for touch in self.touches.iter() {
+            if matches!(touch.phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+                map.remove(&touch.id);
+                continue;
+            }
+            map.insert(touch.id, *touch);
+        }
+        self.touches.clear();
+        for mut touch in map.into_values() {
+            touch.phase = TouchPhase::Moved;
+            self.touches.push(touch);
+        }
+
+        self.text_events.clear();
     }
 
     /// True if the key went from not pressed last frame to pressed this frame
     pub fn key_pressed(&self, key: KeyCode) -> bool {
-        self.keyboard.get(&key).is_some_and(|(curr, prev)| {
-            *curr == ElementState::Pressed && *prev != ElementState::Pressed
-        })
+        self.keyboard
+            .get(&key)
+            .is_some_and(|(curr, prev)| *curr == ElementState::Pressed && *prev != ElementState::Pressed)
     }
 
     /// True if key is held down (pressed now regardless of last frame)
     pub fn key_held(&self, key: KeyCode) -> bool {
-        self.keyboard
-            .get(&key)
-            .is_some_and(|(curr, _)| *curr == ElementState::Pressed)
+        self.keyboard.get(&key).is_some_and(|(curr, _)| *curr == ElementState::Pressed)
     }
 
     /// True if key was just released this frame
     pub fn key_released(&self, key: KeyCode) -> bool {
-        self.keyboard
-            .get(&key)
-            .is_some_and(|(curr, _)| *curr == ElementState::Released)
+        self.keyboard.get(&key).is_some_and(|(curr, _)| *curr == ElementState::Released)
     }
 
     /// True if any key in slice was just pressed
@@ -250,9 +313,9 @@ impl Input {
 
     /// True if mouse button was just pressed this frame
     pub fn mouse_pressed(&self, button: MouseButton) -> bool {
-        self.mouse_buttons.get(&button).is_some_and(|(curr, prev)| {
-            *curr == ElementState::Pressed && *prev != ElementState::Pressed
-        })
+        self.mouse_buttons
+            .get(&button)
+            .is_some_and(|(curr, prev)| *curr == ElementState::Pressed && *prev != ElementState::Pressed)
     }
 
     /// True if mouse button is held down
@@ -284,42 +347,41 @@ impl Input {
         self.mouse_wheel_delta
     }
 
-    /// Returns all active touches this frame
-    pub fn touches(&self) -> Vec<Touch> {
-        self.touches.values().copied().collect()
+    /// Returns all touch events received this frame, in order.
+    pub fn touches(&self) -> &[Touch] {
+        &self.touches
     }
 
-    /// Get a specific touch by its id, if it exists
+    /// Get a specific touch by its id (returns the last event for that id this frame).
     pub fn touch(&self, id: u64) -> Option<Touch> {
-        self.touches.get(&id).copied()
+        self.touches.iter().rev().find(|t| t.id == id).copied()
     }
 
-    /// Returns true if any touch is active (finger on screen)
+    /// Returns true if any touch events were received this frame.
     pub fn is_touched(&self) -> bool {
         !self.touches.is_empty()
     }
 
-    /// Returns the number of active touches
+    /// Returns the number of touch events this frame.
     pub fn touch_count(&self) -> usize {
         self.touches.len()
+    }
+
+    /// Returns all text input events received this frame
+    pub fn text_events(&self) -> &[TextInputEvent] {
+        &self.text_events
     }
 }
 
 #[cfg(test)]
 impl Input {
     pub fn inject_key(&mut self, key: KeyCode, state: ElementState) {
-        let prev = self
-            .keyboard
-            .get(&key)
-            .map_or(ElementState::Released, |(curr, _)| *curr);
+        let prev = self.keyboard.get(&key).map_or(ElementState::Released, |(curr, _)| *curr);
         self.keyboard.insert(key, (state, prev));
     }
 
     pub fn inject_mouse_button(&mut self, button: MouseButton, state: ElementState) {
-        let prev = self
-            .mouse_buttons
-            .get(&button)
-            .map_or(ElementState::Released, |(curr, _)| *curr);
+        let prev = self.mouse_buttons.get(&button).map_or(ElementState::Released, |(curr, _)| *curr);
         self.mouse_buttons.insert(button, (state, prev));
     }
 

@@ -64,18 +64,11 @@ impl TiledMap {
     }
 
     pub fn tile_to_world(&self, x: u32, y: u32) -> Vec2 {
-        vec2(
-            x as f32 * self.tilewidth as f32,
-            y as f32 * self.tileheight as f32,
-        )
+        vec2(x as f32 * self.tilewidth as f32, y as f32 * self.tileheight as f32)
     }
 
     /// iterate every non‑empty tile (x,y,gid) that overlaps `rect`
-    pub fn visible_tiles(
-        &self,
-        layer: &TiledLayer,
-        rect: &Rect,
-    ) -> impl Iterator<Item = (u32, u32, u32)> {
+    pub fn visible_tiles(&self, layer: &TiledLayer, rect: &Rect) -> impl Iterator<Item = (u32, u32, u32)> {
         let (tw, th) = self.tile_size();
         let (lw, lh) = (layer.width.unwrap(), layer.height.unwrap());
 
@@ -176,11 +169,7 @@ impl EgorMap {
 
     // gid → (tileset, uv‑quad)
     fn lookup_gid(&self, gid: u32) -> Option<(&TilesetInfo, [f32; 4])> {
-        let (_, info) = self
-            .sets
-            .iter()
-            .filter(|(fg, _)| gid >= **fg)
-            .max_by_key(|(fg, _)| **fg)?;
+        let (_, info) = self.sets.iter().filter(|(fg, _)| gid >= **fg).max_by_key(|(fg, _)| **fg)?;
 
         let local = gid - info.first_gid;
         let tx = (local % info.per_row) * info.tile_w;

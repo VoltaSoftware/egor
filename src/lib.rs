@@ -11,7 +11,6 @@
 //! - Efficient 2D rendering (shapes, textures, text)
 //! - Keyboard & mouse input
 //! - Camera & world-space transforms
-//! - Optional egui integration for tools and UIs
 //! - Optional hot-reload during development
 //!
 //! ## Start Here
@@ -42,7 +41,6 @@
 //! ---|---|---
 //! `log` | Enable logging via `egor_app/log` | opt-in
 //! `hot_reload` | Hot-reload support via `egor_glue/hot_reload` | opt-in
-//! `ui`         | Enable egui integration via `egor_glue/ui` | opt-in
 //! `webgl`      | WebGL backend for `egor_render` | opt-in
 //! `angle`      | ANGLE backend for `egor_render` | opt-in
 //! `gles`       | OpenGL ES backend for `egor_render` | opt-in
@@ -53,16 +51,14 @@
 //! - Optional backends can be enabled to override defaults or for cross-platform targeting
 
 pub mod app {
-    pub use egor_app::WindowEvent;
     #[cfg(target_os = "android")]
     pub use egor_app::{ANDROID_APP, AndroidApp};
-    pub use egor_glue::app::{App, FrameContext};
-    #[cfg(feature = "ui")]
-    pub use egor_glue::ui::egui;
+    pub use egor_app::{DeviceEvent, DeviceId, Icon, StartCause, WindowEvent};
+    pub use egor_glue::app::{App, AppControl, FrameContext};
 }
 
 pub mod input {
-    pub use egor_app::input::{Input, KeyCode, MouseButton, Touch, TouchPhase};
+    pub use egor_app::input::{Input, KeyCode, MouseButton, TextInputEvent, Touch, TouchPhase};
 }
 
 pub mod time {
@@ -79,11 +75,17 @@ pub mod render {
     pub use egor_render::{
         MemoryHints,
         target::{OffscreenTarget, RenderTarget},
+        vertex::Vertex,
     };
 }
 
 pub mod math {
     pub use egor_glue::math::{IVec2, Rect, Vec2, ivec2, vec2};
+}
+
+pub mod profiling {
+    pub use egor_glue::profile_new_frame;
+    pub use egor_glue::profiling::*;
 }
 
 #[macro_export]

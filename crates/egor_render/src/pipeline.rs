@@ -1,9 +1,8 @@
 use wgpu::{
-    BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType, BlendState,
-    BufferBindingType, ColorTargetState, ColorWrites, Device, FragmentState,
-    PipelineLayoutDescriptor, RenderPipeline, RenderPipelineDescriptor, SamplerBindingType,
-    ShaderModuleDescriptor, ShaderSource, ShaderStages, TextureFormat, TextureSampleType,
-    TextureViewDimension, VertexState, include_wgsl,
+    BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType, BlendState, BufferBindingType, ColorTargetState,
+    ColorWrites, CompareFunction, DepthStencilState, Device, FragmentState, PipelineLayoutDescriptor, RenderPipeline,
+    RenderPipelineDescriptor, SamplerBindingType, ShaderModuleDescriptor, ShaderSource, ShaderStages, StencilState, TextureFormat,
+    TextureSampleType, TextureViewDimension, VertexState, include_wgsl,
 };
 
 use crate::{instance::Instance, vertex::Vertex};
@@ -32,8 +31,7 @@ impl Pipelines {
         let texture_layout = create_texture_bind_group_layout(device);
         let camera_layout = create_camera_bind_group_layout(device);
 
-        let primitive =
-            create_primitive_pipeline(device, surface_format, &texture_layout, &camera_layout);
+        let primitive = create_primitive_pipeline(device, surface_format, &texture_layout, &camera_layout);
 
         Self {
             primitive,
@@ -110,6 +108,10 @@ fn create_texture_bind_group_layout(device: &Device) -> BindGroupLayout {
 ///
 /// Defines a single binding:
 /// - Binding 0: Uniform buffer containing view-projection matrix (vertex shader)
+///
+/// Uses `has_dynamic_offset: true` so multiple camera matrices can be stored
+/// in a single buffer and selected per-draw-call via dynamic offset, avoiding
+/// render pass splits on camera changes.
 fn create_camera_bind_group_layout(device: &Device) -> BindGroupLayout {
     device.create_bind_group_layout(&BindGroupLayoutDescriptor {
         label: Some("Camera Bind Group Layout"),
@@ -118,7 +120,7 @@ fn create_camera_bind_group_layout(device: &Device) -> BindGroupLayout {
             visibility: ShaderStages::VERTEX,
             ty: BindingType::Buffer {
                 ty: BufferBindingType::Uniform,
-                has_dynamic_offset: false,
+                has_dynamic_offset: true,
                 min_binding_size: None,
             },
             count: None,
@@ -143,8 +145,8 @@ fn create_primitive_pipeline(
 
     let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
         label: Some("Primitive Pipeline Layout"),
-        bind_group_layouts: &[texture_layout, camera_layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(texture_layout), Some(camera_layout)],
+        immediate_size: 0,
     });
 
     device.create_render_pipeline(&RenderPipelineDescriptor {
@@ -157,7 +159,13 @@ fn create_primitive_pipeline(
             compilation_options: Default::default(),
         },
         primitive: Default::default(),
-        depth_stencil: None,
+        depth_stencil: Some(DepthStencilState {
+            format: crate::Renderer::DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(CompareFunction::LessEqual),
+            stencil: StencilState::default(),
+            bias: Default::default(),
+        }),
         multisample: Default::default(),
         fragment: Some(FragmentState {
             module: &shader,
@@ -169,7 +177,7 @@ fn create_primitive_pipeline(
             })],
             compilation_options: Default::default(),
         }),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     })
 }
@@ -194,13 +202,13 @@ fn create_custom_pipeline(
         source: ShaderSource::Wgsl(wgsl_source.into()),
     });
 
-    let mut layouts: Vec<&BindGroupLayout> = vec![texture_layout, camera_layout];
-    layouts.extend(extra_layouts);
+    let mut layouts: Vec<Option<&BindGroupLayout>> = vec![Some(texture_layout), Some(camera_layout)];
+    layouts.extend(extra_layouts.iter().map(|l| Some(*l)));
 
     let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
         label: Some("Custom Pipeline Layout"),
         bind_group_layouts: &layouts,
-        push_constant_ranges: &[],
+        immediate_size: 0,
     });
 
     device.create_render_pipeline(&RenderPipelineDescriptor {
@@ -213,7 +221,13 @@ fn create_custom_pipeline(
             compilation_options: Default::default(),
         },
         primitive: Default::default(),
-        depth_stencil: None,
+        depth_stencil: Some(DepthStencilState {
+            format: crate::Renderer::DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(CompareFunction::LessEqual),
+            stencil: StencilState::default(),
+            bias: Default::default(),
+        }),
         multisample: Default::default(),
         fragment: Some(FragmentState {
             module: &shader,
@@ -225,7 +239,7 @@ fn create_custom_pipeline(
             })],
             compilation_options: Default::default(),
         }),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     })
 }

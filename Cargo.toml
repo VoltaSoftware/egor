@@ -18,13 +18,15 @@ resolver = "2"
 default = []
 log = ["egor_app/log"]
 
+android-native-activity = ["egor_app/android-native-activity"]
+android-game-activity = ["egor_app/android-game-activity"]
 webgl = ["egor_render/webgl"]
 angle = ["egor_render/angle"]
 gles = ["egor_render/gles"]
 vulkan = ["egor_render/vulkan"]
 
 hot_reload = ["egor_glue/hot_reload"]
-ui = ["egor_glue/ui"]
+profiling = ["egor_glue/profiling"]
 
 [dependencies]
 egor_app = { version = "0.10.0", path = "crates/egor_app" }
