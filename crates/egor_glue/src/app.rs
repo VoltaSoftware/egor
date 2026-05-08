@@ -30,13 +30,22 @@ fn frame_interval_for_fps(fps: u16) -> Duration {
     Duration::from_nanos((1_000_000_000u64 + fps / 2) / fps)
 }
 
+#[cfg(not(target_os = "ios"))]
+fn should_use_software_fps_limit(refresh_rate_fps: Option<u16>, fps: u16, vsync: bool) -> bool {
+    !vsync || refresh_rate_fps.is_none_or(|refresh_rate| fps < refresh_rate)
+}
+
 #[cfg(target_os = "ios")]
-fn software_frame_interval_for_fps_limit(_fps: u16) -> Option<Duration> {
+fn software_frame_interval_for_fps_limit(_window: &Window, _fps: u16, _vsync: bool) -> Option<Duration> {
     None
 }
 
 #[cfg(not(target_os = "ios"))]
-fn software_frame_interval_for_fps_limit(fps: u16) -> Option<Duration> {
+fn software_frame_interval_for_fps_limit(window: &Window, fps: u16, vsync: bool) -> Option<Duration> {
+    if !should_use_software_fps_limit(refresh_rate_fps(window), fps, vsync) {
+        return None;
+    }
+
     Some(frame_interval_for_fps(fps))
 }
 
@@ -170,6 +179,8 @@ impl<'a> AppControl<'a> {
     }
 
     /// Limit continuous redraws to the requested frames per second.
+    /// When vsync/native display scheduling can satisfy the limit, Egor leaves
+    /// redraw pacing to that path instead of adding a software interval.
     pub fn set_fps_limit(&mut self, fps: u16) {
         self.requested_fps_limit = Some(fps.max(1));
     }
@@ -330,6 +341,8 @@ impl App {
     }
 
     /// Set the maximum redraw rate while using `ControlFlow::Poll`.
+    /// When vsync/native display scheduling can satisfy the limit, Egor leaves
+    /// redraw pacing to that path instead of adding a software interval.
     pub fn fps_limit(mut self, fps: u16) -> Self {
         self.fps_limit = Some(fps.max(1));
         self
@@ -436,8 +449,9 @@ impl AppHandler<Renderer> for App {
         self.resize(size.width, size.height, renderer);
     }
 
-    fn poll_frame_interval(&self, _window: &Window) -> Option<Duration> {
-        self.fps_limit.and_then(software_frame_interval_for_fps_limit)
+    fn poll_frame_interval(&self, window: &Window) -> Option<Duration> {
+        self.fps_limit
+            .and_then(|fps_limit| software_frame_interval_for_fps_limit(window, fps_limit, self.vsync))
     }
 
     fn frame(&mut self, _window: &Window, renderer: &mut Renderer, input: &Input, timer: &FrameTimer) {
