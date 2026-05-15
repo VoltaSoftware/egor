@@ -36,13 +36,18 @@ fn should_use_software_fps_limit(refresh_rate_fps: Option<u16>, fps: u16, vsync:
 }
 
 #[cfg(target_os = "ios")]
-fn software_frame_interval_for_fps_limit(_window: &Window, _fps: u16, _vsync: bool) -> Option<Duration> {
+fn software_frame_interval_for_fps_limit(
+    _window: &Window,
+    _native_refresh_rate_fps: Option<u16>,
+    _fps: u16,
+    _vsync: bool,
+) -> Option<Duration> {
     None
 }
 
 #[cfg(not(target_os = "ios"))]
-fn software_frame_interval_for_fps_limit(window: &Window, fps: u16, vsync: bool) -> Option<Duration> {
-    if !should_use_software_fps_limit(refresh_rate_fps(window), fps, vsync) {
+fn software_frame_interval_for_fps_limit(window: &Window, native_refresh_rate_fps: Option<u16>, fps: u16, vsync: bool) -> Option<Duration> {
+    if !should_use_software_fps_limit(refresh_rate_fps(window, native_refresh_rate_fps), fps, vsync) {
         return None;
     }
 
@@ -59,15 +64,17 @@ fn set_native_preferred_fps(window: &Window, fps: u16) {
 #[cfg(not(target_os = "ios"))]
 fn set_native_preferred_fps(_window: &Window, _fps: u16) {}
 
-fn refresh_rate_fps(window: &Window) -> Option<u16> {
-    window
-        .current_monitor()
-        .and_then(|monitor| monitor.refresh_rate_millihertz())
-        .filter(|refresh_rate_millihertz| *refresh_rate_millihertz > 0)
-        .map(|refresh_rate_millihertz| {
-            let fps = (refresh_rate_millihertz + 500) / 1000;
-            fps.clamp(1, u32::from(u16::MAX)) as u16
-        })
+fn refresh_rate_fps(window: &Window, native_refresh_rate_fps: Option<u16>) -> Option<u16> {
+    native_refresh_rate_fps.or_else(|| {
+        window
+            .current_monitor()
+            .and_then(|monitor| monitor.refresh_rate_millihertz())
+            .filter(|refresh_rate_millihertz| *refresh_rate_millihertz > 0)
+            .map(|refresh_rate_millihertz| {
+                let fps = (refresh_rate_millihertz + 500) / 1000;
+                fps.clamp(1, u32::from(u16::MAX)) as u16
+            })
+    })
 }
 
 fn window_surface_size(window: &Window) -> PhysicalSize<u32> {
@@ -139,6 +146,8 @@ pub struct AppControl<'a> {
     requested_size: Option<(u32, u32)>,
     requested_vsync: Option<bool>,
     requested_fps_limit: Option<u16>,
+    native_refresh_rate_fps: Option<u16>,
+    requested_native_refresh_rate_fps: Option<Option<u16>>,
 }
 
 impl<'a> AppControl<'a> {
@@ -185,9 +194,19 @@ impl<'a> AppControl<'a> {
         self.requested_fps_limit = Some(fps.max(1));
     }
 
+    /// Override the detected native refresh rate for platforms whose winit
+    /// monitor backend cannot report it yet, such as Android in our current
+    /// winit fork. This lets the app report a value from its native shell
+    /// without adding JNI/platform code to Egor or winit.
+    pub fn set_native_refresh_rate_fps(&mut self, fps: Option<u16>) {
+        let fps = fps.filter(|fps| *fps > 0);
+        self.native_refresh_rate_fps = fps;
+        self.requested_native_refresh_rate_fps = Some(fps);
+    }
+
     /// Returns the current display refresh rate rounded to frames per second, if known.
     pub fn refresh_rate_fps(&self) -> Option<u16> {
-        refresh_rate_fps(self.window)
+        refresh_rate_fps(self.window, self.native_refresh_rate_fps)
     }
 
     /// Returns the window's DPI scale factor
@@ -217,6 +236,7 @@ pub struct App {
     render_targets: RenderTargetStore,
     screen_capture: ScreenCaptureState,
     fps_limit: Option<u16>,
+    native_refresh_rate_fps: Option<u16>,
     capture_frame_target: Option<CaptureFrameTarget>,
     offscreen_batches: Vec<PrimitiveBatch>,
     instance_byte_offsets: Vec<u64>,
@@ -244,6 +264,7 @@ impl App {
             render_targets: RenderTargetStore::new(),
             screen_capture: ScreenCaptureState::new(),
             fps_limit: None,
+            native_refresh_rate_fps: None,
             capture_frame_target: None,
             offscreen_batches: Vec::new(),
             instance_byte_offsets: Vec::new(),
@@ -451,7 +472,7 @@ impl AppHandler<Renderer> for App {
 
     fn poll_frame_interval(&self, window: &Window) -> Option<Duration> {
         self.fps_limit
-            .and_then(|fps_limit| software_frame_interval_for_fps_limit(window, fps_limit, self.vsync))
+            .and_then(|fps_limit| software_frame_interval_for_fps_limit(window, self.native_refresh_rate_fps, fps_limit, self.vsync))
     }
 
     fn frame(&mut self, _window: &Window, renderer: &mut Renderer, input: &Input, timer: &FrameTimer) {
@@ -484,7 +505,7 @@ impl AppHandler<Renderer> for App {
         self.events_drained.clear();
         std::mem::swap(&mut self.events, &mut self.events_drained);
 
-        let (requested_size, requested_vsync, requested_fps_limit) = {
+        let (requested_size, requested_vsync, requested_fps_limit, requested_native_refresh_rate_fps) = {
             let mut ctx = FrameContext {
                 events: std::mem::take(&mut self.events_drained),
                 app: AppControl {
@@ -492,6 +513,8 @@ impl AppHandler<Renderer> for App {
                     requested_size: None,
                     requested_vsync: None,
                     requested_fps_limit: None,
+                    native_refresh_rate_fps: self.native_refresh_rate_fps,
+                    requested_native_refresh_rate_fps: None,
                 },
                 gfx: Graphics::new(
                     renderer,
@@ -520,14 +543,24 @@ impl AppHandler<Renderer> for App {
             let requested_size = ctx.app.requested_size;
             let requested_vsync = ctx.app.requested_vsync;
             let requested_fps_limit = ctx.app.requested_fps_limit;
+            let requested_native_refresh_rate_fps = ctx.app.requested_native_refresh_rate_fps;
             if let Some((pw, ph)) = requested_size {
                 ctx.gfx.set_target_size(pw, ph);
             }
 
             ctx.gfx.upload_camera();
 
-            (requested_size, requested_vsync, requested_fps_limit)
+            (
+                requested_size,
+                requested_vsync,
+                requested_fps_limit,
+                requested_native_refresh_rate_fps,
+            )
         };
+
+        if let Some(native_refresh_rate_fps) = requested_native_refresh_rate_fps {
+            self.native_refresh_rate_fps = native_refresh_rate_fps;
+        }
 
         if let Some(fps_limit) = requested_fps_limit {
             if self.fps_limit != Some(fps_limit) {
