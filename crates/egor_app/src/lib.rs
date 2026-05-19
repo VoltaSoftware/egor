@@ -273,8 +273,6 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
                     if let Some(interval) = Self::poll_frame_interval_for_handler(handler, window) {
                         self.queued_poll_redraw = true;
                         self.queued_poll_redraw_at = Some(frame_started_at + interval);
-                    } else if should_request_poll_redraw_manually() {
-                        window.request_redraw();
                     }
                 }
             }
@@ -365,7 +363,16 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
         } else if self.config.control_flow == ControlFlow::Poll {
-            event_loop.set_control_flow(platform_control_flow(self.config.control_flow, self.poll_frame_interval()));
+            let poll_frame_interval = self.poll_frame_interval();
+            if poll_frame_interval.is_none()
+                && should_request_poll_redraw_manually()
+                && let Some(window) = &self.window
+            {
+                window.request_redraw();
+                event_loop.set_control_flow(ControlFlow::Wait);
+            } else {
+                event_loop.set_control_flow(platform_control_flow(self.config.control_flow, poll_frame_interval));
+            }
         }
 
         if let Some(handler) = self.handler.as_mut() {

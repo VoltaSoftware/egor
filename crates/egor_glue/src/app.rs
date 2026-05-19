@@ -64,6 +64,15 @@ fn set_native_preferred_fps(window: &Window, fps: u16) {
 #[cfg(not(target_os = "ios"))]
 fn set_native_preferred_fps(_window: &Window, _fps: u16) {}
 
+#[cfg(target_os = "ios")]
+fn clear_native_preferred_fps(window: &Window) {
+    window.set_preferred_frames_per_second(0);
+    window.set_native_display_link_enabled(true);
+}
+
+#[cfg(not(target_os = "ios"))]
+fn clear_native_preferred_fps(_window: &Window) {}
+
 fn refresh_rate_fps(window: &Window, native_refresh_rate_fps: Option<u16>) -> Option<u16> {
     native_refresh_rate_fps.or_else(|| {
         window
@@ -145,7 +154,7 @@ pub struct AppControl<'a> {
     window: &'a Window,
     requested_size: Option<(u32, u32)>,
     requested_vsync: Option<bool>,
-    requested_fps_limit: Option<u16>,
+    requested_fps_limit: Option<Option<u16>>,
     native_refresh_rate_fps: Option<u16>,
     requested_native_refresh_rate_fps: Option<Option<u16>>,
 }
@@ -191,7 +200,12 @@ impl<'a> AppControl<'a> {
     /// When vsync/native display scheduling can satisfy the limit, Egor leaves
     /// redraw pacing to that path instead of adding a software interval.
     pub fn set_fps_limit(&mut self, fps: u16) {
-        self.requested_fps_limit = Some(fps.max(1));
+        self.requested_fps_limit = Some(Some(fps.max(1)));
+    }
+
+    /// Clear the explicit FPS limit and leave redraw pacing to the platform.
+    pub fn clear_fps_limit(&mut self) {
+        self.requested_fps_limit = Some(None);
     }
 
     /// Override the detected native refresh rate for platforms whose winit
@@ -563,10 +577,20 @@ impl AppHandler<Renderer> for App {
         }
 
         if let Some(fps_limit) = requested_fps_limit {
-            if self.fps_limit != Some(fps_limit) {
-                set_native_preferred_fps(_window, fps_limit);
+            match fps_limit {
+                Some(fps_limit) => {
+                    if self.fps_limit != Some(fps_limit) {
+                        set_native_preferred_fps(_window, fps_limit);
+                    }
+                    self.fps_limit = Some(fps_limit);
+                }
+                None => {
+                    if self.fps_limit.is_some() {
+                        clear_native_preferred_fps(_window);
+                    }
+                    self.fps_limit = None;
+                }
             }
-            self.fps_limit = Some(fps_limit);
         }
 
         let has_text = text_renderer.has_entries();
