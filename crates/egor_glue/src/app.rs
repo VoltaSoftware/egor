@@ -233,7 +233,7 @@ pub struct FrameContext<'a> {
     pub events: Vec<WindowEvent>,
     pub app: AppControl<'a>,
     pub gfx: Graphics<'a>,
-    pub input: &'a Input,
+    pub input: &'a mut Input,
     pub timer: &'a FrameTimer,
 }
 
@@ -489,7 +489,7 @@ impl AppHandler<Renderer> for App {
             .and_then(|fps_limit| software_frame_interval_for_fps_limit(window, self.native_refresh_rate_fps, fps_limit, self.vsync))
     }
 
-    fn frame(&mut self, _window: &Window, renderer: &mut Renderer, input: &Input, timer: &FrameTimer) {
+    fn frame(&mut self, _window: &Window, renderer: &mut Renderer, input: &mut Input, timer: &FrameTimer) {
         profile_new_frame!();
         #[cfg(feature = "profiling")]
         profiling::scope!("frame");

@@ -119,7 +119,7 @@ pub trait AppHandler<R> {
     /// Called after the resource is initialized & window is ready
     fn on_ready(&mut self, _window: &Window, _resource: &mut R) {}
     /// Called every frame
-    fn frame(&mut self, _window: &Window, _resource: &mut R, _input: &Input, _timer: &FrameTimer) {}
+    fn frame(&mut self, _window: &Window, _resource: &mut R, _input: &mut Input, _timer: &FrameTimer) {}
     /// Called on window resize
     fn resize(&mut self, _w: u32, _h: u32, _resource: &mut R) {}
     /// Called when new events arrive, before they are dispatched
@@ -232,6 +232,7 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        self.input.clear_all_input_state();
         if let Some(handler) = self.handler.as_mut() {
             handler.suspended();
         }
@@ -266,7 +267,7 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
 
                 let frame_started_at = Instant::now();
                 self.timer.update();
-                handler.frame(window, resource, &self.input, &self.timer);
+                handler.frame(window, resource, &mut self.input, &self.timer);
                 self.input.end_frame();
 
                 if self.config.control_flow == ControlFlow::Poll {
@@ -285,6 +286,7 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
                     handler.resize(size.width, size.height, resource);
                 }
             }
+            WindowEvent::Focused(false) => self.input.clear_all_input_state(),
             WindowEvent::KeyboardInput { event, .. } => self.input.update_key(event),
             WindowEvent::MouseInput { button, state, .. } => {
                 self.input.update_mouse_button(button, state);
@@ -319,7 +321,7 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
 
         let frame_started_at = Instant::now();
         handler.on_ready(window, &mut resource);
-        handler.frame(window, &mut resource, &self.input, &self.timer);
+        handler.frame(window, &mut resource, &mut self.input, &self.timer);
 
         window.set_visible(true);
         if self.config.control_flow == ControlFlow::Poll {

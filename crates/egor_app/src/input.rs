@@ -264,6 +264,25 @@ impl Input {
         self.text_events.clear();
     }
 
+    /// Clear all tracked keyboard state, including pending text input.
+    ///
+    /// Use this when the app knows keyboard ownership has changed and stale
+    /// held keys should not carry forward into the next gameplay/UI context.
+    pub fn clear_keyboard_state(&mut self) {
+        self.keyboard.clear();
+        self.text_events.clear();
+    }
+
+    /// Clear every tracked input state held by the backend.
+    pub fn clear_all_input_state(&mut self) {
+        self.clear_keyboard_state();
+        self.mouse_buttons.clear();
+        self.mouse_delta = (0.0, 0.0);
+        self.mouse_wheel_delta = 0.0;
+        self.touches.clear();
+        self.primary_touch_id = None;
+    }
+
     /// True if the key went from not pressed last frame to pressed this frame
     pub fn key_pressed(&self, key: KeyCode) -> bool {
         self.keyboard
@@ -510,5 +529,21 @@ mod tests {
         assert!(input.key_pressed(KeyCode::KeyX));
         assert!(input.key_held(KeyCode::KeyX));
         assert!(!input.key_released(KeyCode::KeyX));
+    }
+
+    #[test]
+    fn clear_keyboard_state_drops_held_keys() {
+        let mut input = Input::default();
+
+        input.inject_key(KeyCode::KeyW, Pressed);
+        input.inject_key(KeyCode::ArrowUp, Pressed);
+        assert!(input.key_held(KeyCode::KeyW));
+        assert!(input.key_held(KeyCode::ArrowUp));
+
+        input.clear_keyboard_state();
+
+        assert!(!input.key_held(KeyCode::KeyW));
+        assert!(!input.key_held(KeyCode::ArrowUp));
+        assert!(!input.key_pressed(KeyCode::KeyW));
     }
 }
