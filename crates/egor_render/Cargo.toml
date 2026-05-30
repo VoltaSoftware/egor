@@ -44,8 +44,8 @@ wgpu = { version = "29.0.3", default-features = false, features = [
     "webgpu",
     "webgl",
 ] }
-web-sys = { version = "0.3.98", features = ["Window", "Document", "Element", "HtmlCanvasElement"] }
-wasm-bindgen = "0.2.121"
+web-sys = { version = "0.3.99", features = ["Window", "Document", "Element", "HtmlCanvasElement"] }
+wasm-bindgen = "0.2.122"
 
 [dev-dependencies]
 winit = { git = "https://github.com/VoltaSoftware/winit", branch = "lot" }
