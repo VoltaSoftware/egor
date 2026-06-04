@@ -23,7 +23,7 @@ pub trait RenderTarget {
 pub(crate) fn surface_config(surface: &Surface<'_>, adapter: &Adapter, w: u32, h: u32) -> (SurfaceConfiguration, TextureFormat, bool) {
     let caps = surface.get_capabilities(adapter);
     let mut config = surface.get_default_config(adapter, w, h).unwrap();
-    config.present_mode = PresentMode::AutoVsync;
+    config.present_mode = PresentMode::Fifo;
 
     let surface_copy_src = caps.usages.contains(TextureUsages::COPY_SRC);
     if surface_copy_src {

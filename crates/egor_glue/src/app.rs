@@ -30,11 +30,6 @@ fn frame_interval_for_fps(fps: u16) -> Duration {
     Duration::from_nanos((1_000_000_000u64 + fps / 2) / fps)
 }
 
-#[cfg(not(target_os = "ios"))]
-fn should_use_software_fps_limit(refresh_rate_fps: Option<u16>, fps: u16, vsync: bool) -> bool {
-    !vsync || refresh_rate_fps.is_none_or(|refresh_rate| fps < refresh_rate)
-}
-
 #[cfg(target_os = "ios")]
 fn software_frame_interval_for_fps_limit(
     _window: &Window,
@@ -46,12 +41,23 @@ fn software_frame_interval_for_fps_limit(
 }
 
 #[cfg(not(target_os = "ios"))]
-fn software_frame_interval_for_fps_limit(window: &Window, native_refresh_rate_fps: Option<u16>, fps: u16, vsync: bool) -> Option<Duration> {
-    if !should_use_software_fps_limit(refresh_rate_fps(window, native_refresh_rate_fps), fps, vsync) {
-        return None;
-    }
-
+fn software_frame_interval_for_fps_limit(
+    _window: &Window,
+    _native_refresh_rate_fps: Option<u16>,
+    fps: u16,
+    _vsync: bool,
+) -> Option<Duration> {
     Some(frame_interval_for_fps(fps))
+}
+
+#[cfg(target_os = "ios")]
+fn hardware_vsync_enabled(vsync: bool, _fps_limit: Option<u16>) -> bool {
+    vsync
+}
+
+#[cfg(not(target_os = "ios"))]
+fn hardware_vsync_enabled(vsync: bool, fps_limit: Option<u16>) -> bool {
+    vsync && fps_limit.is_none()
 }
 
 #[cfg(target_os = "ios")]
@@ -197,8 +203,6 @@ impl<'a> AppControl<'a> {
     }
 
     /// Limit continuous redraws to the requested frames per second.
-    /// When vsync/native display scheduling can satisfy the limit, Egor leaves
-    /// redraw pacing to that path instead of adding a software interval.
     pub fn set_fps_limit(&mut self, fps: u16) {
         self.requested_fps_limit = Some(Some(fps.max(1)));
     }
@@ -376,8 +380,8 @@ impl App {
     }
 
     /// Set the maximum redraw rate while using `ControlFlow::Poll`.
-    /// When vsync/native display scheduling can satisfy the limit, Egor leaves
-    /// redraw pacing to that path instead of adding a software interval.
+    /// Desktop platforms use software pacing for explicit FPS limits. Platforms
+    /// with native dynamic frame-rate support may apply the limit in the driver.
     pub fn fps_limit(mut self, fps: u16) -> Self {
         self.fps_limit = Some(fps.max(1));
         self
@@ -474,7 +478,10 @@ impl AppHandler<Renderer> for App {
 
     fn on_ready(&mut self, window: &Window, renderer: &mut Renderer) {
         let (device, format) = (renderer.device(), self.backbuffer.as_ref().unwrap().format());
-        self.backbuffer.as_mut().unwrap().set_vsync(device, self.vsync);
+        self.backbuffer
+            .as_mut()
+            .unwrap()
+            .set_vsync(device, hardware_vsync_enabled(self.vsync, self.fps_limit));
         self.text_renderer = Some(TextRenderer::new(device, renderer.queue(), format));
         if let Some(fps_limit) = self.fps_limit {
             set_native_preferred_fps(window, fps_limit);
@@ -576,17 +583,20 @@ impl AppHandler<Renderer> for App {
             self.native_refresh_rate_fps = native_refresh_rate_fps;
         }
 
+        let mut fps_limit_changed = false;
         if let Some(fps_limit) = requested_fps_limit {
             match fps_limit {
                 Some(fps_limit) => {
                     if self.fps_limit != Some(fps_limit) {
                         set_native_preferred_fps(_window, fps_limit);
+                        fps_limit_changed = true;
                     }
                     self.fps_limit = Some(fps_limit);
                 }
                 None => {
                     if self.fps_limit.is_some() {
                         clear_native_preferred_fps(_window);
+                        fps_limit_changed = true;
                     }
                     self.fps_limit = None;
                 }
@@ -905,8 +915,13 @@ impl AppHandler<Renderer> for App {
             self.backbuffer.as_mut().unwrap().resize(&device, rw, rh);
         }
         if let Some(vsync) = requested_vsync {
-            self.backbuffer.as_mut().unwrap().set_vsync(&device, vsync);
             self.vsync = vsync;
+        }
+        if requested_vsync.is_some() || fps_limit_changed {
+            self.backbuffer
+                .as_mut()
+                .unwrap()
+                .set_vsync(&device, hardware_vsync_enabled(self.vsync, self.fps_limit));
         }
     }
 
@@ -924,7 +939,7 @@ impl AppHandler<Renderer> for App {
         let size = window_surface_size(&window);
         let device = renderer.device();
         let mut backbuffer = Backbuffer::new(renderer.instance(), renderer.adapter(), device, window, size.width, size.height);
-        backbuffer.set_vsync(device, self.vsync);
+        backbuffer.set_vsync(device, hardware_vsync_enabled(self.vsync, self.fps_limit));
         self.backbuffer = Some(backbuffer);
     }
 }
