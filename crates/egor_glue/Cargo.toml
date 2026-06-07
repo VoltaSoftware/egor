@@ -21,6 +21,7 @@ web-time = "1.1.0"
 color = "0.3.3"
 glam = "0.33.0"
 glyphon = "0.11.0"
+log = "0.4"
 lyon = { version = "1.0.19" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

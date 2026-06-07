@@ -9,6 +9,15 @@ use wasm_bindgen::JsCast;
 
 use crate::frame::Presentable;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurfaceAcquireFailure {
+    Timeout,
+    Occluded,
+    Outdated,
+    Lost,
+    Validation,
+}
+
 /// Trait for render targets (backbuffers, offscreen textures, etc.)
 pub trait RenderTarget {
     fn format(&self) -> TextureFormat;
@@ -67,6 +76,7 @@ pub struct Backbuffer {
     /// via `view_formats`.
     view_format: TextureFormat,
     surface_copy_src: bool,
+    last_acquire_failure: Option<SurfaceAcquireFailure>,
 }
 
 impl Backbuffer {
@@ -78,19 +88,46 @@ impl Backbuffer {
         w: u32,
         h: u32,
     ) -> Self {
+        log::info!("[egor] backbuffer init: creating surface {w}x{h}");
         let surface = instance.create_surface(window).unwrap();
+        log::info!("[egor] backbuffer init: building surface config");
         let (config, view_format, surface_copy_src) = surface_config(&surface, adapter, w, h);
+        log::info!(
+            "[egor] backbuffer init: configuring surface format={:?} view_format={:?} copy_src={}",
+            config.format,
+            view_format,
+            surface_copy_src
+        );
         surface.configure(device, &config);
+        log::info!("[egor] backbuffer init: complete");
         Self {
             surface,
             config,
             view_format,
             surface_copy_src,
+            last_acquire_failure: None,
         }
     }
 
     pub fn supports_copy_src(&self) -> bool {
         self.surface_copy_src
+    }
+
+    pub fn last_acquire_failure(&self) -> Option<SurfaceAcquireFailure> {
+        self.last_acquire_failure
+    }
+
+    fn record_acquire_success(&mut self) {
+        if let Some(failure) = self.last_acquire_failure.take() {
+            log::info!("[egor] surface acquire recovered after {failure:?}");
+        }
+    }
+
+    fn record_acquire_failure(&mut self, failure: SurfaceAcquireFailure) {
+        if self.last_acquire_failure != Some(failure) {
+            log::warn!("[egor] surface acquire failed: {failure:?}");
+            self.last_acquire_failure = Some(failure);
+        }
     }
 }
 
@@ -119,6 +156,7 @@ impl RenderTarget for Backbuffer {
 
         match self.surface.get_current_texture() {
             CurrentSurfaceTexture::Success(surface_texture) | CurrentSurfaceTexture::Suboptimal(surface_texture) => {
+                self.record_acquire_success();
                 let view = surface_texture.texture.create_view(&TextureViewDescriptor {
                     format: Some(self.view_format),
                     ..Default::default()
@@ -126,11 +164,25 @@ impl RenderTarget for Backbuffer {
                 Some((view, Some(Presentable::Surface(surface_texture))))
             }
             CurrentSurfaceTexture::Outdated => {
+                self.record_acquire_failure(SurfaceAcquireFailure::Outdated);
                 self.resize(device, self.config.width, self.config.height);
                 None
             }
-            other => {
-                //eprintln!("Surface error: {:?}", other);
+            CurrentSurfaceTexture::Lost => {
+                self.record_acquire_failure(SurfaceAcquireFailure::Lost);
+                self.surface.configure(device, &self.config);
+                None
+            }
+            CurrentSurfaceTexture::Timeout => {
+                self.record_acquire_failure(SurfaceAcquireFailure::Timeout);
+                None
+            }
+            CurrentSurfaceTexture::Occluded => {
+                self.record_acquire_failure(SurfaceAcquireFailure::Occluded);
+                None
+            }
+            CurrentSurfaceTexture::Validation => {
+                self.record_acquire_failure(SurfaceAcquireFailure::Validation);
                 None
             }
         }

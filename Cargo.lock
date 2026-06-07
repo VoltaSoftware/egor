@@ -864,6 +864,7 @@ dependencies = [
  "egor_render",
  "glam",
  "glyphon",
+ "log",
  "lyon",
  "profiling",
  "puffin",

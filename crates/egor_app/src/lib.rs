@@ -25,6 +25,8 @@ use std::sync::OnceLock;
 #[cfg(target_os = "android")]
 pub use winit::platform::android::activity::AndroidApp;
 #[cfg(target_os = "android")]
+pub use winit::platform::android::activity::AndroidAppWaker;
+#[cfg(target_os = "android")]
 pub static ANDROID_APP: OnceLock<AndroidApp> = OnceLock::new();
 
 use winit::{

@@ -7,6 +7,8 @@ mod texture;
 mod uniforms;
 pub mod vertex;
 
+use std::sync::Arc;
+
 pub use wgpu::{
     self, Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, Extent3d, MemoryHints, Queue, RenderPass, Texture, TextureFormat,
 };
@@ -66,11 +68,14 @@ impl Renderer {
     ///
     /// Sets up wgpu, pipelines, default texture & camera resources
     pub async fn new(window: impl Into<SurfaceTarget<'static>> + WindowHandle, memory_hints: &MemoryHints) -> Self {
+        log::info!("[egor] renderer init: creating wgpu instance");
         let mut desc = InstanceDescriptor::new_without_display_handle_from_env();
         desc.flags.remove(wgpu::InstanceFlags::VALIDATION);
         desc.flags.remove(wgpu::InstanceFlags::DEBUG);
         let instance = new_instance_with_webgpu_detection(desc).await;
+        log::info!("[egor] renderer init: creating adapter selection surface");
         let surface = instance.create_surface(window).unwrap();
+        log::info!("[egor] renderer init: requesting adapter");
         let adapter = instance
             .request_adapter(&RequestAdapterOptions {
                 // Required for WebGL to prevent selecting a non-presentable device
@@ -98,6 +103,7 @@ impl Renderer {
         #[cfg(not(target_arch = "wasm32"))]
         let mut required_limits = adapter_limits;
         required_limits.max_texture_dimension_2d = required_limits.max_texture_dimension_2d.max(REQUIRED_MAX_TEXTURE_DIMENSION_2D);
+        log::info!("[egor] renderer init: requesting device");
         let (device, queue) = adapter
             .request_device(&DeviceDescriptor {
                 required_limits,
@@ -106,8 +112,12 @@ impl Renderer {
             })
             .await
             .unwrap();
+        device.on_uncaptured_error(Arc::new(|error| {
+            log::error!("[egor] wgpu uncaptured error: {error:?}");
+        }));
 
         let (_surface_config, surface_format, _) = target::surface_config(&surface, &adapter, 1, 1);
+        log::info!("[egor] renderer init: creating pipelines and core buffers");
         let pipelines = Pipelines::new(&device, surface_format);
 
         let quad_vertex_buffer = device.create_buffer_init(&BufferInitDescriptor {
@@ -154,6 +164,7 @@ impl Renderer {
         let textures = Textures::new(&device, &queue);
 
         let (depth_texture, depth_view) = Self::create_depth_texture(&device, 1, 1);
+        log::info!("[egor] renderer init: complete");
 
         Renderer {
             gpu: Gpu {

@@ -14,17 +14,18 @@ use egor_app::PhysicalPosition;
 #[cfg(target_os = "ios")]
 use egor_app::WindowExtIOS;
 use egor_app::{
-    AppConfig, AppHandler, AppRunner, ControlFlow, Fullscreen, PhysicalSize, Window, WindowEvent, input::Input, time::FrameTimer,
+    AppConfig, AppHandler, AppRunner, ControlFlow, Fullscreen, PhysicalSize, StartCause, Window, WindowEvent, input::Input,
+    time::FrameTimer,
 };
 use egor_render::{
     MemoryHints, Renderer, TextureFormat,
     instance::Instance,
-    target::{Backbuffer, RenderTarget},
+    target::{Backbuffer, RenderTarget, SurfaceAcquireFailure},
 };
 
 type UpdateFn = dyn FnMut(&mut FrameContext);
+type UrgentEventsFn = dyn FnMut();
 
-#[cfg(not(target_os = "ios"))]
 fn frame_interval_for_fps(fps: u16) -> Duration {
     let fps = u64::from(fps.max(1));
     Duration::from_nanos((1_000_000_000u64 + fps / 2) / fps)
@@ -90,6 +91,16 @@ fn refresh_rate_fps(window: &Window, native_refresh_rate_fps: Option<u16>) -> Op
                 fps.clamp(1, u32::from(u16::MAX)) as u16
             })
     })
+}
+
+fn surface_acquire_retry_interval(window: &Window, native_refresh_rate_fps: Option<u16>, consecutive_failures: u32) -> Duration {
+    if consecutive_failures > 3 {
+        return Duration::from_millis(100);
+    }
+
+    refresh_rate_fps(window, native_refresh_rate_fps)
+        .map(frame_interval_for_fps)
+        .unwrap_or_else(|| Duration::from_millis(16))
 }
 
 fn window_surface_size(window: &Window) -> PhysicalSize<u32> {
@@ -245,10 +256,12 @@ pub struct App {
     events: Vec<WindowEvent>,
     events_drained: Vec<WindowEvent>,
     update: Option<Box<UpdateFn>>,
+    urgent_events: Option<Box<UrgentEventsFn>>,
     config: Option<AppConfig>,
     vsync: bool,
     text_renderer: Option<TextRenderer>,
     backbuffer: Option<Backbuffer>,
+    window: Option<Arc<Window>>,
     primitive_batch: PrimitiveBatch,
     memory_hints: MemoryHints,
     render_targets: RenderTargetStore,
@@ -258,6 +271,8 @@ pub struct App {
     capture_frame_target: Option<CaptureFrameTarget>,
     offscreen_batches: Vec<PrimitiveBatch>,
     instance_byte_offsets: Vec<u64>,
+    surface_acquire_retry_interval: Option<Duration>,
+    surface_acquire_failure_count: u32,
 }
 
 impl Default for App {
@@ -273,10 +288,12 @@ impl App {
             events: Vec::new(),
             events_drained: Vec::new(),
             update: None,
+            urgent_events: None,
             config: Some(AppConfig::default()),
             vsync: true,
             text_renderer: None,
             backbuffer: None,
+            window: None,
             memory_hints: MemoryHints::Performance,
             primitive_batch: PrimitiveBatch::default(),
             render_targets: RenderTargetStore::new(),
@@ -286,6 +303,8 @@ impl App {
             capture_frame_target: None,
             offscreen_batches: Vec::new(),
             instance_byte_offsets: Vec::new(),
+            surface_acquire_retry_interval: None,
+            surface_acquire_failure_count: 0,
         }
     }
 
@@ -435,6 +454,12 @@ impl App {
         self
     }
 
+    /// Run urgent platform work on the app/event-loop thread outside the frame callback.
+    pub fn urgent_events(mut self, callback: impl FnMut() + 'static) -> Self {
+        self.urgent_events = Some(Box::new(callback));
+        self
+    }
+
     /// Run the app with a per-frame update closure
     pub fn run(mut self, #[allow(unused_mut)] mut update: impl FnMut(&mut FrameContext) + 'static) {
         #[cfg(all(feature = "hot_reload", not(target_arch = "wasm32")))]
@@ -450,9 +475,60 @@ impl App {
         let config = self.config.take().unwrap();
         AppRunner::new(self, config).run();
     }
+
+    fn run_urgent_events(&mut self) {
+        if let Some(urgent_events) = self.urgent_events.as_mut() {
+            urgent_events();
+        }
+    }
+
+    fn recreate_backbuffer(&mut self, renderer: &mut Renderer) -> bool {
+        let Some(window) = self.window.as_ref().cloned() else {
+            log::warn!("[egor] cannot recreate backbuffer because no window handle is available");
+            return false;
+        };
+
+        let size = window_surface_size(&window);
+        if size.width == 0 || size.height == 0 {
+            return false;
+        }
+
+        self.backbuffer = None;
+        let mut backbuffer = Backbuffer::new(
+            renderer.instance(),
+            renderer.adapter(),
+            renderer.device(),
+            window,
+            size.width,
+            size.height,
+        );
+        backbuffer.set_vsync(renderer.device(), hardware_vsync_enabled(self.vsync, self.fps_limit));
+
+        self.backbuffer = Some(backbuffer);
+        renderer.ensure_depth_size(size.width, size.height);
+        if let Some(text_renderer) = self.text_renderer.as_mut() {
+            text_renderer.resize(size.width, size.height, renderer.queue());
+        }
+
+        log::warn!(
+            "[egor] recreated backbuffer after surface acquire failure at {}x{}",
+            size.width,
+            size.height
+        );
+
+        true
+    }
 }
 
 impl AppHandler<Renderer> for App {
+    fn new_events(&mut self, _cause: StartCause) {
+        self.run_urgent_events();
+    }
+
+    fn about_to_wait(&mut self) {
+        self.run_urgent_events();
+    }
+
     fn on_window_event(&mut self, _window: &Window, event: &WindowEvent) {
         self.events.push(event.clone());
     }
@@ -464,7 +540,11 @@ impl AppHandler<Renderer> for App {
             if size.width == 0 { 800 } else { size.width },
             if size.height == 0 { 600 } else { size.height },
         );
+        log::info!("[egor] app resource init: start {w}x{h}");
         let renderer = Renderer::new(window.clone(), &self.memory_hints).await;
+        log::info!("[egor] app resource init: renderer ready");
+        self.window = Some(window.clone());
+        log::info!("[egor] app resource init: creating first backbuffer");
         self.backbuffer = Some(Backbuffer::new(
             renderer.instance(),
             renderer.adapter(),
@@ -473,10 +553,12 @@ impl AppHandler<Renderer> for App {
             w,
             h,
         ));
+        log::info!("[egor] app resource init: complete");
         renderer
     }
 
     fn on_ready(&mut self, window: &Window, renderer: &mut Renderer) {
+        log::info!("[egor] app ready: configuring render resources");
         let (device, format) = (renderer.device(), self.backbuffer.as_ref().unwrap().format());
         self.backbuffer
             .as_mut()
@@ -489,11 +571,20 @@ impl AppHandler<Renderer> for App {
 
         let size = window_surface_size(window);
         self.resize(size.width, size.height, renderer);
+        log::info!("[egor] app ready: complete");
     }
 
     fn poll_frame_interval(&self, window: &Window) -> Option<Duration> {
-        self.fps_limit
-            .and_then(|fps_limit| software_frame_interval_for_fps_limit(window, self.native_refresh_rate_fps, fps_limit, self.vsync))
+        let fps_limit_interval = self
+            .fps_limit
+            .and_then(|fps_limit| software_frame_interval_for_fps_limit(window, self.native_refresh_rate_fps, fps_limit, self.vsync));
+
+        match (self.surface_acquire_retry_interval, fps_limit_interval) {
+            (Some(retry_interval), Some(fps_limit_interval)) if retry_interval > fps_limit_interval => Some(retry_interval),
+            (Some(_), Some(fps_limit_interval)) => Some(fps_limit_interval),
+            (Some(retry_interval), None) => Some(retry_interval),
+            (None, fps_limit_interval) => fps_limit_interval,
+        }
     }
 
     fn frame(&mut self, _window: &Window, renderer: &mut Renderer, input: &mut Input, timer: &FrameTimer) {
@@ -666,9 +757,26 @@ impl AppHandler<Renderer> for App {
         };
 
         let Some(mut frame) = renderer.begin_frame(backbuffer) else {
+            let acquire_failure = backbuffer.last_acquire_failure();
+            self.surface_acquire_failure_count = self.surface_acquire_failure_count.saturating_add(1);
+            self.surface_acquire_retry_interval = Some(surface_acquire_retry_interval(
+                _window,
+                self.native_refresh_rate_fps,
+                self.surface_acquire_failure_count,
+            ));
             self.primitive_batch.recycle(batches);
+            if matches!(
+                acquire_failure,
+                Some(SurfaceAcquireFailure::Validation | SurfaceAcquireFailure::Lost)
+            ) && self.recreate_backbuffer(renderer)
+            {
+                self.surface_acquire_failure_count = 0;
+                self.surface_acquire_retry_interval = Some(surface_acquire_retry_interval(_window, self.native_refresh_rate_fps, 0));
+            }
             return;
         };
+        self.surface_acquire_failure_count = 0;
+        self.surface_acquire_retry_interval = None;
 
         let main_view = capture_frame_view.unwrap_or(&frame.view);
 
@@ -932,14 +1040,18 @@ impl AppHandler<Renderer> for App {
     }
 
     fn suspended(&mut self) {
+        log::info!("[egor] app suspended: dropping backbuffer");
         self.backbuffer = None;
     }
 
     fn resumed(&mut self, window: Arc<Window>, renderer: &mut Renderer) {
         let size = window_surface_size(&window);
         let device = renderer.device();
+        self.window = Some(window.clone());
+        log::info!("[egor] app resumed: recreating backbuffer {}x{}", size.width, size.height);
         let mut backbuffer = Backbuffer::new(renderer.instance(), renderer.adapter(), device, window, size.width, size.height);
         backbuffer.set_vsync(device, hardware_vsync_enabled(self.vsync, self.fps_limit));
         self.backbuffer = Some(backbuffer);
+        log::info!("[egor] app resumed: complete");
     }
 }

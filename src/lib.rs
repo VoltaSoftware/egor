@@ -52,7 +52,7 @@
 
 pub mod app {
     #[cfg(target_os = "android")]
-    pub use egor_app::{ANDROID_APP, AndroidApp};
+    pub use egor_app::{ANDROID_APP, AndroidApp, AndroidAppWaker};
     pub use egor_app::{DeviceEvent, DeviceId, Icon, StartCause, WindowEvent};
     pub use egor_glue::app::{App, AppControl, FrameContext};
 }
