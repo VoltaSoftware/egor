@@ -21,7 +21,7 @@ log = [
 ]
 
 [dependencies]
-log = { version = "0.4.30", optional = true }
+log = { version = "0.4.32", optional = true }
 web-time = "1.1.0"
 winit = { git = "https://github.com/VoltaSoftware/winit", branch = "lot" }
 
