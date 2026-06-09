@@ -10,6 +10,8 @@ compile_error!("On Android, enable either the `android-native-activity` or `andr
 use crate::{input::Input, time::FrameTimer};
 use std::sync::Arc;
 use web_time::{Duration, Instant};
+#[cfg(target_os = "android")]
+pub use winit::event::AndroidLifecycle;
 pub use winit::{
     dpi::{PhysicalPosition, PhysicalSize},
     event::{DeviceEvent, DeviceId, StartCause, WindowEvent},
@@ -122,6 +124,12 @@ pub trait AppHandler<R> {
     fn on_ready(&mut self, _window: &Window, _resource: &mut R) {}
     /// Called every frame
     fn frame(&mut self, _window: &Window, _resource: &mut R, _input: &mut Input, _timer: &FrameTimer) {}
+    /// Return true when the resource should be dropped and recreated.
+    fn resource_recreate_requested(&self) -> bool {
+        false
+    }
+    /// Called immediately before the current resource is dropped for recreation.
+    fn before_resource_recreate(&mut self) {}
     /// Called on window resize
     fn resize(&mut self, _w: u32, _h: u32, _resource: &mut R) {}
     /// Called when new events arrive, before they are dispatched
@@ -138,6 +146,10 @@ pub trait AppHandler<R> {
     fn memory_warning(&mut self) {}
     /// Called for raw device events (e.g. gamepad, unprocessed input)
     fn device_event(&mut self, _device_id: DeviceId, _event: &DeviceEvent) {}
+    /// Called for Android activity lifecycle events that do not necessarily
+    /// imply surface creation/destruction.
+    #[cfg(target_os = "android")]
+    fn android_lifecycle(&mut self, _lifecycle: AndroidLifecycle) {}
 }
 
 /// Generic application entry point
@@ -164,8 +176,12 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
             handler.resumed(window, resource);
         }
 
+        if self.window.is_some() {
+            return;
+        }
+
         // Called when window is ready; initializes the resource async (wasm) or sync (native)
-        let Some(proxy) = self.proxy.take() else {
+        let Some(proxy) = self.proxy.clone() else {
             return;
         };
 
@@ -270,7 +286,13 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
                 let frame_started_at = Instant::now();
                 self.timer.update();
                 handler.frame(window, resource, &mut self.input, &self.timer);
+                let recreate_resource = handler.resource_recreate_requested();
                 self.input.end_frame();
+
+                if recreate_resource {
+                    self.recreate_resource();
+                    return;
+                }
 
                 if self.config.control_flow == ControlFlow::Poll {
                     if let Some(interval) = Self::poll_frame_interval_for_handler(handler, window) {
@@ -280,10 +302,6 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
                 }
             }
             WindowEvent::Resized(size) => {
-                if size.width == 0 || size.height == 0 {
-                    return;
-                }
-
                 if let (Some(resource), Some(handler)) = (self.resource.as_mut(), self.handler.as_mut()) {
                     handler.resize(size.width, size.height, resource);
                 }
@@ -324,8 +342,16 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
         let frame_started_at = Instant::now();
         handler.on_ready(window, &mut resource);
         handler.frame(window, &mut resource, &mut self.input, &self.timer);
+        let recreate_resource = handler.resource_recreate_requested();
 
         window.set_visible(true);
+        if recreate_resource {
+            self.resource = Some(resource);
+            self.handler = Some(handler);
+            self.recreate_resource();
+            return;
+        }
+
         if self.config.control_flow == ControlFlow::Poll {
             if let Some(interval) = Self::poll_frame_interval_for_handler(&handler, window) {
                 self.queued_poll_redraw = true;
@@ -401,6 +427,13 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
             handler.device_event(device_id, &event);
         }
     }
+
+    #[cfg(target_os = "android")]
+    fn android_lifecycle(&mut self, _event_loop: &ActiveEventLoop, lifecycle: AndroidLifecycle) {
+        if let Some(handler) = self.handler.as_mut() {
+            handler.android_lifecycle(lifecycle);
+        }
+    }
 }
 
 impl<R, H: AppHandler<R> + 'static> AppRunner<R, H> {
@@ -432,6 +465,40 @@ impl<R, H: AppHandler<R> + 'static> AppRunner<R, H> {
         handler.poll_frame_interval(window)
     }
 
+    fn recreate_resource(&mut self) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let Some(proxy) = self.proxy.clone() else {
+            return;
+        };
+        let Some(mut handler) = self.prepare_resource_recreate() else {
+            return;
+        };
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            wasm_bindgen_futures::spawn_local(async move {
+                let resource = handler.with_resource(window).await;
+                _ = proxy.send_event((resource, handler));
+            });
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let resource = pollster::block_on(handler.with_resource(window));
+            _ = proxy.send_event((resource, handler));
+        }
+    }
+
+    fn prepare_resource_recreate(&mut self) -> Option<H> {
+        let mut handler = self.handler.take()?;
+        self.resource = None;
+        self.queued_poll_redraw = false;
+        self.queued_poll_redraw_at = None;
+        handler.before_resource_recreate();
+        Some(handler)
+    }
+
     /// Runs the app’s event loop on the current platform
     ///
     /// Handles Android, WASM and native setups, plus logging and user events
@@ -447,7 +514,14 @@ impl<R, H: AppHandler<R> + 'static> AppRunner<R, H> {
             event_loop_builder.with_android_app(android_app);
         }
 
-        let event_loop = event_loop_builder.build().unwrap();
+        let event_loop = match event_loop_builder.build() {
+            Ok(event_loop) => event_loop,
+            Err(error) => {
+                #[cfg(feature = "log")]
+                log::error!("[egor] failed to build event loop: {error:?}");
+                return;
+            }
+        };
         event_loop.set_control_flow(platform_control_flow(self.config.control_flow, None));
         self.proxy = Some(event_loop.create_proxy());
 
@@ -474,5 +548,62 @@ impl<R, H: AppHandler<R> + 'static> AppRunner<R, H> {
 
             event_loop.run_app(&mut self).unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    struct TestHandler {
+        before_recreate_calls: Rc<Cell<u32>>,
+    }
+
+    impl AppHandler<u32> for TestHandler {
+        async fn with_resource(&mut self, _window: Arc<Window>) -> u32 {
+            2
+        }
+
+        fn before_resource_recreate(&mut self) {
+            self.before_recreate_calls.set(self.before_recreate_calls.get() + 1);
+        }
+    }
+
+    #[test]
+    fn prepare_resource_recreate_drops_old_resource_and_preserves_handler() {
+        let before_recreate_calls = Rc::new(Cell::new(0));
+        let mut runner = AppRunner::new(
+            TestHandler {
+                before_recreate_calls: Rc::clone(&before_recreate_calls),
+            },
+            AppConfig::default(),
+        );
+        runner.resource = Some(1);
+        runner.queued_poll_redraw = true;
+        runner.queued_poll_redraw_at = Some(Instant::now());
+
+        let handler = runner.prepare_resource_recreate();
+
+        assert!(handler.is_some());
+        assert!(runner.resource.is_none());
+        assert!(!runner.queued_poll_redraw);
+        assert!(runner.queued_poll_redraw_at.is_none());
+        assert_eq!(before_recreate_calls.get(), 1);
+    }
+
+    #[test]
+    fn recreated_resource_can_be_installed_after_prepare() {
+        let before_recreate_calls = Rc::new(Cell::new(0));
+        let mut runner = AppRunner::new(TestHandler { before_recreate_calls }, AppConfig::default());
+        runner.resource = Some(1);
+
+        let handler = runner.prepare_resource_recreate().expect("handler should be returned");
+        runner.resource = Some(2);
+        runner.handler = Some(handler);
+
+        assert_eq!(runner.resource, Some(2));
+        assert!(runner.handler.is_some());
     }
 }

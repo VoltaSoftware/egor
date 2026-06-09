@@ -272,12 +272,66 @@ impl PrimitiveBatch {
         self.draw_depth = 0.0;
         self.has_rt_overrides = false;
     }
+
+    /// Drops all cached geometry batches and GPU buffers.
+    ///
+    /// Normal frame reset keeps buffers alive for reuse. This is only for GPU
+    /// device recreation, where buffers created by the old device must not be
+    /// reused with the new one.
+    pub(crate) fn drop_gpu_resources(&mut self) {
+        self.batches.clear();
+        self.drained.clear();
+        self.recycled.clear();
+        self.scissor = None;
+        self.camera_slot = 0;
+        self.camera_matrices.clear();
+        self.camera_count = 0;
+        self.render_target = None;
+        self.draw_depth = 0.0;
+        self.has_rt_overrides = false;
+    }
 }
 
 /// Common anchor options
 pub enum Anchor {
     Center,
     TopLeft,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drop_gpu_resources_clears_recycled_batches_and_state() {
+        let mut batch = PrimitiveBatch::default();
+        batch.set_scissor(Some((1, 2, 3, 4)));
+        batch.set_draw_depth(0.75);
+        batch.ensure_batch(Some(7), Some(3));
+        batch.push_instance_unchecked(Instance::new(
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0],
+            [1.0; 4],
+            [0.0, 0.0, 1.0, 1.0],
+        ));
+
+        let drained = batch.drain_all();
+        assert_eq!(drained.len(), 1);
+        batch.recycle(drained);
+        assert_eq!(batch.recycled.len(), 1);
+
+        batch.drop_gpu_resources();
+
+        assert!(batch.batches.is_empty());
+        assert!(batch.drained.is_empty());
+        assert!(batch.recycled.is_empty());
+        assert_eq!(batch.scissor, None);
+        assert_eq!(batch.camera_slot, 0);
+        assert_eq!(batch.camera_count, 0);
+        assert_eq!(batch.render_target, None);
+        assert_eq!(batch.draw_depth, 0.0);
+        assert!(!batch.has_rt_overrides);
+    }
 }
 
 /// Builder for (textured) rectangles, drawn on `Drop`

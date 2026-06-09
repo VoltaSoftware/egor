@@ -6,9 +6,15 @@ use crate::{
     graphics::{Graphics, RenderTargetStore, ScreenCaptureState},
     primitives::PrimitiveBatch,
     profile_new_frame,
+    surface_recovery::{
+        DeviceLossAction, SurfaceFailure, SurfaceRecoveryAction, SurfaceRecoveryState, frame_interval_for_fps, max_frame_interval,
+        retry_interval_for_refresh,
+    },
     text::TextRenderer,
 };
 
+#[cfg(target_os = "android")]
+use egor_app::AndroidLifecycle;
 #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios")))]
 use egor_app::PhysicalPosition;
 #[cfg(target_os = "ios")]
@@ -20,16 +26,13 @@ use egor_app::{
 use egor_render::{
     MemoryHints, Renderer, TextureFormat,
     instance::Instance,
-    target::{Backbuffer, RenderTarget, SurfaceAcquireFailure},
+    target::{Backbuffer, RenderTarget},
 };
 
 type UpdateFn = dyn FnMut(&mut FrameContext);
 type UrgentEventsFn = dyn FnMut();
-
-fn frame_interval_for_fps(fps: u16) -> Duration {
-    let fps = u64::from(fps.max(1));
-    Duration::from_nanos((1_000_000_000u64 + fps / 2) / fps)
-}
+#[cfg(target_os = "android")]
+type AndroidLifecycleFn = dyn FnMut(AndroidLifecycle);
 
 #[cfg(target_os = "ios")]
 fn software_frame_interval_for_fps_limit(
@@ -94,13 +97,19 @@ fn refresh_rate_fps(window: &Window, native_refresh_rate_fps: Option<u16>) -> Op
 }
 
 fn surface_acquire_retry_interval(window: &Window, native_refresh_rate_fps: Option<u16>, consecutive_failures: u32) -> Duration {
-    if consecutive_failures > 3 {
-        return Duration::from_millis(100);
-    }
+    retry_interval_for_refresh(refresh_rate_fps(window, native_refresh_rate_fps), consecutive_failures)
+}
 
-    refresh_rate_fps(window, native_refresh_rate_fps)
-        .map(frame_interval_for_fps)
-        .unwrap_or_else(|| Duration::from_millis(16))
+fn surface_wait_retry_interval() -> Duration {
+    Duration::from_millis(100)
+}
+
+fn should_wait_for_surface_restore(is_minimized: bool, size: PhysicalSize<u32>) -> bool {
+    is_minimized || size.width == 0 || size.height == 0
+}
+
+fn backbuffer_format_matches_renderer(backbuffer_format: TextureFormat, renderer_format: TextureFormat) -> bool {
+    backbuffer_format == renderer_format
 }
 
 fn window_surface_size(window: &Window) -> PhysicalSize<u32> {
@@ -174,6 +183,7 @@ pub struct AppControl<'a> {
     requested_fps_limit: Option<Option<u16>>,
     native_refresh_rate_fps: Option<u16>,
     requested_native_refresh_rate_fps: Option<Option<u16>>,
+    gpu_device_recreated: bool,
 }
 
 impl<'a> AppControl<'a> {
@@ -238,6 +248,11 @@ impl<'a> AppControl<'a> {
         refresh_rate_fps(self.window, self.native_refresh_rate_fps)
     }
 
+    /// Returns true on the first frame after the GPU device and renderer were recreated.
+    pub fn gpu_device_recreated(&self) -> bool {
+        self.gpu_device_recreated
+    }
+
     /// Returns the window's DPI scale factor
     pub fn scale_factor(&self) -> f64 {
         self.window.scale_factor()
@@ -257,6 +272,8 @@ pub struct App {
     events_drained: Vec<WindowEvent>,
     update: Option<Box<UpdateFn>>,
     urgent_events: Option<Box<UrgentEventsFn>>,
+    #[cfg(target_os = "android")]
+    android_lifecycle: Option<Box<AndroidLifecycleFn>>,
     config: Option<AppConfig>,
     vsync: bool,
     text_renderer: Option<TextRenderer>,
@@ -272,7 +289,12 @@ pub struct App {
     offscreen_batches: Vec<PrimitiveBatch>,
     instance_byte_offsets: Vec<u64>,
     surface_acquire_retry_interval: Option<Duration>,
-    surface_acquire_failure_count: u32,
+    surface_recovery: SurfaceRecoveryState,
+    window_focused: bool,
+    surface_occluded: bool,
+    renderer_recreate_requested: bool,
+    renderer_recreate_in_progress: bool,
+    gpu_device_recreated_pending_frame: bool,
 }
 
 impl Default for App {
@@ -289,6 +311,8 @@ impl App {
             events_drained: Vec::new(),
             update: None,
             urgent_events: None,
+            #[cfg(target_os = "android")]
+            android_lifecycle: None,
             config: Some(AppConfig::default()),
             vsync: true,
             text_renderer: None,
@@ -304,7 +328,12 @@ impl App {
             offscreen_batches: Vec::new(),
             instance_byte_offsets: Vec::new(),
             surface_acquire_retry_interval: None,
-            surface_acquire_failure_count: 0,
+            surface_recovery: SurfaceRecoveryState::new(),
+            window_focused: true,
+            surface_occluded: false,
+            renderer_recreate_requested: false,
+            renderer_recreate_in_progress: false,
+            gpu_device_recreated_pending_frame: false,
         }
     }
 
@@ -460,6 +489,13 @@ impl App {
         self
     }
 
+    /// Run Android activity lifecycle work on the app/event-loop thread.
+    #[cfg(target_os = "android")]
+    pub fn android_lifecycle(mut self, callback: impl FnMut(AndroidLifecycle) + 'static) -> Self {
+        self.android_lifecycle = Some(Box::new(callback));
+        self
+    }
+
     /// Run the app with a per-frame update closure
     pub fn run(mut self, #[allow(unused_mut)] mut update: impl FnMut(&mut FrameContext) + 'static) {
         #[cfg(all(feature = "hot_reload", not(target_arch = "wasm32")))]
@@ -490,18 +526,34 @@ impl App {
 
         let size = window_surface_size(&window);
         if size.width == 0 || size.height == 0 {
+            self.surface_recovery.record_surface_failure(SurfaceFailure::ZeroSizedSurface);
             return false;
         }
 
         self.backbuffer = None;
-        let mut backbuffer = Backbuffer::new(
+        let mut backbuffer = match Backbuffer::try_new(
             renderer.instance(),
             renderer.adapter(),
             renderer.device(),
             window,
             size.width,
             size.height,
-        );
+        ) {
+            Ok(backbuffer) => backbuffer,
+            Err(error) => {
+                log::warn!("[egor] backbuffer recreation failed: {error:?}");
+                return false;
+            }
+        };
+        let backbuffer_format = backbuffer.format();
+        let renderer_format = renderer.surface_format();
+        if !backbuffer_format_matches_renderer(backbuffer_format, renderer_format) {
+            log::warn!(
+                "[egor] backbuffer format changed during surface recovery: renderer={renderer_format:?} backbuffer={backbuffer_format:?}; recreating renderer"
+            );
+            self.request_renderer_recreation("backbuffer format changed during surface recovery");
+            return false;
+        }
         backbuffer.set_vsync(renderer.device(), hardware_vsync_enabled(self.vsync, self.fps_limit));
 
         self.backbuffer = Some(backbuffer);
@@ -518,6 +570,41 @@ impl App {
 
         true
     }
+
+    fn drop_renderer_owned_resources(&mut self) {
+        self.backbuffer = None;
+        self.text_renderer = None;
+        self.render_targets = RenderTargetStore::new();
+        self.screen_capture = ScreenCaptureState::new();
+        self.capture_frame_target = None;
+        self.primitive_batch.drop_gpu_resources();
+        self.offscreen_batches.clear();
+        self.instance_byte_offsets.clear();
+        self.surface_acquire_retry_interval = Some(Duration::from_millis(1000));
+    }
+
+    fn request_renderer_recreation(&mut self, reason: &str) {
+        if !self.renderer_recreate_requested {
+            log::error!("[egor] requesting GPU renderer recreation: {reason:?}");
+        }
+        self.renderer_recreate_requested = true;
+        self.drop_renderer_owned_resources();
+    }
+
+    async fn create_renderer_with_retry(&self, window: Arc<Window>) -> Renderer {
+        loop {
+            match Renderer::try_new(window.clone(), &self.memory_hints).await {
+                Ok(renderer) => return renderer,
+                Err(error) => {
+                    log::error!("[egor] renderer init failed: {error:?}; retrying");
+                    #[cfg(not(target_arch = "wasm32"))]
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                    #[cfg(target_arch = "wasm32")]
+                    panic!("failed to initialize egor renderer after GPU recovery: {error:?}");
+                }
+            }
+        }
+    }
 }
 
 impl AppHandler<Renderer> for App {
@@ -529,8 +616,41 @@ impl AppHandler<Renderer> for App {
         self.run_urgent_events();
     }
 
+    #[cfg(target_os = "android")]
+    fn android_lifecycle(&mut self, lifecycle: AndroidLifecycle) {
+        log::info!("[egor] android lifecycle: {lifecycle:?}");
+        if let Some(android_lifecycle) = self.android_lifecycle.as_mut() {
+            android_lifecycle(lifecycle);
+        }
+    }
+
     fn on_window_event(&mut self, _window: &Window, event: &WindowEvent) {
+        match event {
+            WindowEvent::Focused(focused) => {
+                self.window_focused = *focused;
+            }
+            WindowEvent::Occluded(occluded) => {
+                self.surface_occluded = *occluded;
+                if *occluded {
+                    self.backbuffer = None;
+                    self.surface_recovery
+                        .record_surface_failure(SurfaceFailure::Acquire(egor_render::target::SurfaceAcquireFailure::Occluded));
+                    self.surface_acquire_retry_interval = Some(Duration::from_millis(100));
+                }
+            }
+            _ => {}
+        }
         self.events.push(event.clone());
+    }
+
+    fn resource_recreate_requested(&self) -> bool {
+        self.renderer_recreate_requested
+    }
+
+    fn before_resource_recreate(&mut self) {
+        self.renderer_recreate_requested = false;
+        self.renderer_recreate_in_progress = true;
+        self.drop_renderer_owned_resources();
     }
 
     async fn with_resource(&mut self, window: Arc<Window>) -> Renderer {
@@ -541,36 +661,48 @@ impl AppHandler<Renderer> for App {
             if size.height == 0 { 600 } else { size.height },
         );
         log::info!("[egor] app resource init: start {w}x{h}");
-        let renderer = Renderer::new(window.clone(), &self.memory_hints).await;
+        let renderer = self.create_renderer_with_retry(window.clone()).await;
         log::info!("[egor] app resource init: renderer ready");
         self.window = Some(window.clone());
         log::info!("[egor] app resource init: creating first backbuffer");
-        self.backbuffer = Some(Backbuffer::new(
-            renderer.instance(),
-            renderer.adapter(),
-            renderer.device(),
-            window,
-            w,
-            h,
-        ));
+        self.backbuffer = match Backbuffer::try_new(renderer.instance(), renderer.adapter(), renderer.device(), window, w, h) {
+            Ok(backbuffer) => Some(backbuffer),
+            Err(error) => {
+                log::warn!("[egor] initial backbuffer creation failed: {error:?}");
+                None
+            }
+        };
         log::info!("[egor] app resource init: complete");
         renderer
     }
 
     fn on_ready(&mut self, window: &Window, renderer: &mut Renderer) {
         log::info!("[egor] app ready: configuring render resources");
-        let (device, format) = (renderer.device(), self.backbuffer.as_ref().unwrap().format());
-        self.backbuffer
-            .as_mut()
-            .unwrap()
-            .set_vsync(device, hardware_vsync_enabled(self.vsync, self.fps_limit));
+        let renderer_was_recreated = self.renderer_recreate_in_progress;
+        self.renderer_recreate_in_progress = false;
+        if renderer_was_recreated {
+            self.gpu_device_recreated_pending_frame = true;
+            log::warn!("[egor] GPU renderer recreation complete");
+        }
+        let (device, format) = (
+            renderer.device(),
+            self.backbuffer
+                .as_ref()
+                .map(RenderTarget::format)
+                .unwrap_or_else(|| renderer.surface_format()),
+        );
+        if let Some(backbuffer) = self.backbuffer.as_mut() {
+            backbuffer.set_vsync(device, hardware_vsync_enabled(self.vsync, self.fps_limit));
+        }
         self.text_renderer = Some(TextRenderer::new(device, renderer.queue(), format));
         if let Some(fps_limit) = self.fps_limit {
             set_native_preferred_fps(window, fps_limit);
         }
 
         let size = window_surface_size(window);
-        self.resize(size.width, size.height, renderer);
+        if size.width > 0 && size.height > 0 {
+            self.resize(size.width, size.height, renderer);
+        }
         log::info!("[egor] app ready: complete");
     }
 
@@ -578,13 +710,12 @@ impl AppHandler<Renderer> for App {
         let fps_limit_interval = self
             .fps_limit
             .and_then(|fps_limit| software_frame_interval_for_fps_limit(window, self.native_refresh_rate_fps, fps_limit, self.vsync));
+        let background_interval = (!self.window_focused || self.surface_occluded).then_some(Duration::from_millis(100));
 
-        match (self.surface_acquire_retry_interval, fps_limit_interval) {
-            (Some(retry_interval), Some(fps_limit_interval)) if retry_interval > fps_limit_interval => Some(retry_interval),
-            (Some(_), Some(fps_limit_interval)) => Some(fps_limit_interval),
-            (Some(retry_interval), None) => Some(retry_interval),
-            (None, fps_limit_interval) => fps_limit_interval,
-        }
+        max_frame_interval(
+            max_frame_interval(self.surface_acquire_retry_interval, fps_limit_interval),
+            background_interval,
+        )
     }
 
     fn frame(&mut self, _window: &Window, renderer: &mut Renderer, input: &mut Input, timer: &FrameTimer) {
@@ -592,9 +723,39 @@ impl AppHandler<Renderer> for App {
         #[cfg(feature = "profiling")]
         profiling::scope!("frame");
 
-        let Some(update) = &mut self.update else {
+        if self.update.is_none() {
             return;
-        };
+        }
+
+        if self.surface_occluded {
+            self.surface_acquire_retry_interval = Some(surface_wait_retry_interval());
+            return;
+        }
+
+        if should_wait_for_surface_restore(_window.is_minimized().unwrap_or(false), window_surface_size(_window)) {
+            self.backbuffer = None;
+            self.surface_recovery.record_surface_failure(SurfaceFailure::ZeroSizedSurface);
+            self.surface_acquire_retry_interval = Some(surface_wait_retry_interval());
+            return;
+        }
+
+        if renderer.device_lost() {
+            let (action, should_log) = self.surface_recovery.record_device_lost();
+            if should_log {
+                log::error!("[egor] GPU device lost; recovery action: {action:?}");
+            }
+            match action {
+                DeviceLossAction::PauseRendering => {
+                    self.backbuffer = None;
+                    self.surface_acquire_retry_interval = Some(Duration::from_millis(1000));
+                    return;
+                }
+                DeviceLossAction::RecreateRenderer => {
+                    self.request_renderer_recreation("wgpu device lost");
+                    return;
+                }
+            }
+        }
 
         // Drive wgpu map_async callbacks at the START of the frame.
         // By polling here (not at end-of-frame), the GPU has had a full
@@ -602,6 +763,23 @@ impl AppHandler<Renderer> for App {
         // oldest ring-buffer slot is complete, eliminating stalls.
         if self.screen_capture.readback_in_flight() {
             let _ = renderer.device().poll(egor_render::wgpu::PollType::Poll);
+        }
+
+        if self.backbuffer.is_none() && should_wait_for_surface_restore(false, window_surface_size(_window)) {
+            self.surface_recovery.record_surface_failure(SurfaceFailure::ZeroSizedSurface);
+            self.surface_acquire_retry_interval = Some(surface_wait_retry_interval());
+            return;
+        }
+
+        if self.backbuffer.is_none() && !self.recreate_backbuffer(renderer) {
+            let action = self.surface_recovery.record_surface_failure(SurfaceFailure::BackbufferCreateFailed);
+            log::debug!("[egor] missing backbuffer recovery action: {action:?}");
+            self.surface_acquire_retry_interval = Some(surface_acquire_retry_interval(
+                _window,
+                self.native_refresh_rate_fps,
+                self.surface_recovery.consecutive_acquire_failures().saturating_add(1),
+            ));
+            return;
         }
 
         let Some(backbuffer) = &mut self.backbuffer else {
@@ -613,6 +791,8 @@ impl AppHandler<Renderer> for App {
         let (device, queue) = (renderer.device().clone(), renderer.queue().clone());
         let format = backbuffer.format();
         let text_renderer = self.text_renderer.as_mut().unwrap();
+        let update = self.update.as_mut().unwrap();
+        let gpu_device_recreated = self.gpu_device_recreated_pending_frame;
 
         self.events_drained.clear();
         std::mem::swap(&mut self.events, &mut self.events_drained);
@@ -627,6 +807,7 @@ impl AppHandler<Renderer> for App {
                     requested_fps_limit: None,
                     native_refresh_rate_fps: self.native_refresh_rate_fps,
                     requested_native_refresh_rate_fps: None,
+                    gpu_device_recreated,
                 },
                 gfx: Graphics::new(
                     renderer,
@@ -646,8 +827,27 @@ impl AppHandler<Renderer> for App {
             {
                 #[cfg(feature = "profiling")]
                 profiling::scope!("user_callback");
-                update(&mut ctx);
+                let update_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    update(&mut ctx);
+                }));
+                if let Err(payload) = update_result {
+                    let panic_message = payload
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .map(str::to_owned)
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".to_string());
+                    drop(ctx);
+                    if renderer.device_lost() {
+                        log::error!("[egor] user frame callback panicked after GPU device loss: {panic_message:?}");
+                        self.gpu_device_recreated_pending_frame = false;
+                        self.request_renderer_recreation("user callback panicked after device loss");
+                        return;
+                    }
+                    std::panic::resume_unwind(payload);
+                }
             }
+            self.gpu_device_recreated_pending_frame = false;
 
             ctx.events.clear();
             self.events_drained = ctx.events;
@@ -756,26 +956,35 @@ impl AppHandler<Renderer> for App {
             None
         };
 
-        let Some(mut frame) = renderer.begin_frame(backbuffer) else {
+        let frame_result = match renderer.try_begin_frame(backbuffer) {
+            Ok(frame_result) => frame_result,
+            Err(error) => {
+                log::error!("[egor] begin frame failed: {error:?}");
+                self.primitive_batch.recycle(batches);
+                self.request_renderer_recreation("begin frame failed");
+                return;
+            }
+        };
+
+        let Some(mut frame) = frame_result else {
             let acquire_failure = backbuffer.last_acquire_failure();
-            self.surface_acquire_failure_count = self.surface_acquire_failure_count.saturating_add(1);
+            let action = self.surface_recovery.record_surface_failure(match acquire_failure {
+                Some(failure) => SurfaceFailure::Acquire(failure),
+                None => SurfaceFailure::ConfigureFailed,
+            });
             self.surface_acquire_retry_interval = Some(surface_acquire_retry_interval(
                 _window,
                 self.native_refresh_rate_fps,
-                self.surface_acquire_failure_count,
+                self.surface_recovery.consecutive_acquire_failures(),
             ));
             self.primitive_batch.recycle(batches);
-            if matches!(
-                acquire_failure,
-                Some(SurfaceAcquireFailure::Validation | SurfaceAcquireFailure::Lost)
-            ) && self.recreate_backbuffer(renderer)
-            {
-                self.surface_acquire_failure_count = 0;
+            if action == SurfaceRecoveryAction::RecreateBackbuffer && self.recreate_backbuffer(renderer) {
+                self.surface_recovery.record_frame_acquired();
                 self.surface_acquire_retry_interval = Some(surface_acquire_retry_interval(_window, self.native_refresh_rate_fps, 0));
             }
             return;
         };
-        self.surface_acquire_failure_count = 0;
+        self.surface_recovery.record_frame_acquired();
         self.surface_acquire_retry_interval = None;
 
         let main_view = capture_frame_view.unwrap_or(&frame.view);
@@ -1006,10 +1215,25 @@ impl AppHandler<Renderer> for App {
         {
             #[cfg(feature = "profiling")]
             profiling::scope!("submit_present");
-            let (commands, presentable) = renderer.finish_encoder(frame);
-            renderer.submit_commands(commands);
+            let (commands, presentable) = match renderer.try_finish_encoder(frame) {
+                Ok(result) => result,
+                Err(error) => {
+                    log::error!("[egor] finish encoder failed: {error:?}");
+                    self.request_renderer_recreation("finish encoder failed");
+                    return;
+                }
+            };
+            if let Err(error) = renderer.try_submit_commands(commands) {
+                log::error!("[egor] queue submit failed: {error:?}");
+                self.request_renderer_recreation("queue submit failed");
+                return;
+            }
             if let Some(p) = presentable {
-                p.present();
+                if let Err(error) = renderer.try_present(p) {
+                    log::error!("[egor] present failed: {error:?}");
+                    self.request_renderer_recreation("present failed");
+                    return;
+                }
             }
         } // profile_scope submit_present
 
@@ -1020,23 +1244,40 @@ impl AppHandler<Renderer> for App {
         }
 
         if let Some((rw, rh)) = requested_size {
-            self.backbuffer.as_mut().unwrap().resize(&device, rw, rh);
+            if let Some(backbuffer) = self.backbuffer.as_mut() {
+                backbuffer.resize(&device, rw, rh);
+            }
         }
         if let Some(vsync) = requested_vsync {
             self.vsync = vsync;
         }
         if requested_vsync.is_some() || fps_limit_changed {
-            self.backbuffer
-                .as_mut()
-                .unwrap()
-                .set_vsync(&device, hardware_vsync_enabled(self.vsync, self.fps_limit));
+            if let Some(backbuffer) = self.backbuffer.as_mut() {
+                backbuffer.set_vsync(&device, hardware_vsync_enabled(self.vsync, self.fps_limit));
+            }
         }
     }
 
     fn resize(&mut self, w: u32, h: u32, renderer: &mut Renderer) {
-        self.backbuffer.as_mut().unwrap().resize(renderer.device(), w, h);
+        if w == 0 || h == 0 {
+            self.surface_recovery.record_surface_failure(SurfaceFailure::ZeroSizedSurface);
+            self.backbuffer = None;
+            self.surface_acquire_retry_interval = Some(Duration::from_millis(100));
+            return;
+        }
+
+        self.surface_occluded = false;
+        if self.backbuffer.is_none() && !self.recreate_backbuffer(renderer) {
+            return;
+        }
+
+        if let Some(backbuffer) = self.backbuffer.as_mut() {
+            backbuffer.resize(renderer.device(), w, h);
+        }
         renderer.ensure_depth_size(w, h);
-        self.text_renderer.as_mut().unwrap().resize(w, h, renderer.queue());
+        if let Some(text_renderer) = self.text_renderer.as_mut() {
+            text_renderer.resize(w, h, renderer.queue());
+        }
     }
 
     fn suspended(&mut self) {
@@ -1048,10 +1289,78 @@ impl AppHandler<Renderer> for App {
         let size = window_surface_size(&window);
         let device = renderer.device();
         self.window = Some(window.clone());
+        self.surface_occluded = false;
+        if size.width == 0 || size.height == 0 {
+            self.surface_recovery.record_surface_failure(SurfaceFailure::ZeroSizedSurface);
+            log::info!("[egor] app resumed with zero-sized surface; waiting for resize");
+            self.backbuffer = None;
+            self.surface_acquire_retry_interval = Some(Duration::from_millis(100));
+            return;
+        }
+
         log::info!("[egor] app resumed: recreating backbuffer {}x{}", size.width, size.height);
-        let mut backbuffer = Backbuffer::new(renderer.instance(), renderer.adapter(), device, window, size.width, size.height);
+        let mut backbuffer = match Backbuffer::try_new(renderer.instance(), renderer.adapter(), device, window, size.width, size.height) {
+            Ok(backbuffer) => backbuffer,
+            Err(error) => {
+                log::warn!("[egor] app resume backbuffer creation failed: {error:?}");
+                self.backbuffer = None;
+                return;
+            }
+        };
+        let backbuffer_format = backbuffer.format();
+        let renderer_format = renderer.surface_format();
+        if !backbuffer_format_matches_renderer(backbuffer_format, renderer_format) {
+            log::warn!(
+                "[egor] backbuffer format changed during app resume: renderer={renderer_format:?} backbuffer={backbuffer_format:?}; recreating renderer"
+            );
+            self.request_renderer_recreation("backbuffer format changed during app resume");
+            return;
+        }
         backbuffer.set_vsync(device, hardware_vsync_enabled(self.vsync, self.fps_limit));
         self.backbuffer = Some(backbuffer);
         log::info!("[egor] app resumed: complete");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renderer_recreation_request_drops_owned_gpu_state_and_backs_off() {
+        let mut app = App::new();
+        app.surface_acquire_retry_interval = None;
+        app.gpu_device_recreated_pending_frame = true;
+
+        app.request_renderer_recreation("injected queue submit failure");
+
+        assert!(app.renderer_recreate_requested);
+        assert!(app.backbuffer.is_none());
+        assert!(app.text_renderer.is_none());
+        assert_eq!(app.render_targets.len(), 0);
+        assert!(app.capture_frame_target.is_none());
+        assert!(app.offscreen_batches.is_empty());
+        assert!(app.instance_byte_offsets.is_empty());
+        assert_eq!(app.surface_acquire_retry_interval, Some(Duration::from_millis(1000)));
+    }
+
+    #[test]
+    fn minimized_or_zero_sized_surface_waits_for_restore() {
+        assert!(should_wait_for_surface_restore(true, PhysicalSize::new(1280, 720)));
+        assert!(should_wait_for_surface_restore(false, PhysicalSize::new(0, 720)));
+        assert!(should_wait_for_surface_restore(false, PhysicalSize::new(1280, 0)));
+        assert!(!should_wait_for_surface_restore(false, PhysicalSize::new(1280, 720)));
+    }
+
+    #[test]
+    fn backbuffer_format_change_requires_renderer_recreation() {
+        assert!(backbuffer_format_matches_renderer(
+            TextureFormat::Bgra8UnormSrgb,
+            TextureFormat::Bgra8UnormSrgb
+        ));
+        assert!(!backbuffer_format_matches_renderer(
+            TextureFormat::Rgba8UnormSrgb,
+            TextureFormat::Bgra8UnormSrgb
+        ));
     }
 }

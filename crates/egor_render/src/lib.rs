@@ -7,22 +7,25 @@ mod texture;
 mod uniforms;
 pub mod vertex;
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 pub use wgpu::{
     self, Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, Extent3d, MemoryHints, Queue, RenderPass, Texture, TextureFormat,
 };
 
 use wgpu::{
-    Adapter, BindGroup, BindGroupDescriptor, BindGroupEntry, Color, DepthStencilState, DeviceDescriptor, Instance, InstanceDescriptor,
-    LoadOp, Operations, RenderPassColorAttachment, RenderPassDepthStencilAttachment, RenderPassDescriptor, RequestAdapterOptions, StoreOp,
-    SurfaceTarget, TextureView, WindowHandle,
+    Adapter, BindGroup, BindGroupDescriptor, BindGroupEntry, Color, DeviceDescriptor, Instance, InstanceDescriptor, LoadOp, Operations,
+    RenderPassColorAttachment, RenderPassDepthStencilAttachment, RenderPassDescriptor, RequestAdapterOptions, StoreOp, SurfaceTarget,
+    TextureView, WindowHandle,
     util::{BufferInitDescriptor, DeviceExt, new_instance_with_webgpu_detection},
 };
 
 use crate::{
     batch::GeometryBatch,
-    frame::Frame,
+    frame::{Frame, Presentable},
     pipeline::Pipelines,
     target::{OffscreenTarget, RenderTarget},
     texture::Textures,
@@ -35,6 +38,66 @@ pub(crate) struct Gpu {
     pub adapter: Adapter,
     pub device: Device,
     pub queue: Queue,
+    pub device_lost: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+pub enum RendererInitError {
+    CreateSurface(String),
+    RequestAdapter(String),
+    RequestDevice(String),
+    AdapterLimit { max_texture_dimension_2d: u32, required: u32 },
+    SurfaceConfig(target::BackbufferError),
+}
+
+impl std::fmt::Display for RendererInitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CreateSurface(error) => write!(f, "failed to create adapter selection surface: {error}"),
+            Self::RequestAdapter(error) => write!(f, "failed to request GPU adapter: {error}"),
+            Self::RequestDevice(error) => write!(f, "failed to request GPU device: {error}"),
+            Self::AdapterLimit {
+                max_texture_dimension_2d,
+                required,
+            } => write!(
+                f,
+                "adapter max_texture_dimension_2d {max_texture_dimension_2d} is below required {required}"
+            ),
+            Self::SurfaceConfig(error) => write!(f, "failed to determine surface config: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for RendererInitError {}
+
+#[derive(Debug)]
+pub enum RendererFrameError {
+    BeginFrame(String),
+    FinishEncoder(String),
+    Submit(String),
+    Present(String),
+}
+
+impl std::fmt::Display for RendererFrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BeginFrame(error) => write!(f, "failed to begin frame: {error}"),
+            Self::FinishEncoder(error) => write!(f, "failed to finish command encoder: {error}"),
+            Self::Submit(error) => write!(f, "failed to submit command buffer: {error}"),
+            Self::Present(error) => write!(f, "failed to present frame: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for RendererFrameError {}
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .map(str::to_owned)
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
 }
 
 const REQUIRED_MAX_TEXTURE_DIMENSION_2D: u32 = 4096;
@@ -68,13 +131,24 @@ impl Renderer {
     ///
     /// Sets up wgpu, pipelines, default texture & camera resources
     pub async fn new(window: impl Into<SurfaceTarget<'static>> + WindowHandle, memory_hints: &MemoryHints) -> Self {
+        Self::try_new(window, memory_hints)
+            .await
+            .expect("failed to initialize egor renderer")
+    }
+
+    pub async fn try_new(
+        window: impl Into<SurfaceTarget<'static>> + WindowHandle,
+        memory_hints: &MemoryHints,
+    ) -> Result<Self, RendererInitError> {
         log::info!("[egor] renderer init: creating wgpu instance");
         let mut desc = InstanceDescriptor::new_without_display_handle_from_env();
         desc.flags.remove(wgpu::InstanceFlags::VALIDATION);
         desc.flags.remove(wgpu::InstanceFlags::DEBUG);
         let instance = new_instance_with_webgpu_detection(desc).await;
         log::info!("[egor] renderer init: creating adapter selection surface");
-        let surface = instance.create_surface(window).unwrap();
+        let surface = instance
+            .create_surface(window)
+            .map_err(|error| RendererInitError::CreateSurface(error.to_string()))?;
         log::info!("[egor] renderer init: requesting adapter");
         let adapter = instance
             .request_adapter(&RequestAdapterOptions {
@@ -83,7 +157,7 @@ impl Renderer {
                 ..Default::default()
             })
             .await
-            .unwrap();
+            .map_err(|error| RendererInitError::RequestAdapter(error.to_string()))?;
         let info = adapter.get_info();
         log::info!(
             "[egor] wgpu backend: {:?} | adapter: {} | driver: {}",
@@ -92,12 +166,12 @@ impl Renderer {
             info.driver
         );
         let adapter_limits = adapter.limits();
-        assert!(
-            adapter_limits.max_texture_dimension_2d >= REQUIRED_MAX_TEXTURE_DIMENSION_2D,
-            "[egor] adapter max_texture_dimension_2d {} is below required {}",
-            adapter_limits.max_texture_dimension_2d,
-            REQUIRED_MAX_TEXTURE_DIMENSION_2D
-        );
+        if adapter_limits.max_texture_dimension_2d < REQUIRED_MAX_TEXTURE_DIMENSION_2D {
+            return Err(RendererInitError::AdapterLimit {
+                max_texture_dimension_2d: adapter_limits.max_texture_dimension_2d,
+                required: REQUIRED_MAX_TEXTURE_DIMENSION_2D,
+            });
+        }
         #[cfg(target_arch = "wasm32")]
         let mut required_limits = wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter_limits.clone());
         #[cfg(not(target_arch = "wasm32"))]
@@ -111,12 +185,19 @@ impl Renderer {
                 ..Default::default()
             })
             .await
-            .unwrap();
+            .map_err(|error| RendererInitError::RequestDevice(error.to_string()))?;
+        let device_lost = Arc::new(AtomicBool::new(false));
+        let device_lost_callback = Arc::clone(&device_lost);
+        device.set_device_lost_callback(move |reason, message| {
+            device_lost_callback.store(true, Ordering::SeqCst);
+            log::error!("[egor] wgpu device lost: {reason:?}: {message:?}");
+        });
         device.on_uncaptured_error(Arc::new(|error| {
             log::error!("[egor] wgpu uncaptured error: {error:?}");
         }));
 
-        let (_surface_config, surface_format, _) = target::surface_config(&surface, &adapter, 1, 1);
+        let (_surface_config, surface_format, _) =
+            target::surface_config(&surface, &adapter, 1, 1).map_err(RendererInitError::SurfaceConfig)?;
         log::info!("[egor] renderer init: creating pipelines and core buffers");
         let pipelines = Pipelines::new(&device, surface_format);
 
@@ -166,12 +247,13 @@ impl Renderer {
         let (depth_texture, depth_view) = Self::create_depth_texture(&device, 1, 1);
         log::info!("[egor] renderer init: complete");
 
-        Renderer {
+        Ok(Renderer {
             gpu: Gpu {
                 instance,
                 adapter,
                 device,
                 queue,
+                device_lost,
             },
             pipelines,
             quad_vertex_buffer,
@@ -190,7 +272,7 @@ impl Renderer {
             depth_size: (1, 1),
             shared_instance_buffer: None,
             last_camera: [[[0.0; 4]; 4]; 8],
-        }
+        })
     }
 
     pub const DEPTH_FORMAT: TextureFormat = TextureFormat::Depth32Float;
@@ -247,6 +329,14 @@ impl Renderer {
         &self.gpu.queue
     }
 
+    pub fn device_lost(&self) -> bool {
+        self.gpu.device_lost.load(Ordering::SeqCst)
+    }
+
+    pub fn surface_format(&self) -> TextureFormat {
+        self.surface_format
+    }
+
     /// Sets the clear color for future render passes
     pub fn set_clear_color(&mut self, color: [f64; 4]) {
         self.clear_color = Color {
@@ -259,13 +349,21 @@ impl Renderer {
 
     /// Begins a frame with the given render target
     pub fn begin_frame(&mut self, target: &mut dyn RenderTarget) -> Option<Frame> {
-        let (view, presentable) = target.acquire(&self.gpu.device)?;
-        let encoder = self.gpu.device.create_command_encoder(&Default::default());
-        Some(Frame {
-            view,
-            encoder,
-            presentable,
-        })
+        self.try_begin_frame(target).expect("failed to begin egor frame")
+    }
+
+    /// Begins a frame with panic containment around GPU/device calls.
+    pub fn try_begin_frame(&mut self, target: &mut dyn RenderTarget) -> Result<Option<Frame>, RendererFrameError> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (view, presentable) = target.acquire(&self.gpu.device)?;
+            let encoder = self.gpu.device.create_command_encoder(&Default::default());
+            Some(Frame {
+                view,
+                encoder,
+                presentable,
+            })
+        }))
+        .map_err(|payload| RendererFrameError::BeginFrame(panic_payload_message(payload)))
     }
 
     /// Ends the frame by submitting commands and presenting
@@ -283,9 +381,31 @@ impl Renderer {
         frame.finish_encoder()
     }
 
+    /// Finish encoder without submitting, returning driver/backend panics as errors.
+    pub fn try_finish_encoder(&mut self, frame: Frame) -> Result<(wgpu::CommandBuffer, Option<Presentable>), RendererFrameError> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| frame.finish_encoder()))
+            .map_err(|payload| RendererFrameError::FinishEncoder(panic_payload_message(payload)))
+    }
+
     /// Submit a pre-finished command buffer
     pub fn submit_commands(&self, commands: wgpu::CommandBuffer) {
         self.gpu.queue.submit(Some(commands));
+    }
+
+    /// Submit a pre-finished command buffer, returning driver/backend panics as errors.
+    pub fn try_submit_commands(&self, commands: wgpu::CommandBuffer) -> Result<(), RendererFrameError> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.gpu.queue.submit(Some(commands));
+        }))
+        .map_err(|payload| RendererFrameError::Submit(panic_payload_message(payload)))
+    }
+
+    /// Present a surface texture, returning driver/backend panics as errors.
+    pub fn try_present(&self, presentable: Presentable) -> Result<(), RendererFrameError> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            presentable.present();
+        }))
+        .map_err(|payload| RendererFrameError::Present(panic_payload_message(payload)))
     }
 
     /// Begins a render pass with the given encoder and target view.

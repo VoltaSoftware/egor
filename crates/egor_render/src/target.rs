@@ -4,10 +4,45 @@ use wgpu::{
     WindowHandle,
 };
 
+#[cfg(not(target_arch = "wasm32"))]
+use wgpu::PollType;
+
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
 
 use crate::frame::Presentable;
+
+#[derive(Debug)]
+pub enum BackbufferError {
+    ZeroSize { width: u32, height: u32 },
+    CreateSurface(String),
+    UnsupportedSurface { width: u32, height: u32 },
+    Configure(String),
+}
+
+impl std::fmt::Display for BackbufferError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroSize { width, height } => write!(f, "surface size is zero ({width}x{height})"),
+            Self::CreateSurface(error) => write!(f, "failed to create surface: {error}"),
+            Self::UnsupportedSurface { width, height } => {
+                write!(f, "surface has no compatible default config for {width}x{height}")
+            }
+            Self::Configure(error) => write!(f, "failed to configure surface: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for BackbufferError {}
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .map(str::to_owned)
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SurfaceAcquireFailure {
@@ -29,9 +64,20 @@ pub trait RenderTarget {
     fn set_vsync(&mut self, _device: &Device, _on: bool) {}
 }
 
-pub(crate) fn surface_config(surface: &Surface<'_>, adapter: &Adapter, w: u32, h: u32) -> (SurfaceConfiguration, TextureFormat, bool) {
+pub(crate) fn surface_config(
+    surface: &Surface<'_>,
+    adapter: &Adapter,
+    w: u32,
+    h: u32,
+) -> Result<(SurfaceConfiguration, TextureFormat, bool), BackbufferError> {
+    if w == 0 || h == 0 {
+        return Err(BackbufferError::ZeroSize { width: w, height: h });
+    }
+
     let caps = surface.get_capabilities(adapter);
-    let mut config = surface.get_default_config(adapter, w, h).unwrap();
+    let mut config = surface
+        .get_default_config(adapter, w, h)
+        .ok_or(BackbufferError::UnsupportedSurface { width: w, height: h })?;
     config.present_mode = PresentMode::Fifo;
 
     let surface_copy_src = caps.usages.contains(TextureUsages::COPY_SRC);
@@ -62,7 +108,7 @@ pub(crate) fn surface_config(surface: &Surface<'_>, adapter: &Adapter, w: u32, h
         config.format
     };
 
-    (config, view_format, surface_copy_src)
+    Ok((config, view_format, surface_copy_src))
 }
 
 /// Renders to the window's backbuffer (swapchain)
@@ -88,25 +134,38 @@ impl Backbuffer {
         w: u32,
         h: u32,
     ) -> Self {
+        Self::try_new(instance, adapter, device, window, w, h).expect("failed to create egor backbuffer")
+    }
+
+    pub fn try_new(
+        instance: &Instance,
+        adapter: &Adapter,
+        device: &Device,
+        window: impl Into<SurfaceTarget<'static>> + WindowHandle,
+        w: u32,
+        h: u32,
+    ) -> Result<Self, BackbufferError> {
         log::info!("[egor] backbuffer init: creating surface {w}x{h}");
-        let surface = instance.create_surface(window).unwrap();
+        let surface = instance
+            .create_surface(window)
+            .map_err(|error| BackbufferError::CreateSurface(error.to_string()))?;
         log::info!("[egor] backbuffer init: building surface config");
-        let (config, view_format, surface_copy_src) = surface_config(&surface, adapter, w, h);
+        let (config, view_format, surface_copy_src) = surface_config(&surface, adapter, w, h)?;
         log::info!(
             "[egor] backbuffer init: configuring surface format={:?} view_format={:?} copy_src={}",
             config.format,
             view_format,
             surface_copy_src
         );
-        surface.configure(device, &config);
+        Self::configure_surface(&surface, device, &config)?;
         log::info!("[egor] backbuffer init: complete");
-        Self {
+        Ok(Self {
             surface,
             config,
             view_format,
             surface_copy_src,
             last_acquire_failure: None,
-        }
+        })
     }
 
     pub fn supports_copy_src(&self) -> bool {
@@ -115,6 +174,52 @@ impl Backbuffer {
 
     pub fn last_acquire_failure(&self) -> Option<SurfaceAcquireFailure> {
         self.last_acquire_failure
+    }
+
+    fn configure_surface(surface: &Surface<'_>, device: &Device, config: &SurfaceConfiguration) -> Result<(), BackbufferError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = device.poll(PollType::wait_indefinitely());
+            let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let configure_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                surface.configure(device, config);
+            }));
+            if let Err(payload) = configure_result {
+                drop(error_scope);
+                return Err(BackbufferError::Configure(panic_payload_message(payload)));
+            }
+            if let Some(error) = pollster::block_on(error_scope.pop()) {
+                return Err(BackbufferError::Configure(error.to_string()));
+            }
+            Ok(())
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            surface.configure(device, config);
+            Ok(())
+        }
+    }
+
+    fn reconfigure(&self, device: &Device) -> Result<(), BackbufferError> {
+        Self::configure_surface(&self.surface, device, &self.config)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn get_current_texture(&self) -> CurrentSurfaceTexture {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.surface.get_current_texture())) {
+            Ok(texture) => texture,
+            Err(payload) => {
+                let panic_message = panic_payload_message(payload);
+                log::error!("[egor] surface acquire panicked: {panic_message:?}");
+                CurrentSurfaceTexture::Validation
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn get_current_texture(&self) -> CurrentSurfaceTexture {
+        self.surface.get_current_texture()
     }
 
     fn record_acquire_success(&mut self) {
@@ -154,7 +259,7 @@ impl RenderTarget for Backbuffer {
             }
         }
 
-        match self.surface.get_current_texture() {
+        match self.get_current_texture() {
             CurrentSurfaceTexture::Success(surface_texture) | CurrentSurfaceTexture::Suboptimal(surface_texture) => {
                 self.record_acquire_success();
                 let view = surface_texture.texture.create_view(&TextureViewDescriptor {
@@ -170,7 +275,9 @@ impl RenderTarget for Backbuffer {
             }
             CurrentSurfaceTexture::Lost => {
                 self.record_acquire_failure(SurfaceAcquireFailure::Lost);
-                self.surface.configure(device, &self.config);
+                if let Err(error) = self.reconfigure(device) {
+                    log::warn!("[egor] surface reconfigure after Lost failed: {error:?}");
+                }
                 None
             }
             CurrentSurfaceTexture::Timeout => {
@@ -183,19 +290,29 @@ impl RenderTarget for Backbuffer {
             }
             CurrentSurfaceTexture::Validation => {
                 self.record_acquire_failure(SurfaceAcquireFailure::Validation);
+                if let Err(error) = self.reconfigure(device) {
+                    log::warn!("[egor] surface reconfigure after Validation failed: {error:?}");
+                }
                 None
             }
         }
     }
 
     fn resize(&mut self, device: &Device, w: u32, h: u32) {
+        if w == 0 || h == 0 {
+            return;
+        }
         (self.config.width, self.config.height) = (w, h);
-        self.surface.configure(device, &self.config);
+        if let Err(error) = self.reconfigure(device) {
+            log::warn!("[egor] surface resize configure failed: {error:?}");
+        }
     }
 
     fn set_vsync(&mut self, device: &Device, on: bool) {
         self.config.present_mode = if on { PresentMode::Fifo } else { PresentMode::AutoNoVsync };
-        self.surface.configure(device, &self.config);
+        if let Err(error) = self.reconfigure(device) {
+            log::warn!("[egor] surface vsync configure failed: {error:?}");
+        }
     }
 }
 
@@ -227,6 +344,8 @@ pub struct OffscreenTarget {
 
 impl OffscreenTarget {
     pub fn new(device: &Device, width: u32, height: u32, format: TextureFormat) -> Self {
+        let width = width.max(1);
+        let height = height.max(1);
         let render_texture = device.create_texture(&TextureDescriptor {
             label: Some("Offscreen Render Texture"),
             size: Extent3d {
@@ -320,6 +439,8 @@ impl RenderTarget for OffscreenTarget {
     }
 
     fn resize(&mut self, device: &Device, w: u32, h: u32) {
+        let w = w.max(1);
+        let h = h.max(1);
         if self.width == w && self.height == h {
             return;
         }
