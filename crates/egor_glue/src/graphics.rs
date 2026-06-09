@@ -1,5 +1,5 @@
 use egor_render::{
-    Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, Extent3d, Renderer, Texture, TextureFormat,
+    AdapterInfo, Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, Extent3d, Renderer, Texture, TextureFormat,
     batch::GeometryBatch,
     target::{OffscreenTarget, RenderTarget},
 };
@@ -1041,6 +1041,11 @@ impl<'a> Graphics<'a> {
     /// Create a new offscreen render target
     pub fn create_offscreen(&self, width: u32, height: u32) -> OffscreenTarget {
         self.renderer.create_offscreen_target(width, height, self.target_format)
+    }
+
+    /// Return information about the active GPU adapter/backend.
+    pub fn adapter_info(&self) -> AdapterInfo {
+        self.renderer.adapter_info()
     }
 
     /// Render to an offscreen target

@@ -13,7 +13,8 @@ use std::sync::{
 };
 
 pub use wgpu::{
-    self, Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, Extent3d, MemoryHints, Queue, RenderPass, Texture, TextureFormat,
+    self, AdapterInfo, Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, Extent3d, MemoryHints, Queue, RenderPass, Texture,
+    TextureFormat,
 };
 
 use wgpu::{
@@ -319,6 +320,10 @@ impl Renderer {
     /// Returns a reference to the underlying wgpu `Adapter`
     pub fn adapter(&self) -> &Adapter {
         &self.gpu.adapter
+    }
+    /// Returns information about the active GPU adapter/backend.
+    pub fn adapter_info(&self) -> AdapterInfo {
+        self.gpu.adapter.get_info()
     }
     /// Returns a reference to the underlying wgpu `Device`
     pub fn device(&self) -> &Device {
