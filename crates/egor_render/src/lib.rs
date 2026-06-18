@@ -276,7 +276,7 @@ impl Renderer {
         })
     }
 
-    pub const DEPTH_FORMAT: TextureFormat = TextureFormat::Depth32Float;
+    pub const DEPTH_FORMAT: TextureFormat = TextureFormat::Depth16Unorm;
 
     pub fn create_depth_texture(device: &Device, width: u32, height: u32) -> (wgpu::Texture, TextureView) {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
