@@ -7,6 +7,17 @@ use wgpu::{
 
 use crate::target::OffscreenTarget;
 
+const INVALID_TEXTURE_FALLBACK_RGBA: [u8; 4] = [255, 0, 255, 255];
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .map(str::to_owned)
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
+}
+
 /// A GPU texture that can be bound in shaders for rendering
 ///
 /// Wraps a `wgpu::Texture`, its view, sampler, & bind group
@@ -46,8 +57,108 @@ impl Texture {
         width: u32,
         height: u32,
     ) -> Self {
+        if let Err(reason) = Self::validate_upload(device, data, width, height) {
+            log::warn!("[egor] invalid texture upload ({reason}); using 1x1 fallback");
+            return Self::from_trusted_bytes(
+                device,
+                queue,
+                layout,
+                sampler,
+                &INVALID_TEXTURE_FALLBACK_RGBA,
+                1,
+                1,
+                Some("Egor Invalid Texture Fallback"),
+            );
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let texture_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Self::from_trusted_bytes(device, queue, layout, sampler, data, width, height, Some("Egor Texture"))
+            }));
+
+            let texture = match texture_result {
+                Ok(texture) => texture,
+                Err(payload) => {
+                    drop(error_scope);
+                    log::error!(
+                        "[egor] texture upload panicked ({}); using 1x1 fallback",
+                        panic_payload_message(payload)
+                    );
+                    return Self::from_trusted_bytes(
+                        device,
+                        queue,
+                        layout,
+                        sampler,
+                        &INVALID_TEXTURE_FALLBACK_RGBA,
+                        1,
+                        1,
+                        Some("Egor Invalid Texture Fallback"),
+                    );
+                }
+            };
+
+            if let Some(error) = pollster::block_on(error_scope.pop()) {
+                log::error!("[egor] texture upload validation failed: {error}; using 1x1 fallback");
+                return Self::from_trusted_bytes(
+                    device,
+                    queue,
+                    layout,
+                    sampler,
+                    &INVALID_TEXTURE_FALLBACK_RGBA,
+                    1,
+                    1,
+                    Some("Egor Invalid Texture Fallback"),
+                );
+            }
+
+            texture
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            Self::from_trusted_bytes(device, queue, layout, sampler, data, width, height, Some("Egor Texture"))
+        }
+    }
+
+    fn validate_upload(device: &Device, data: &[u8], width: u32, height: u32) -> Result<(), String> {
+        if width == 0 || height == 0 {
+            return Err(format!("zero-sized texture {width}x{height}"));
+        }
+
+        let max_dimension = device.limits().max_texture_dimension_2d;
+        if width > max_dimension || height > max_dimension {
+            return Err(format!("texture {width}x{height} exceeds max dimension {max_dimension}"));
+        }
+
+        let expected_len = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| format!("texture size overflow for {width}x{height}"))?;
+
+        if data.len() < expected_len {
+            return Err(format!(
+                "RGBA buffer too small for {width}x{height}: got {} bytes, need {expected_len}",
+                data.len()
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn from_trusted_bytes(
+        device: &Device,
+        queue: &Queue,
+        layout: &BindGroupLayout,
+        sampler: &Sampler,
+        data: &[u8],
+        width: u32,
+        height: u32,
+        label: Option<&str>,
+    ) -> Self {
         let texture = device.create_texture(&TextureDescriptor {
-            label: None,
+            label,
             size: Extent3d {
                 width,
                 height,
