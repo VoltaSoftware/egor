@@ -209,7 +209,7 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
         #[cfg(target_arch = "wasm32")]
         {
             use winit::platform::web::WindowAttributesExtWebSys;
-            win_attrs = win_attrs.with_append(true);
+            win_attrs = win_attrs.with_append(true).with_prevent_default(false);
         }
         #[cfg(target_os = "ios")]
         {
