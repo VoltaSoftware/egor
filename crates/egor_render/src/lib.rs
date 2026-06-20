@@ -217,7 +217,10 @@ impl Renderer {
             contents: bytemuck::bytes_of(&instance::Instance::identity()),
             usage: BufferUsages::VERTEX,
         });
-        let min_alignment = device.limits().min_uniform_buffer_offset_alignment as u32;
+        let min_alignment = device
+            .limits()
+            .min_uniform_buffer_offset_alignment
+            .max(256) as u32;
         let camera_data_size = std::mem::size_of::<CameraUniform>() as u32;
         let camera_slot_stride = ((camera_data_size + min_alignment - 1) / min_alignment) * min_alignment;
         let camera_slot_count: u32 = 8;
