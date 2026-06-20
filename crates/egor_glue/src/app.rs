@@ -7,12 +7,13 @@ use crate::{
     primitives::PrimitiveBatch,
     profile_new_frame,
     surface_recovery::{
-        DeviceLossAction, SurfaceFailure, SurfaceRecoveryAction, SurfaceRecoveryState, frame_interval_for_fps, max_frame_interval,
-        retry_interval_for_refresh,
+        DeviceLossAction, SurfaceFailure, SurfaceRecoveryAction, SurfaceRecoveryState, max_frame_interval, retry_interval_for_refresh,
     },
     text::TextRenderer,
 };
 
+#[cfg(not(target_os = "ios"))]
+use crate::surface_recovery::frame_interval_for_fps;
 #[cfg(target_os = "android")]
 use egor_app::AndroidLifecycle;
 #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios")))]
@@ -82,6 +83,14 @@ fn clear_native_preferred_fps(window: &Window) {
 
 #[cfg(not(target_os = "ios"))]
 fn clear_native_preferred_fps(_window: &Window) {}
+
+#[cfg(target_os = "ios")]
+fn set_native_redraw_enabled(window: &Window, enabled: bool) {
+    window.set_native_display_link_enabled(enabled);
+}
+
+#[cfg(not(target_os = "ios"))]
+fn set_native_redraw_enabled(_window: &Window, _enabled: bool) {}
 
 fn refresh_rate_fps(window: &Window, native_refresh_rate_fps: Option<u16>) -> Option<u16> {
     native_refresh_rate_fps.or_else(|| {
@@ -292,6 +301,7 @@ pub struct App {
     surface_recovery: SurfaceRecoveryState,
     window_focused: bool,
     surface_occluded: bool,
+    app_suspended: bool,
     renderer_recreate_requested: bool,
     renderer_recreate_in_progress: bool,
     gpu_device_recreated_pending_frame: bool,
@@ -331,6 +341,7 @@ impl App {
             surface_recovery: SurfaceRecoveryState::new(),
             window_focused: true,
             surface_occluded: false,
+            app_suspended: false,
             renderer_recreate_requested: false,
             renderer_recreate_in_progress: false,
             gpu_device_recreated_pending_frame: false,
@@ -519,6 +530,10 @@ impl App {
     }
 
     fn recreate_backbuffer(&mut self, renderer: &mut Renderer) -> bool {
+        if self.app_suspended {
+            return false;
+        }
+
         let Some(window) = self.window.as_ref().cloned() else {
             log::warn!("[egor] cannot recreate backbuffer because no window handle is available");
             return false;
@@ -724,6 +739,12 @@ impl AppHandler<Renderer> for App {
         profiling::scope!("frame");
 
         if self.update.is_none() {
+            return;
+        }
+
+        if self.app_suspended {
+            self.backbuffer = None;
+            self.surface_acquire_retry_interval = None;
             return;
         }
 
@@ -1282,14 +1303,22 @@ impl AppHandler<Renderer> for App {
 
     fn suspended(&mut self) {
         log::info!("[egor] app suspended: dropping backbuffer");
+        self.app_suspended = true;
+        self.surface_acquire_retry_interval = None;
         self.backbuffer = None;
+        if let Some(window) = self.window.as_deref() {
+            set_native_redraw_enabled(window, false);
+        }
     }
 
     fn resumed(&mut self, window: Arc<Window>, renderer: &mut Renderer) {
         let size = window_surface_size(&window);
         let device = renderer.device();
         self.window = Some(window.clone());
+        self.app_suspended = false;
+        self.surface_acquire_retry_interval = None;
         self.surface_occluded = false;
+        set_native_redraw_enabled(&window, true);
         if size.width == 0 || size.height == 0 {
             self.surface_recovery.record_surface_failure(SurfaceFailure::ZeroSizedSurface);
             log::info!("[egor] app resumed with zero-sized surface; waiting for resize");
