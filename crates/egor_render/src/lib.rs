@@ -217,10 +217,7 @@ impl Renderer {
             contents: bytemuck::bytes_of(&instance::Instance::identity()),
             usage: BufferUsages::VERTEX,
         });
-        let min_alignment = device
-            .limits()
-            .min_uniform_buffer_offset_alignment
-            .max(256) as u32;
+        let min_alignment = device.limits().min_uniform_buffer_offset_alignment.max(256) as u32;
         let camera_data_size = std::mem::size_of::<CameraUniform>() as u32;
         let camera_slot_stride = ((camera_data_size + min_alignment - 1) / min_alignment) * min_alignment;
         let camera_slot_count: u32 = 8;
@@ -519,9 +516,9 @@ impl Renderer {
         current_shader: &mut Option<usize>,
         current_camera_offset: &mut u32,
         quad_bound: &mut bool,
-    ) {
+    ) -> u32 {
         if batch.is_empty() {
-            return;
+            return 0;
         }
 
         batch.upload(&self.gpu.device, &self.gpu.queue);
@@ -546,7 +543,7 @@ impl Renderer {
             *current_camera_offset = camera_offset;
         }
 
-        batch.draw(
+        let draw_calls = batch.draw(
             r_pass,
             &self.quad_vertex_buffer,
             &self.quad_index_buffer,
@@ -555,6 +552,7 @@ impl Renderer {
             None,
         );
         batch.clear();
+        draw_calls
     }
 
     /// Like draw_batch but uses a shared instance buffer at the given byte offset.
@@ -572,9 +570,9 @@ impl Renderer {
         quad_bound: &mut bool,
         shared_buf: &'a Buffer,
         instance_byte_offset: u64,
-    ) {
+    ) -> u32 {
         if batch.is_empty() {
-            return;
+            return 0;
         }
 
         batch.upload_geometry_only(&self.gpu.device, &self.gpu.queue);
@@ -599,7 +597,7 @@ impl Renderer {
             *current_camera_offset = camera_offset;
         }
 
-        batch.draw(
+        let draw_calls = batch.draw(
             r_pass,
             &self.quad_vertex_buffer,
             &self.quad_index_buffer,
@@ -608,6 +606,7 @@ impl Renderer {
             Some((shared_buf, instance_byte_offset)),
         );
         batch.clear();
+        draw_calls
     }
 
     /// Writes a camera matrix into the given slot of the multi-slot camera buffer.

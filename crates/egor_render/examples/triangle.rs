@@ -71,7 +71,19 @@ impl ApplicationHandler for MinimalApp {
                         r.bind_pass_state(&mut r_pass, None, None);
                         let mut cur_tex = None;
                         let mut cur_shd = None;
-                        r.draw_batch(&mut r_pass, &mut self.batch, None, None, 0, &mut cur_tex, &mut cur_shd);
+                        let mut cur_cam_offset = u32::MAX;
+                        let mut quad_bound = true;
+                        let _ = r.draw_batch(
+                            &mut r_pass,
+                            &mut self.batch,
+                            None,
+                            None,
+                            0,
+                            &mut cur_tex,
+                            &mut cur_shd,
+                            &mut cur_cam_offset,
+                            &mut quad_bound,
+                        );
                     }
                     r.end_frame(frame);
                 }

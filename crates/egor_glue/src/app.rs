@@ -274,6 +274,13 @@ pub struct FrameContext<'a> {
     pub gfx: Graphics<'a>,
     pub input: &'a mut Input,
     pub timer: &'a FrameTimer,
+    pub last_frame_stats: FrameStats,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FrameStats {
+    /// GPU draw calls emitted by egor's main renderer in the previous frame.
+    pub draw_calls: u32,
 }
 
 pub struct App {
@@ -305,6 +312,7 @@ pub struct App {
     renderer_recreate_requested: bool,
     renderer_recreate_in_progress: bool,
     gpu_device_recreated_pending_frame: bool,
+    last_frame_stats: FrameStats,
 }
 
 impl Default for App {
@@ -345,6 +353,7 @@ impl App {
             renderer_recreate_requested: false,
             renderer_recreate_in_progress: false,
             gpu_device_recreated_pending_frame: false,
+            last_frame_stats: FrameStats::default(),
         }
     }
 
@@ -843,6 +852,7 @@ impl AppHandler<Renderer> for App {
                 ),
                 input,
                 timer,
+                last_frame_stats: self.last_frame_stats,
             };
 
             {
@@ -1009,6 +1019,7 @@ impl AppHandler<Renderer> for App {
         self.surface_acquire_retry_interval = None;
 
         let main_view = capture_frame_view.unwrap_or(&frame.view);
+        let mut frame_stats = FrameStats::default();
 
         {
             #[cfg(feature = "profiling")]
@@ -1092,7 +1103,7 @@ impl AppHandler<Renderer> for App {
                             }
                             let offset = batch.camera_slot * stride;
                             if let Some(shared_buf) = renderer.shared_instance_buffer() {
-                                renderer.draw_batch_shared(
+                                frame_stats.draw_calls += renderer.draw_batch_shared(
                                     &mut r_pass,
                                     &mut batch.geometry,
                                     batch.texture_id,
@@ -1106,7 +1117,7 @@ impl AppHandler<Renderer> for App {
                                     self.instance_byte_offsets[idx],
                                 );
                             } else {
-                                renderer.draw_batch(
+                                frame_stats.draw_calls += renderer.draw_batch(
                                     &mut r_pass,
                                     &mut batch.geometry,
                                     batch.texture_id,
@@ -1122,6 +1133,7 @@ impl AppHandler<Renderer> for App {
 
                         if batch_end >= batches.len() && group_rt.is_none() && has_text {
                             text_renderer.render(&mut r_pass);
+                            frame_stats.draw_calls += 1;
                         }
                     }
 
@@ -1137,6 +1149,7 @@ impl AppHandler<Renderer> for App {
                     let mut r_pass = renderer.begin_render_pass(&mut frame.encoder, main_view);
                     if has_text {
                         text_renderer.render(&mut r_pass);
+                        frame_stats.draw_calls += 1;
                     }
                 }
             } else {
@@ -1170,7 +1183,7 @@ impl AppHandler<Renderer> for App {
                             }
                             let offset = batch.camera_slot * stride;
                             if let Some(shared_buf) = renderer.shared_instance_buffer() {
-                                renderer.draw_batch_shared(
+                                frame_stats.draw_calls += renderer.draw_batch_shared(
                                     &mut r_pass,
                                     &mut batch.geometry,
                                     batch.texture_id,
@@ -1184,7 +1197,7 @@ impl AppHandler<Renderer> for App {
                                     self.instance_byte_offsets[idx],
                                 );
                             } else {
-                                renderer.draw_batch(
+                                frame_stats.draw_calls += renderer.draw_batch(
                                     &mut r_pass,
                                     &mut batch.geometry,
                                     batch.texture_id,
@@ -1201,6 +1214,7 @@ impl AppHandler<Renderer> for App {
 
                     if has_text {
                         text_renderer.render(&mut r_pass);
+                        frame_stats.draw_calls += 1;
                     }
                 }
             }
@@ -1208,6 +1222,7 @@ impl AppHandler<Renderer> for App {
             // Recycle batch GPU buffers for reuse next frame.
             self.primitive_batch.recycle(batches);
         } // profile_scope render_pass
+        self.last_frame_stats = frame_stats;
 
         // Screen capture: blit-downsample the final frame into a small capture
         // texture and encode a copy_texture_to_buffer for async readback.

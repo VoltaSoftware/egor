@@ -233,7 +233,9 @@ impl GeometryBatch {
         dummy_instance: &'a Buffer,
         quad_bound: &mut bool,
         external_instances: Option<(&'a Buffer, u64)>,
-    ) {
+    ) -> u32 {
+        let mut draw_calls = 0;
+
         if !self.instances.is_empty() {
             if !*quad_bound {
                 r_pass.set_vertex_buffer(0, quad_vb.slice(..));
@@ -245,6 +247,7 @@ impl GeometryBatch {
                 r_pass.set_vertex_buffer(1, instance_buf.slice(..));
             }
             r_pass.draw_indexed(0..6, 0, 0..self.instances.len() as u32);
+            draw_calls += 1;
             *quad_bound = true;
         }
         if !self.indices.is_empty()
@@ -254,7 +257,10 @@ impl GeometryBatch {
             r_pass.set_vertex_buffer(1, dummy_instance.slice(..));
             r_pass.set_index_buffer(ib.slice(..), IndexFormat::Uint16);
             r_pass.draw_indexed(0..self.indices.len() as u32, 0, 0..1);
+            draw_calls += 1;
             *quad_bound = false;
         }
+
+        draw_calls
     }
 }
