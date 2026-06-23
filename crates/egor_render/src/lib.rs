@@ -42,6 +42,47 @@ pub(crate) struct Gpu {
     pub device_lost: Arc<AtomicBool>,
 }
 
+/// Controls which wgpu backend set egor enables when creating its renderer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RendererBackendPreference {
+    /// Use wgpu's default backend set.
+    Auto,
+    /// Use an explicit backend set.
+    Backends(wgpu::Backends),
+}
+
+impl Default for RendererBackendPreference {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl RendererBackendPreference {
+    pub const fn auto() -> Self {
+        Self::Auto
+    }
+
+    pub const fn gl() -> Self {
+        Self::Backends(wgpu::Backends::GL)
+    }
+
+    pub const fn vulkan() -> Self {
+        Self::Backends(wgpu::Backends::VULKAN)
+    }
+
+    pub const fn metal() -> Self {
+        Self::Backends(wgpu::Backends::METAL)
+    }
+
+    pub const fn dx12() -> Self {
+        Self::Backends(wgpu::Backends::DX12)
+    }
+
+    pub const fn webgpu() -> Self {
+        Self::Backends(wgpu::Backends::BROWSER_WEBGPU)
+    }
+}
+
 #[derive(Debug)]
 pub enum RendererInitError {
     CreateSurface(String),
@@ -137,12 +178,33 @@ impl Renderer {
             .expect("failed to initialize egor renderer")
     }
 
+    pub async fn new_with_backend(
+        window: impl Into<SurfaceTarget<'static>> + WindowHandle,
+        memory_hints: &MemoryHints,
+        backend_preference: RendererBackendPreference,
+    ) -> Self {
+        Self::try_new_with_backend(window, memory_hints, backend_preference)
+            .await
+            .expect("failed to initialize egor renderer")
+    }
+
     pub async fn try_new(
         window: impl Into<SurfaceTarget<'static>> + WindowHandle,
         memory_hints: &MemoryHints,
     ) -> Result<Self, RendererInitError> {
+        Self::try_new_with_backend(window, memory_hints, RendererBackendPreference::Auto).await
+    }
+
+    pub async fn try_new_with_backend(
+        window: impl Into<SurfaceTarget<'static>> + WindowHandle,
+        memory_hints: &MemoryHints,
+        backend_preference: RendererBackendPreference,
+    ) -> Result<Self, RendererInitError> {
         log::info!("[egor] renderer init: creating wgpu instance");
-        let mut desc = InstanceDescriptor::new_without_display_handle_from_env();
+        let mut desc = InstanceDescriptor::new_without_display_handle();
+        if let RendererBackendPreference::Backends(backends) = backend_preference {
+            desc.backends = backends;
+        }
         desc.flags.remove(wgpu::InstanceFlags::VALIDATION);
         desc.flags.remove(wgpu::InstanceFlags::DEBUG);
         let instance = new_instance_with_webgpu_detection(desc).await;

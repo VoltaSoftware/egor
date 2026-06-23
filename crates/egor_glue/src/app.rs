@@ -25,7 +25,7 @@ use egor_app::{
     time::FrameTimer,
 };
 use egor_render::{
-    MemoryHints, Renderer, TextureFormat,
+    MemoryHints, Renderer, RendererBackendPreference, TextureFormat,
     instance::Instance,
     target::{Backbuffer, RenderTarget},
 };
@@ -297,6 +297,7 @@ pub struct App {
     window: Option<Arc<Window>>,
     primitive_batch: PrimitiveBatch,
     memory_hints: MemoryHints,
+    renderer_backend: RendererBackendPreference,
     render_targets: RenderTargetStore,
     screen_capture: ScreenCaptureState,
     fps_limit: Option<u16>,
@@ -337,6 +338,7 @@ impl App {
             backbuffer: None,
             window: None,
             memory_hints: MemoryHints::Performance,
+            renderer_backend: RendererBackendPreference::Auto,
             primitive_batch: PrimitiveBatch::default(),
             render_targets: RenderTargetStore::new(),
             screen_capture: ScreenCaptureState::new(),
@@ -474,6 +476,12 @@ impl App {
     /// See [`MemoryHints`] for more
     pub fn memory_hints(mut self, hints: MemoryHints) -> Self {
         self.memory_hints = hints;
+        self
+    }
+
+    /// Select which wgpu backend set the renderer should enable.
+    pub fn renderer_backend(mut self, backend: RendererBackendPreference) -> Self {
+        self.renderer_backend = backend;
         self
     }
 
@@ -617,7 +625,7 @@ impl App {
 
     async fn create_renderer_with_retry(&self, window: Arc<Window>) -> Renderer {
         loop {
-            match Renderer::try_new(window.clone(), &self.memory_hints).await {
+            match Renderer::try_new_with_backend(window.clone(), &self.memory_hints, self.renderer_backend).await {
                 Ok(renderer) => return renderer,
                 Err(error) => {
                     log::error!("[egor] renderer init failed: {error:?}; retrying");
