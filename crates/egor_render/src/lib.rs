@@ -83,6 +83,25 @@ impl RendererBackendPreference {
     }
 }
 
+fn renderer_instance_descriptor() -> InstanceDescriptor {
+    let mut desc = InstanceDescriptor::new_without_display_handle();
+    configure_renderer_instance_flags(&mut desc);
+    desc
+}
+
+#[cfg(target_os = "android")]
+fn configure_renderer_instance_flags(desc: &mut InstanceDescriptor) {
+    if desc.flags.contains(wgpu::InstanceFlags::DEBUG) {
+        log::info!("[egor] renderer init: disabling wgpu DEBUG instance flag on Android");
+    }
+    // Android emulator Vulkan drivers can crash inside vk_common_SetDebugUtilsObjectNameEXT
+    // when wgpu DEBUG labels objects. Keep validation requested, but skip driver debug labels.
+    desc.flags.remove(wgpu::InstanceFlags::DEBUG);
+}
+
+#[cfg(not(target_os = "android"))]
+fn configure_renderer_instance_flags(_desc: &mut InstanceDescriptor) {}
+
 #[derive(Debug)]
 pub enum RendererInitError {
     CreateSurface(String),
@@ -161,6 +180,7 @@ pub struct Renderer {
     uniforms: Uniforms,
     textures: Textures,
     clear_color: Color,
+    startup_surface: Option<wgpu::Surface<'static>>,
     depth_texture: wgpu::Texture,
     depth_view: TextureView,
     depth_size: (u32, u32),
@@ -201,22 +221,37 @@ impl Renderer {
         backend_preference: RendererBackendPreference,
     ) -> Result<Self, RendererInitError> {
         log::info!("[egor] renderer init: creating wgpu instance");
-        let mut desc = InstanceDescriptor::new_without_display_handle();
-        if let RendererBackendPreference::Backends(backends) = backend_preference {
-            desc.backends = backends;
+        let mut desc = renderer_instance_descriptor();
+        match backend_preference {
+            RendererBackendPreference::Auto => {
+                log::info!("[egor] renderer init: enabled backend set: auto");
+            }
+            RendererBackendPreference::Backends(backends) => {
+                log::info!("[egor] renderer init: enabled backend set: {backends:?}");
+                desc.backends = backends;
+            }
         }
-        desc.flags.remove(wgpu::InstanceFlags::VALIDATION);
-        desc.flags.remove(wgpu::InstanceFlags::DEBUG);
+        log::info!("[egor] renderer init: instance flags: {:?}", desc.flags);
         let instance = new_instance_with_webgpu_detection(desc).await;
+        #[cfg(not(target_os = "android"))]
         log::info!("[egor] renderer init: creating adapter selection surface");
+        #[cfg(not(target_os = "android"))]
         let surface = instance
             .create_surface(window)
             .map_err(|error| RendererInitError::CreateSurface(error.to_string()))?;
+        #[cfg(target_os = "android")]
+        log::info!("[egor] renderer init: requesting adapter before creating an Android surface");
+        #[cfg(not(target_os = "android"))]
+        let compatible_surface = Some(&surface);
+        #[cfg(target_os = "android")]
+        let compatible_surface = None;
         log::info!("[egor] renderer init: requesting adapter");
         let adapter = instance
             .request_adapter(&RequestAdapterOptions {
-                // Required for WebGL to prevent selecting a non-presentable device
-                compatible_surface: Some(&surface),
+                // Required for WebGL to prevent selecting a non-presentable device.
+                // On Android/GLES, probing through the native window can leave the
+                // SurfaceView connected before the real swapchain is configured.
+                compatible_surface,
                 ..Default::default()
             })
             .await
@@ -228,6 +263,40 @@ impl Renderer {
             info.name,
             info.driver
         );
+
+        #[cfg(target_os = "android")]
+        let (instance, adapter, _info) = if backend_preference == RendererBackendPreference::Auto {
+            let selected_backends = wgpu::Backends::from(info.backend);
+            log::info!(
+                "[egor] renderer init: auto selected {:?}; recreating Android instance with {:?}",
+                info.backend,
+                selected_backends
+            );
+            drop(adapter);
+
+            let mut narrowed_desc = renderer_instance_descriptor();
+            narrowed_desc.backends = selected_backends;
+            log::info!("[egor] renderer init: narrowed Android instance flags: {:?}", narrowed_desc.flags);
+            let instance = new_instance_with_webgpu_detection(narrowed_desc).await;
+            let adapter = instance
+                .request_adapter(&RequestAdapterOptions {
+                    compatible_surface: None,
+                    ..Default::default()
+                })
+                .await
+                .map_err(|error| RendererInitError::RequestAdapter(error.to_string()))?;
+            let info = adapter.get_info();
+            log::info!(
+                "[egor] wgpu backend after Android auto narrowing: {:?} | adapter: {} | driver: {}",
+                info.backend,
+                info.name,
+                info.driver
+            );
+            (instance, adapter, info)
+        } else {
+            (instance, adapter, info)
+        };
+
         let adapter_limits = adapter.limits();
         if adapter_limits.max_texture_dimension_2d < REQUIRED_MAX_TEXTURE_DIMENSION_2D {
             return Err(RendererInitError::AdapterLimit {
@@ -259,8 +328,21 @@ impl Renderer {
             log::error!("[egor] wgpu uncaptured error: {error:?}");
         }));
 
+        #[cfg(target_os = "android")]
+        let (surface_format, startup_surface) = {
+            log::info!("[egor] renderer init: creating Android startup surface for format selection");
+            let surface = instance
+                .create_surface(window)
+                .map_err(|error| RendererInitError::CreateSurface(error.to_string()))?;
+            let (_surface_config, surface_format, _) =
+                target::surface_config_with_android_gl_fallback(&surface, &adapter, 1, 1).map_err(RendererInitError::SurfaceConfig)?;
+            (surface_format, Some(surface))
+        };
+        #[cfg(not(target_os = "android"))]
         let (_surface_config, surface_format, _) =
-            target::surface_config(&surface, &adapter, 1, 1).map_err(RendererInitError::SurfaceConfig)?;
+            target::surface_config_with_android_gl_fallback(&surface, &adapter, 1, 1).map_err(RendererInitError::SurfaceConfig)?;
+        #[cfg(not(target_os = "android"))]
+        let startup_surface = Some(surface);
         log::info!("[egor] renderer init: creating pipelines and core buffers");
         let pipelines = Pipelines::new(&device, surface_format);
 
@@ -330,6 +412,7 @@ impl Renderer {
             uniforms,
             textures,
             clear_color: Color::BLACK,
+            startup_surface,
             depth_texture,
             depth_view,
             depth_size: (1, 1),
@@ -402,6 +485,24 @@ impl Renderer {
 
     pub fn surface_format(&self) -> TextureFormat {
         self.surface_format
+    }
+
+    /// Consume the surface created during renderer startup and configure it as
+    /// the first backbuffer. This avoids connecting the same native window to a
+    /// second surface on platforms such as Android/EGL.
+    pub fn take_startup_backbuffer(&mut self, w: u32, h: u32) -> Option<Result<target::Backbuffer, target::BackbufferError>> {
+        let surface = self.startup_surface.take()?;
+        Some(target::Backbuffer::try_from_surface(
+            &self.gpu.adapter,
+            &self.gpu.device,
+            surface,
+            w,
+            h,
+        ))
+    }
+
+    pub fn drop_startup_surface(&mut self) {
+        self.startup_surface = None;
     }
 
     /// Sets the clear color for future render passes

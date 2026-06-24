@@ -307,6 +307,7 @@ pub struct App {
     instance_byte_offsets: Vec<u64>,
     surface_acquire_retry_interval: Option<Duration>,
     surface_recovery: SurfaceRecoveryState,
+    waiting_for_surface_change: bool,
     window_focused: bool,
     surface_occluded: bool,
     app_suspended: bool,
@@ -349,6 +350,7 @@ impl App {
             instance_byte_offsets: Vec::new(),
             surface_acquire_retry_interval: None,
             surface_recovery: SurfaceRecoveryState::new(),
+            waiting_for_surface_change: false,
             window_focused: true,
             surface_occluded: false,
             app_suspended: false,
@@ -547,6 +549,9 @@ impl App {
     }
 
     fn recreate_backbuffer(&mut self, renderer: &mut Renderer) -> bool {
+        if self.waiting_for_surface_change {
+            return false;
+        }
         if self.app_suspended {
             return false;
         }
@@ -563,19 +568,26 @@ impl App {
         }
 
         self.backbuffer = None;
-        let mut backbuffer = match Backbuffer::try_new(
-            renderer.instance(),
-            renderer.adapter(),
-            renderer.device(),
-            window,
-            size.width,
-            size.height,
-        ) {
-            Ok(backbuffer) => backbuffer,
-            Err(error) => {
+        let mut backbuffer = match renderer.take_startup_backbuffer(size.width, size.height) {
+            Some(Ok(backbuffer)) => backbuffer,
+            Some(Err(error)) => {
                 log::warn!("[egor] backbuffer recreation failed: {error:?}");
                 return false;
             }
+            None => match Backbuffer::try_new(
+                renderer.instance(),
+                renderer.adapter(),
+                renderer.device(),
+                window,
+                size.width,
+                size.height,
+            ) {
+                Ok(backbuffer) => backbuffer,
+                Err(error) => {
+                    log::warn!("[egor] backbuffer recreation failed: {error:?}");
+                    return false;
+                }
+            },
         };
         let backbuffer_format = backbuffer.format();
         let renderer_format = renderer.surface_format();
@@ -589,6 +601,7 @@ impl App {
         backbuffer.set_vsync(renderer.device(), hardware_vsync_enabled(self.vsync, self.fps_limit));
 
         self.backbuffer = Some(backbuffer);
+        self.waiting_for_surface_change = false;
         renderer.ensure_depth_size(size.width, size.height);
         if let Some(text_renderer) = self.text_renderer.as_mut() {
             text_renderer.resize(size.width, size.height, renderer.queue());
@@ -660,6 +673,12 @@ impl AppHandler<Renderer> for App {
         match event {
             WindowEvent::Focused(focused) => {
                 self.window_focused = *focused;
+                if *focused {
+                    #[cfg(not(target_os = "android"))]
+                    {
+                        self.waiting_for_surface_change = false;
+                    }
+                }
             }
             WindowEvent::Occluded(occluded) => {
                 self.surface_occluded = *occluded;
@@ -668,7 +687,12 @@ impl AppHandler<Renderer> for App {
                     self.surface_recovery
                         .record_surface_failure(SurfaceFailure::Acquire(egor_render::target::SurfaceAcquireFailure::Occluded));
                     self.surface_acquire_retry_interval = Some(Duration::from_millis(100));
+                } else {
+                    self.waiting_for_surface_change = false;
                 }
+            }
+            WindowEvent::Resized(size) if size.width > 0 && size.height > 0 => {
+                self.waiting_for_surface_change = false;
             }
             _ => {}
         }
@@ -693,17 +717,33 @@ impl AppHandler<Renderer> for App {
             if size.height == 0 { 600 } else { size.height },
         );
         log::info!("[egor] app resource init: start {w}x{h}");
-        let renderer = self.create_renderer_with_retry(window.clone()).await;
+        let mut renderer = self.create_renderer_with_retry(window.clone()).await;
         log::info!("[egor] app resource init: renderer ready");
         self.window = Some(window.clone());
-        log::info!("[egor] app resource init: creating first backbuffer");
-        self.backbuffer = match Backbuffer::try_new(renderer.instance(), renderer.adapter(), renderer.device(), window, w, h) {
-            Ok(backbuffer) => Some(backbuffer),
-            Err(error) => {
-                log::warn!("[egor] initial backbuffer creation failed: {error:?}");
-                None
-            }
-        };
+        #[cfg(target_os = "android")]
+        {
+            let _ = (w, h);
+            log::info!("[egor] app resource init: deferring first backbuffer until redraw");
+            self.backbuffer = None;
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            log::info!("[egor] app resource init: creating first backbuffer");
+            self.backbuffer = match renderer.take_startup_backbuffer(w, h) {
+                Some(Ok(backbuffer)) => Some(backbuffer),
+                Some(Err(error)) => {
+                    log::warn!("[egor] initial backbuffer creation failed: {error:?}");
+                    None
+                }
+                None => match Backbuffer::try_new(renderer.instance(), renderer.adapter(), renderer.device(), window, w, h) {
+                    Ok(backbuffer) => Some(backbuffer),
+                    Err(error) => {
+                        log::warn!("[egor] initial backbuffer creation failed: {error:?}");
+                        None
+                    }
+                },
+            };
+        }
         log::info!("[egor] app resource init: complete");
         renderer
     }
@@ -732,7 +772,7 @@ impl AppHandler<Renderer> for App {
         }
 
         let size = window_surface_size(window);
-        if size.width > 0 && size.height > 0 {
+        if size.width > 0 && size.height > 0 && self.backbuffer.is_some() {
             self.resize(size.width, size.height, renderer);
         }
         log::info!("[egor] app ready: complete");
@@ -809,14 +849,33 @@ impl AppHandler<Renderer> for App {
             return;
         }
 
+        if self.backbuffer.is_none() && self.waiting_for_surface_change {
+            self.surface_acquire_retry_interval = Some(surface_wait_retry_interval());
+            return;
+        }
+
         if self.backbuffer.is_none() && !self.recreate_backbuffer(renderer) {
             let action = self.surface_recovery.record_surface_failure(SurfaceFailure::BackbufferCreateFailed);
-            log::debug!("[egor] missing backbuffer recovery action: {action:?}");
-            self.surface_acquire_retry_interval = Some(surface_acquire_retry_interval(
-                _window,
-                self.native_refresh_rate_fps,
-                self.surface_recovery.consecutive_acquire_failures().saturating_add(1),
-            ));
+            match action {
+                SurfaceRecoveryAction::WaitForResize => {
+                    self.surface_acquire_retry_interval = Some(surface_wait_retry_interval());
+                }
+                SurfaceRecoveryAction::WaitForSurfaceChange => {
+                    if !self.waiting_for_surface_change {
+                        log::warn!("[egor] pausing backbuffer creation until Android reports a surface change");
+                    }
+                    self.waiting_for_surface_change = true;
+                    self.surface_acquire_retry_interval = Some(surface_wait_retry_interval());
+                }
+                SurfaceRecoveryAction::SkipFrame | SurfaceRecoveryAction::RecreateBackbuffer => {
+                    log::debug!("[egor] missing backbuffer recovery action: {action:?}");
+                    self.surface_acquire_retry_interval = Some(surface_acquire_retry_interval(
+                        _window,
+                        self.native_refresh_rate_fps,
+                        self.surface_recovery.consecutive_acquire_failures(),
+                    ));
+                }
+            }
             return;
         }
 
@@ -1017,13 +1076,27 @@ impl AppHandler<Renderer> for App {
                 self.surface_recovery.consecutive_acquire_failures(),
             ));
             self.primitive_batch.recycle(batches);
-            if action == SurfaceRecoveryAction::RecreateBackbuffer && self.recreate_backbuffer(renderer) {
-                self.surface_recovery.record_frame_acquired();
-                self.surface_acquire_retry_interval = Some(surface_acquire_retry_interval(_window, self.native_refresh_rate_fps, 0));
+            match action {
+                SurfaceRecoveryAction::RecreateBackbuffer => {
+                    if self.recreate_backbuffer(renderer) {
+                        self.surface_recovery.record_frame_acquired();
+                        self.surface_acquire_retry_interval =
+                            Some(surface_acquire_retry_interval(_window, self.native_refresh_rate_fps, 0));
+                    }
+                }
+                SurfaceRecoveryAction::WaitForSurfaceChange => {
+                    if !self.waiting_for_surface_change {
+                        log::warn!("[egor] pausing surface recovery until Android reports a surface change");
+                    }
+                    self.waiting_for_surface_change = true;
+                    self.surface_acquire_retry_interval = Some(surface_wait_retry_interval());
+                }
+                SurfaceRecoveryAction::SkipFrame | SurfaceRecoveryAction::WaitForResize => {}
             }
             return;
         };
         self.surface_recovery.record_frame_acquired();
+        self.waiting_for_surface_change = false;
         self.surface_acquire_retry_interval = None;
 
         let main_view = capture_frame_view.unwrap_or(&frame.view);
@@ -1311,6 +1384,7 @@ impl AppHandler<Renderer> for App {
         }
 
         self.surface_occluded = false;
+        self.waiting_for_surface_change = false;
         if self.backbuffer.is_none() && !self.recreate_backbuffer(renderer) {
             return;
         }
@@ -1328,6 +1402,7 @@ impl AppHandler<Renderer> for App {
         log::info!("[egor] app suspended: dropping backbuffer");
         self.app_suspended = true;
         self.surface_acquire_retry_interval = None;
+        self.waiting_for_surface_change = false;
         self.backbuffer = None;
         if let Some(window) = self.window.as_deref() {
             set_native_redraw_enabled(window, false);
@@ -1336,12 +1411,33 @@ impl AppHandler<Renderer> for App {
 
     fn resumed(&mut self, window: Arc<Window>, renderer: &mut Renderer) {
         let size = window_surface_size(&window);
-        let device = renderer.device();
         self.window = Some(window.clone());
         self.app_suspended = false;
         self.surface_acquire_retry_interval = None;
+        self.waiting_for_surface_change = false;
         self.surface_occluded = false;
         set_native_redraw_enabled(&window, true);
+
+        #[cfg(target_os = "android")]
+        {
+            renderer.drop_startup_surface();
+            self.backbuffer = None;
+            if size.width == 0 || size.height == 0 {
+                self.surface_recovery.record_surface_failure(SurfaceFailure::ZeroSizedSurface);
+                log::info!("[egor] app resumed with zero-sized surface; waiting for resize");
+                self.surface_acquire_retry_interval = Some(Duration::from_millis(100));
+                return;
+            }
+
+            log::info!(
+                "[egor] app resumed: deferring backbuffer recreation until redraw {}x{}",
+                size.width,
+                size.height
+            );
+            return;
+        }
+
+        let device = renderer.device();
         if size.width == 0 || size.height == 0 {
             self.surface_recovery.record_surface_failure(SurfaceFailure::ZeroSizedSurface);
             log::info!("[egor] app resumed with zero-sized surface; waiting for resize");

@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use wgpu::{
     BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType, BlendState, BufferBindingType, ColorTargetState,
     ColorWrites, CompareFunction, DepthStencilState, Device, FragmentState, PipelineLayoutDescriptor, RenderPipeline,
@@ -6,6 +8,114 @@ use wgpu::{
 };
 
 use crate::{instance::Instance, vertex::Vertex};
+
+const SRGB_OUTPUT_HELPERS: &str = r#"
+fn egor_linear_to_srgb_channel(value: f32) -> f32 {
+    let clamped = clamp(value, 0.0, 1.0);
+    if clamped <= 0.0031308 {
+        return clamped * 12.92;
+    }
+    return 1.055 * pow(clamped, 1.0 / 2.4) - 0.055;
+}
+
+fn egor_linear_to_srgb(color: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(
+        egor_linear_to_srgb_channel(color.r),
+        egor_linear_to_srgb_channel(color.g),
+        egor_linear_to_srgb_channel(color.b),
+        color.a,
+    );
+}
+"#;
+
+fn surface_needs_srgb_encode(surface_format: TextureFormat) -> bool {
+    surface_format.add_srgb_suffix() != surface_format
+}
+
+fn skip_ascii_whitespace(source: &str, mut index: usize) -> usize {
+    while let Some(byte) = source.as_bytes().get(index) {
+        if !byte.is_ascii_whitespace() {
+            break;
+        }
+        index += 1;
+    }
+    index
+}
+
+fn parse_fragment_argument_names(params: &str) -> Option<String> {
+    let mut names = Vec::new();
+    for param in params.split(',').map(str::trim).filter(|param| !param.is_empty()) {
+        let (name, _) = param.split_once(':')?;
+        names.push(name.trim());
+    }
+    Some(names.join(", "))
+}
+
+fn wrap_custom_shader_for_srgb_output(wgsl_source: &str) -> Cow<'_, str> {
+    const FRAGMENT_ATTR: &str = "@fragment";
+    const USER_FN: &str = "fn fs_main";
+    const RETURN_LOCATION: &str = "@location(0)";
+    const RETURN_TYPE: &str = "vec4<f32>";
+
+    let Some(fn_pos) = wgsl_source.find(USER_FN) else {
+        log::warn!("[egor] custom shader has no fs_main entrypoint; sRGB output encoding was not applied");
+        return Cow::Borrowed(wgsl_source);
+    };
+    let Some(attr_pos) = wgsl_source[..fn_pos].rfind(FRAGMENT_ATTR) else {
+        log::warn!("[egor] custom shader fs_main has no @fragment attribute; sRGB output encoding was not applied");
+        return Cow::Borrowed(wgsl_source);
+    };
+    if !wgsl_source[attr_pos + FRAGMENT_ATTR.len()..fn_pos].trim().is_empty() {
+        log::warn!("[egor] custom shader @fragment attribute could not be matched to fs_main; sRGB output encoding was not applied");
+        return Cow::Borrowed(wgsl_source);
+    }
+
+    let Some(params_start) = wgsl_source[fn_pos..].find('(').map(|offset| fn_pos + offset) else {
+        log::warn!("[egor] custom shader fs_main params could not be parsed; sRGB output encoding was not applied");
+        return Cow::Borrowed(wgsl_source);
+    };
+    let Some(params_end) = wgsl_source[params_start..].find(')').map(|offset| params_start + offset) else {
+        log::warn!("[egor] custom shader fs_main params could not be parsed; sRGB output encoding was not applied");
+        return Cow::Borrowed(wgsl_source);
+    };
+    let params = &wgsl_source[params_start + 1..params_end];
+    let Some(argument_names) = parse_fragment_argument_names(params) else {
+        log::warn!("[egor] custom shader fs_main arguments could not be parsed; sRGB output encoding was not applied");
+        return Cow::Borrowed(wgsl_source);
+    };
+
+    let mut cursor = skip_ascii_whitespace(wgsl_source, params_end + 1);
+    if !wgsl_source[cursor..].starts_with("->") {
+        log::warn!("[egor] custom shader fs_main return type could not be parsed; sRGB output encoding was not applied");
+        return Cow::Borrowed(wgsl_source);
+    }
+    cursor = skip_ascii_whitespace(wgsl_source, cursor + 2);
+    if !wgsl_source[cursor..].starts_with(RETURN_LOCATION) {
+        log::warn!("[egor] custom shader fs_main return location could not be parsed; sRGB output encoding was not applied");
+        return Cow::Borrowed(wgsl_source);
+    }
+    cursor = skip_ascii_whitespace(wgsl_source, cursor + RETURN_LOCATION.len());
+    if !wgsl_source[cursor..].starts_with(RETURN_TYPE) {
+        log::warn!("[egor] custom shader fs_main return type is not vec4<f32>; sRGB output encoding was not applied");
+        return Cow::Borrowed(wgsl_source);
+    }
+    let return_type_end = cursor + RETURN_TYPE.len();
+
+    let mut wrapped = String::with_capacity(wgsl_source.len() + SRGB_OUTPUT_HELPERS.len() + 180);
+    wrapped.push_str(&wgsl_source[..attr_pos]);
+    wrapped.push_str("fn egor_user_fs_main");
+    wrapped.push_str(&wgsl_source[params_start..params_end + 1]);
+    wrapped.push_str(" -> vec4<f32>");
+    wrapped.push_str(&wgsl_source[return_type_end..]);
+    wrapped.push_str(SRGB_OUTPUT_HELPERS);
+    wrapped.push_str("\n@fragment\nfn fs_main(");
+    wrapped.push_str(params);
+    wrapped.push_str(") -> @location(0) vec4<f32> {\n    return egor_linear_to_srgb(egor_user_fs_main(");
+    wrapped.push_str(&argument_names);
+    wrapped.push_str("));\n}\n");
+
+    Cow::Owned(wrapped)
+}
 
 pub(crate) struct CustomPipeline {
     pipeline: RenderPipeline,
@@ -142,6 +252,11 @@ fn create_primitive_pipeline(
     camera_layout: &BindGroupLayout,
 ) -> RenderPipeline {
     let shader = device.create_shader_module(include_wgsl!("../shader.wgsl"));
+    let fragment_entry_point = if surface_needs_srgb_encode(surface_format) {
+        "fs_main_srgb_encoded"
+    } else {
+        "fs_main"
+    };
 
     let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
         label: Some("Primitive Pipeline Layout"),
@@ -169,7 +284,7 @@ fn create_primitive_pipeline(
         multisample: Default::default(),
         fragment: Some(FragmentState {
             module: &shader,
-            entry_point: Some("fs_main"),
+            entry_point: Some(fragment_entry_point),
             targets: &[Some(ColorTargetState {
                 format: surface_format,
                 blend: Some(BlendState::ALPHA_BLENDING),
@@ -197,9 +312,14 @@ fn create_custom_pipeline(
     extra_layouts: &[&BindGroupLayout],
     wgsl_source: &str,
 ) -> RenderPipeline {
+    let wgsl_source = if surface_needs_srgb_encode(surface_format) {
+        wrap_custom_shader_for_srgb_output(wgsl_source)
+    } else {
+        Cow::Borrowed(wgsl_source)
+    };
     let shader = device.create_shader_module(ShaderModuleDescriptor {
         label: Some("Custom Shader"),
-        source: ShaderSource::Wgsl(wgsl_source.into()),
+        source: ShaderSource::Wgsl(wgsl_source),
     });
 
     let mut layouts: Vec<Option<&BindGroupLayout>> = vec![Some(texture_layout), Some(camera_layout)];

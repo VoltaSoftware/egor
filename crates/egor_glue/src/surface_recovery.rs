@@ -15,6 +15,7 @@ pub(crate) enum SurfaceFailure {
 pub(crate) enum SurfaceRecoveryAction {
     SkipFrame,
     WaitForResize,
+    WaitForSurfaceChange,
     RecreateBackbuffer,
 }
 
@@ -28,6 +29,7 @@ pub(crate) enum DeviceLossAction {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SurfaceRecoveryState {
     consecutive_acquire_failures: u32,
+    consecutive_surface_create_failures: u32,
     device_lost_reported: bool,
 }
 
@@ -35,6 +37,7 @@ impl SurfaceRecoveryState {
     pub(crate) fn new() -> Self {
         Self {
             consecutive_acquire_failures: 0,
+            consecutive_surface_create_failures: 0,
             device_lost_reported: false,
         }
     }
@@ -45,22 +48,31 @@ impl SurfaceRecoveryState {
 
     pub(crate) fn record_frame_acquired(&mut self) {
         self.consecutive_acquire_failures = 0;
+        self.consecutive_surface_create_failures = 0;
         self.device_lost_reported = false;
     }
 
     pub(crate) fn record_surface_failure(&mut self, failure: SurfaceFailure) -> SurfaceRecoveryAction {
         match failure {
-            SurfaceFailure::ZeroSizedSurface => SurfaceRecoveryAction::WaitForResize,
-            SurfaceFailure::BackbufferCreateFailed => SurfaceRecoveryAction::SkipFrame,
+            SurfaceFailure::ZeroSizedSurface => {
+                self.reset_surface_create_failures();
+                SurfaceRecoveryAction::WaitForResize
+            }
+            SurfaceFailure::BackbufferCreateFailed => {
+                self.bump_surface_create_failures();
+                self.surface_create_failure_action()
+            }
             SurfaceFailure::ConfigureFailed => {
-                self.bump_acquire_failures();
-                SurfaceRecoveryAction::SkipFrame
+                self.bump_surface_create_failures();
+                self.surface_create_failure_action()
             }
             SurfaceFailure::Acquire(SurfaceAcquireFailure::Lost) => {
+                self.reset_surface_create_failures();
                 self.bump_acquire_failures();
                 SurfaceRecoveryAction::RecreateBackbuffer
             }
             SurfaceFailure::Acquire(SurfaceAcquireFailure::Validation) | SurfaceFailure::AcquirePanic => {
+                self.reset_surface_create_failures();
                 self.bump_acquire_failures();
                 if self.consecutive_acquire_failures > 1 {
                     SurfaceRecoveryAction::RecreateBackbuffer
@@ -69,10 +81,12 @@ impl SurfaceRecoveryState {
                 }
             }
             SurfaceFailure::Acquire(SurfaceAcquireFailure::Outdated) => {
+                self.reset_surface_create_failures();
                 self.bump_acquire_failures();
                 SurfaceRecoveryAction::RecreateBackbuffer
             }
             SurfaceFailure::Acquire(SurfaceAcquireFailure::Timeout | SurfaceAcquireFailure::Occluded) => {
+                self.reset_surface_create_failures();
                 self.bump_acquire_failures();
                 SurfaceRecoveryAction::SkipFrame
             }
@@ -87,6 +101,23 @@ impl SurfaceRecoveryState {
 
     fn bump_acquire_failures(&mut self) {
         self.consecutive_acquire_failures = self.consecutive_acquire_failures.saturating_add(1);
+    }
+
+    fn bump_surface_create_failures(&mut self) {
+        self.bump_acquire_failures();
+        self.consecutive_surface_create_failures = self.consecutive_surface_create_failures.saturating_add(1);
+    }
+
+    fn reset_surface_create_failures(&mut self) {
+        self.consecutive_surface_create_failures = 0;
+    }
+
+    fn surface_create_failure_action(&self) -> SurfaceRecoveryAction {
+        if self.consecutive_surface_create_failures > 3 {
+            SurfaceRecoveryAction::WaitForSurfaceChange
+        } else {
+            SurfaceRecoveryAction::SkipFrame
+        }
     }
 }
 
@@ -142,6 +173,7 @@ mod tests {
     enum InjectedRecoveryOutcome {
         SkipFrame,
         WaitForResize,
+        WaitForSurfaceChange,
         RecreateBackbuffer,
         RecreateRenderer,
         FrameAcquired,
@@ -212,6 +244,7 @@ mod tests {
                     self.wait_resize_count += 1;
                     InjectedRecoveryOutcome::WaitForResize
                 }
+                SurfaceRecoveryAction::WaitForSurfaceChange => InjectedRecoveryOutcome::WaitForSurfaceChange,
                 SurfaceRecoveryAction::RecreateBackbuffer => {
                     self.backbuffer_recreate_count += 1;
                     InjectedRecoveryOutcome::RecreateBackbuffer
@@ -298,7 +331,43 @@ mod tests {
         let action = state.record_surface_failure(SurfaceFailure::BackbufferCreateFailed);
 
         assert_eq!(action, SurfaceRecoveryAction::SkipFrame);
-        assert_eq!(state.consecutive_acquire_failures(), 0);
+        assert_eq!(state.consecutive_acquire_failures(), 1);
+    }
+
+    #[test]
+    fn repeated_backbuffer_create_failures_back_off() {
+        let mut state = SurfaceRecoveryState::new();
+
+        for expected_count in 1..=3 {
+            let action = state.record_surface_failure(SurfaceFailure::BackbufferCreateFailed);
+            assert_eq!(action, SurfaceRecoveryAction::SkipFrame);
+            assert_eq!(state.consecutive_acquire_failures(), expected_count);
+        }
+        let action = state.record_surface_failure(SurfaceFailure::BackbufferCreateFailed);
+        assert_eq!(action, SurfaceRecoveryAction::WaitForSurfaceChange);
+        assert_eq!(state.consecutive_acquire_failures(), 4);
+
+        assert_eq!(
+            retry_interval_for_refresh(Some(120), state.consecutive_acquire_failures()),
+            Duration::from_millis(100)
+        );
+    }
+
+    #[test]
+    fn repeated_configure_failures_wait_for_surface_change() {
+        let mut state = SurfaceRecoveryState::new();
+
+        for _ in 0..3 {
+            assert_eq!(
+                state.record_surface_failure(SurfaceFailure::ConfigureFailed),
+                SurfaceRecoveryAction::SkipFrame
+            );
+        }
+
+        assert_eq!(
+            state.record_surface_failure(SurfaceFailure::ConfigureFailed),
+            SurfaceRecoveryAction::WaitForSurfaceChange
+        );
     }
 
     #[test]

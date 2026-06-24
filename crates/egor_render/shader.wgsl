@@ -44,11 +44,37 @@ fn vs_main(vert: VertexInput, inst: InstanceInput) -> VertexOutput {
     return out;
 }
 
-@fragment
-fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+fn fs_main_linear(input: VertexOutput) -> vec4<f32> {
     let color = textureSample(texture_binding, texture_sampler, input.tex_coords) * input.color;
     if color.a < 0.004 {
         discard;
     }
     return color;
+}
+
+fn linear_to_srgb_channel(value: f32) -> f32 {
+    let clamped = clamp(value, 0.0, 1.0);
+    if clamped <= 0.0031308 {
+        return clamped * 12.92;
+    }
+    return 1.055 * pow(clamped, 1.0 / 2.4) - 0.055;
+}
+
+fn linear_to_srgb(color: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(
+        linear_to_srgb_channel(color.r),
+        linear_to_srgb_channel(color.g),
+        linear_to_srgb_channel(color.b),
+        color.a,
+    );
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    return fs_main_linear(input);
+}
+
+@fragment
+fn fs_main_srgb_encoded(input: VertexOutput) -> @location(0) vec4<f32> {
+    return linear_to_srgb(fs_main_linear(input));
 }

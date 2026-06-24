@@ -234,19 +234,9 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
             window.set_max_inner_size(Some(PhysicalSize::new(w, h)));
         }
 
-        let mut handler = self.handler.take().unwrap();
-        #[cfg(target_arch = "wasm32")]
-        {
-            wasm_bindgen_futures::spawn_local(async move {
-                let resource = handler.with_resource(window).await;
-                _ = proxy.send_event((resource, handler));
-            });
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let resource = pollster::block_on(handler.with_resource(window));
-            _ = proxy.send_event((resource, handler));
-        }
+        #[cfg(target_os = "android")]
+        event_loop.set_control_flow(ControlFlow::Poll);
+        self.dispatch_resource_creation(proxy, window);
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
@@ -339,8 +329,9 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
     fn user_event(&mut self, _: &ActiveEventLoop, (mut resource, mut handler): (R, H)) {
         let Some(window) = &self.window else { return };
 
-        let frame_started_at = Instant::now();
         handler.on_ready(window, &mut resource);
+        let frame_started_at = Instant::now();
+        #[cfg(not(target_os = "android"))]
         handler.frame(window, &mut resource, &mut self.input, &self.timer);
         let recreate_resource = handler.resource_recreate_requested();
 
@@ -465,14 +456,8 @@ impl<R, H: AppHandler<R> + 'static> AppRunner<R, H> {
         handler.poll_frame_interval(window)
     }
 
-    fn recreate_resource(&mut self) {
-        let Some(window) = self.window.clone() else {
-            return;
-        };
-        let Some(proxy) = self.proxy.clone() else {
-            return;
-        };
-        let Some(mut handler) = self.prepare_resource_recreate() else {
+    fn dispatch_resource_creation(&mut self, proxy: EventLoopProxy<(R, H)>, window: Arc<Window>) {
+        let Some(mut handler) = self.handler.take() else {
             return;
         };
 
@@ -488,6 +473,21 @@ impl<R, H: AppHandler<R> + 'static> AppRunner<R, H> {
             let resource = pollster::block_on(handler.with_resource(window));
             _ = proxy.send_event((resource, handler));
         }
+    }
+
+    fn recreate_resource(&mut self) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let Some(proxy) = self.proxy.clone() else {
+            return;
+        };
+        let Some(handler) = self.prepare_resource_recreate() else {
+            return;
+        };
+
+        self.handler = Some(handler);
+        self.dispatch_resource_creation(proxy, window);
     }
 
     fn prepare_resource_recreate(&mut self) -> Option<H> {
@@ -516,9 +516,9 @@ impl<R, H: AppHandler<R> + 'static> AppRunner<R, H> {
 
         let event_loop = match event_loop_builder.build() {
             Ok(event_loop) => event_loop,
-            Err(error) => {
+            Err(_error) => {
                 #[cfg(feature = "log")]
-                log::error!("[egor] failed to build event loop: {error:?}");
+                log::error!("[egor] failed to build event loop: {_error:?}");
                 return;
             }
         };

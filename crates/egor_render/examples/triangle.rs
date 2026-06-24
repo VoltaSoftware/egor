@@ -28,15 +28,20 @@ impl ApplicationHandler for MinimalApp {
         let window = Arc::new(event_loop.create_window(Default::default()).unwrap());
         let size = window.inner_size();
 
-        let renderer = pollster::block_on(Renderer::new(window.clone(), &MemoryHints::Performance));
-        let backbuffer = Backbuffer::new(
-            renderer.instance(),
-            renderer.adapter(),
-            renderer.device(),
-            window.clone(),
-            size.width,
-            size.height,
-        );
+        let mut renderer = pollster::block_on(Renderer::new(window.clone(), &MemoryHints::Performance));
+        let backbuffer = renderer
+            .take_startup_backbuffer(size.width, size.height)
+            .unwrap_or_else(|| {
+                Backbuffer::try_new(
+                    renderer.instance(),
+                    renderer.adapter(),
+                    renderer.device(),
+                    window.clone(),
+                    size.width,
+                    size.height,
+                )
+            })
+            .expect("failed to create backbuffer");
 
         self.window = Some(window);
         self.renderer = Some(renderer);

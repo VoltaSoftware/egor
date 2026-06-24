@@ -1,8 +1,8 @@
 use wgpu::{
-    AddressMode, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry,
-    BindingResource, BindingType, Device, Extent3d, FilterMode, Origin3d, Queue, RenderPass, Sampler, SamplerBindingType,
-    SamplerDescriptor, ShaderStages, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect, TextureDescriptor, TextureDimension,
-    TextureFormat, TextureSampleType, TextureUsages, TextureView, TextureViewDimension,
+    BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingResource,
+    BindingType, Device, Extent3d, FilterMode, Origin3d, Queue, RenderPass, Sampler, SamplerBindingType, SamplerDescriptor, ShaderStages,
+    TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect, TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType,
+    TextureUsages, TextureView, TextureViewDimension,
 };
 
 use crate::target::OffscreenTarget;
@@ -228,7 +228,6 @@ pub(crate) struct Textures {
     layout: BindGroupLayout,
     default_sampler: Sampler,
     nearest_sampler: Sampler,
-    linear_clamp_sampler: Sampler,
     default_texture: Texture,
     store: Vec<Texture>,
 }
@@ -259,14 +258,6 @@ impl Textures {
 
         let default_sampler = device.create_sampler(&Default::default());
 
-        let linear_clamp_sampler = device.create_sampler(&SamplerDescriptor {
-            address_mode_u: AddressMode::ClampToEdge,
-            address_mode_v: AddressMode::ClampToEdge,
-            mag_filter: FilterMode::Nearest,
-            min_filter: FilterMode::Nearest,
-            ..Default::default()
-        });
-
         let nearest_sampler = device.create_sampler(&SamplerDescriptor {
             mag_filter: FilterMode::Nearest,
             min_filter: FilterMode::Nearest,
@@ -279,7 +270,6 @@ impl Textures {
             layout,
             default_sampler,
             nearest_sampler,
-            linear_clamp_sampler,
             default_texture,
             store: Vec::new(),
         }

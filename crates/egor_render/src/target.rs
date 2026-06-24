@@ -1,7 +1,7 @@
 use wgpu::{
-    Adapter, CommandEncoder, CurrentSurfaceTexture, Device, DownlevelFlags, Extent3d, Instance, PresentMode, Surface, SurfaceConfiguration,
-    SurfaceTarget, Texture, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView, TextureViewDescriptor,
-    WindowHandle,
+    Adapter, CommandEncoder, CompositeAlphaMode, CurrentSurfaceTexture, Device, DownlevelFlags, Extent3d, Instance, PresentMode, Surface,
+    SurfaceConfiguration, SurfaceTarget, Texture, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView,
+    TextureViewDescriptor, WindowHandle,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -64,6 +64,39 @@ pub trait RenderTarget {
     fn set_vsync(&mut self, _device: &Device, _on: bool) {}
 }
 
+fn android_gl_fallback_surface_format() -> TextureFormat {
+    TextureFormat::Rgba8Unorm
+}
+
+fn android_gl_fallback_surface_config(w: u32, h: u32) -> Result<(SurfaceConfiguration, TextureFormat, bool), BackbufferError> {
+    if w == 0 || h == 0 {
+        return Err(BackbufferError::ZeroSize { width: w, height: h });
+    }
+
+    let format = android_gl_fallback_surface_format();
+    let config = SurfaceConfiguration {
+        usage: TextureUsages::RENDER_ATTACHMENT,
+        format,
+        width: w,
+        height: h,
+        present_mode: PresentMode::Fifo,
+        desired_maximum_frame_latency: 2,
+        alpha_mode: CompositeAlphaMode::Auto,
+        view_formats: Vec::new(),
+    };
+    Ok((config, format, false))
+}
+
+#[cfg(target_os = "android")]
+fn is_android_gl(adapter: &Adapter) -> bool {
+    adapter.get_info().backend == wgpu::Backend::Gl
+}
+
+#[cfg(not(target_os = "android"))]
+fn is_android_gl(_adapter: &Adapter) -> bool {
+    false
+}
+
 pub(crate) fn surface_config(
     surface: &Surface<'_>,
     adapter: &Adapter,
@@ -111,6 +144,26 @@ pub(crate) fn surface_config(
     Ok((config, view_format, surface_copy_src))
 }
 
+pub(crate) fn surface_config_with_android_gl_fallback(
+    surface: &Surface<'_>,
+    adapter: &Adapter,
+    w: u32,
+    h: u32,
+) -> Result<(SurfaceConfiguration, TextureFormat, bool), BackbufferError> {
+    match surface_config(surface, adapter, w, h) {
+        Ok(config) => Ok(config),
+        Err(error @ BackbufferError::ZeroSize { .. }) => Err(error),
+        Err(error) if is_android_gl(adapter) => {
+            log::warn!(
+                "[egor] Android GL surface capability query failed ({error}); falling back to {:?}",
+                android_gl_fallback_surface_format()
+            );
+            android_gl_fallback_surface_config(w, h)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Renders to the window's backbuffer (swapchain)
 pub struct Backbuffer {
     surface: Surface<'static>,
@@ -149,8 +202,18 @@ impl Backbuffer {
         let surface = instance
             .create_surface(window)
             .map_err(|error| BackbufferError::CreateSurface(error.to_string()))?;
+        Self::try_from_surface(adapter, device, surface, w, h)
+    }
+
+    pub(crate) fn try_from_surface(
+        adapter: &Adapter,
+        device: &Device,
+        surface: Surface<'static>,
+        w: u32,
+        h: u32,
+    ) -> Result<Self, BackbufferError> {
         log::info!("[egor] backbuffer init: building surface config");
-        let (config, view_format, surface_copy_src) = surface_config(&surface, adapter, w, h)?;
+        let (config, view_format, surface_copy_src) = surface_config_with_android_gl_fallback(&surface, adapter, w, h)?;
         log::info!(
             "[egor] backbuffer init: configuring surface format={:?} view_format={:?} copy_src={}",
             config.format,
@@ -302,6 +365,9 @@ impl RenderTarget for Backbuffer {
         if w == 0 || h == 0 {
             return;
         }
+        if self.config.width == w && self.config.height == h {
+            return;
+        }
         (self.config.width, self.config.height) = (w, h);
         if let Err(error) = self.reconfigure(device) {
             log::warn!("[egor] surface resize configure failed: {error:?}");
@@ -309,7 +375,11 @@ impl RenderTarget for Backbuffer {
     }
 
     fn set_vsync(&mut self, device: &Device, on: bool) {
-        self.config.present_mode = if on { PresentMode::Fifo } else { PresentMode::AutoNoVsync };
+        let present_mode = if on { PresentMode::Fifo } else { PresentMode::AutoNoVsync };
+        if self.config.present_mode == present_mode {
+            return;
+        }
+        self.config.present_mode = present_mode;
         if let Err(error) = self.reconfigure(device) {
             log::warn!("[egor] surface vsync configure failed: {error:?}");
         }
@@ -335,7 +405,7 @@ pub struct OffscreenTarget {
     render_view: TextureView,
     sample_texture: Texture,
     sample_view: TextureView,
-    depth_texture: Texture,
+    _depth_texture: Texture,
     depth_view: TextureView,
     format: TextureFormat,
     width: u32,
@@ -386,7 +456,7 @@ impl OffscreenTarget {
             render_view,
             sample_texture,
             sample_view,
-            depth_texture,
+            _depth_texture: depth_texture,
             depth_view,
             format,
             width,
