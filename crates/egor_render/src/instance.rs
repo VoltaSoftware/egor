@@ -1,6 +1,6 @@
 use wgpu::{BufferAddress, VertexAttribute, VertexBufferLayout, VertexFormat, VertexStepMode};
 
-/// Per-instance data for 2D instanced drawing (60 bytes)
+/// Per-instance data for 2D instanced drawing (76 bytes)
 ///
 /// Uses a compact 2D affine representation instead of a full `mat4x4`:
 /// - `affine`: column-major 2×2 rotation+scale matrix `[col0.x, col0.y, col1.x, col1.y]`
@@ -12,6 +12,9 @@ pub struct Instance {
     pub translate: [f32; 3],
     pub color: [f32; 4],
     pub uv: [f32; 4],
+    /// Transparent for normal sprites. Non-zero alpha enables the built-in
+    /// single-pass font outline path in the default sprite shader.
+    pub outline_color: [f32; 4],
 }
 
 impl Instance {
@@ -21,6 +24,23 @@ impl Instance {
             translate,
             color,
             uv,
+            outline_color: [0.0; 4],
+        }
+    }
+
+    pub fn new_outlined(
+        affine: [f32; 4],
+        translate: [f32; 3],
+        color: [f32; 4],
+        uv: [f32; 4],
+        outline_color: [f32; 4],
+    ) -> Self {
+        Self {
+            affine,
+            translate,
+            color,
+            uv,
+            outline_color,
         }
     }
 
@@ -54,6 +74,12 @@ impl Instance {
                     shader_location: 6,
                     format: VertexFormat::Float32x4,
                 },
+                // outline color / mode
+                VertexAttribute {
+                    offset: 60,
+                    shader_location: 7,
+                    format: VertexFormat::Float32x4,
+                },
             ],
         }
     }
@@ -64,6 +90,7 @@ impl Instance {
             translate: [0.0, 0.0, 0.0],
             color: [1.0; 4],
             uv: [0.0, 0.0, 1.0, 1.0],
+            outline_color: [0.0; 4],
         }
     }
 }

@@ -1240,6 +1240,29 @@ impl<'a> Graphics<'a> {
             uvs,
         ));
     }
+
+    /// Push an outlined glyph through the default sprite pipeline. The UV rect
+    /// must include the one-texel outline border; `outline_color.a > 0` enables
+    /// the outline path in the default shader.
+    #[inline(always)]
+    pub fn push_outlined_sprite_unchecked(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        uvs: [f32; 4],
+        color: [f32; 4],
+        outline_color: [f32; 4],
+    ) {
+        self.batch.push_instance_unchecked(egor_render::instance::Instance::new_outlined(
+            [w, 0.0, 0.0, h],
+            [x + w * 0.5, y + h * 0.5, self.batch.draw_depth()],
+            color,
+            uvs,
+            outline_color,
+        ));
+    }
     /// Start building an arbitrary polygon primitive, capable of triangles, circles, n-gons
     pub fn polygon(&mut self) -> PolygonBuilder<'_> {
         PolygonBuilder::new(self.batch, self.current_shader)
