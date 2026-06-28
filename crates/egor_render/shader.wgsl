@@ -126,3 +126,13 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 fn fs_main_srgb_encoded(input: VertexOutput) -> @location(0) vec4<f32> {
     return linear_to_srgb(fs_main_linear(input));
 }
+
+@fragment
+fn fs_replace(input: VertexOutput) -> @location(0) vec4<f32> {
+    return input.color;
+}
+
+@fragment
+fn fs_replace_srgb_encoded(input: VertexOutput) -> @location(0) vec4<f32> {
+    return linear_to_srgb(input.color);
+}

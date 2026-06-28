@@ -297,6 +297,13 @@ impl Textures {
         id
     }
 
+    pub fn insert_raw_nearest(&mut self, device: &Device, queue: &Queue, w: u32, h: u32, data: &[u8]) -> usize {
+        let id = self.store.len();
+        self.store
+            .push(Texture::from_bytes(device, queue, &self.layout, &self.nearest_sampler, data, w, h));
+        id
+    }
+
     pub fn replace(&mut self, device: &Device, queue: &Queue, id: usize, data: &[u8]) {
         let (w, h, img) = Self::decode_rgba(data);
         self.replace_raw(device, queue, id, w, h, &img);

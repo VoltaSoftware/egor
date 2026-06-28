@@ -993,9 +993,6 @@ impl AppHandler<Renderer> for App {
         }
 
         let has_text = text_renderer.has_entries();
-        if has_text {
-            text_renderer.prepare(&device, &queue, w, h);
-        }
 
         // Use the flag tracked during batch building instead of scanning all batches.
         let has_rt_overrides = self.primitive_batch.has_rt_overrides();
@@ -1044,7 +1041,8 @@ impl AppHandler<Renderer> for App {
         } // profile_scope batch_upload
 
         let capture_active = self.screen_capture.is_requested();
-        let use_capture_frame_target = capture_active && !backbuffer.supports_copy_src();
+        let capture_source_render_target = self.screen_capture.requested_source_render_target();
+        let use_capture_frame_target = capture_active && capture_source_render_target.is_none() && !backbuffer.supports_copy_src();
         if use_capture_frame_target {
             CaptureFrameTarget::ensure(&mut self.capture_frame_target, &device, w, h, format);
         }
@@ -1109,7 +1107,7 @@ impl AppHandler<Renderer> for App {
                 // Multi-pass rendering: split ONLY on render_target changes.
                 let mut current_rt: Option<usize> = None;
                 let mut first_pass_on_backbuffer = true;
-                let mut first_pass_on_rt: Option<usize> = None;
+                let mut initialized_render_targets: Vec<usize> = Vec::new();
 
                 let mut batch_start = 0;
                 while batch_start < batches.len() {
@@ -1131,9 +1129,9 @@ impl AppHandler<Renderer> for App {
                         let rt = self.render_targets.get(rt_id);
                         let view = rt.render_view();
                         let dv = rt.offscreen_depth_view();
-                        let is_first = first_pass_on_rt != Some(rt_id);
+                        let is_first = !initialized_render_targets.contains(&rt_id);
                         if is_first {
-                            first_pass_on_rt = Some(rt_id);
+                            initialized_render_targets.push(rt_id);
                         }
                         (view, dv, is_first)
                     } else {
@@ -1152,15 +1150,26 @@ impl AppHandler<Renderer> for App {
 
                     {
                         let mut r_pass = if is_first {
-                            renderer.begin_render_pass_with_depth(&mut frame.encoder, view, depth_view, true)
+                            if group_rt.is_some() {
+                                renderer.begin_render_pass_with_depth_clear_color(
+                                    &mut frame.encoder,
+                                    view,
+                                    depth_view,
+                                    egor_render::wgpu::Color::TRANSPARENT,
+                                    true,
+                                )
+                            } else {
+                                renderer.begin_render_pass_with_depth(&mut frame.encoder, view, depth_view, true)
+                            }
                         } else {
                             renderer.begin_render_pass_load_with_depth(&mut frame.encoder, view, depth_view)
                         };
 
                         let first_batch = &batches[batch_start];
-                        renderer.bind_pass_state(&mut r_pass, first_batch.texture_id, first_batch.shader_id);
+                        renderer.bind_pass_state(&mut r_pass, first_batch.texture_id, first_batch.shader_id, first_batch.replace_blend);
                         let mut cur_tex = first_batch.texture_id;
                         let mut cur_shd = first_batch.shader_id;
+                        let mut cur_replace_blend = first_batch.replace_blend;
                         let mut cur_cam_offset = u32::MAX;
                         let mut quad_bound = true;
                         let full_scissor = (0u32, 0u32, rt_w.max(1), rt_h.max(1));
@@ -1189,9 +1198,11 @@ impl AppHandler<Renderer> for App {
                                     &mut batch.geometry,
                                     batch.texture_id,
                                     batch.shader_id,
+                                    batch.replace_blend,
                                     offset,
                                     &mut cur_tex,
                                     &mut cur_shd,
+                                    &mut cur_replace_blend,
                                     &mut cur_cam_offset,
                                     &mut quad_bound,
                                     shared_buf,
@@ -1203,16 +1214,20 @@ impl AppHandler<Renderer> for App {
                                     &mut batch.geometry,
                                     batch.texture_id,
                                     batch.shader_id,
+                                    batch.replace_blend,
                                     offset,
                                     &mut cur_tex,
                                     &mut cur_shd,
+                                    &mut cur_replace_blend,
                                     &mut cur_cam_offset,
                                     &mut quad_bound,
                                 );
                             }
                         }
 
-                        if batch_end >= batches.len() && group_rt.is_none() && has_text {
+                        let is_last_group_for_target = batches[batch_end..].iter().all(|batch| batch.render_target != group_rt);
+                        if has_text && is_last_group_for_target {
+                            text_renderer.prepare(&device, &queue, rt_w, rt_h, group_rt);
                             text_renderer.render(&mut r_pass);
                             frame_stats.draw_calls += 1;
                         }
@@ -1229,6 +1244,7 @@ impl AppHandler<Renderer> for App {
                 if batches.is_empty() {
                     let mut r_pass = renderer.begin_render_pass(&mut frame.encoder, main_view);
                     if has_text {
+                        text_renderer.prepare(&device, &queue, w, h, None);
                         text_renderer.render(&mut r_pass);
                         frame_stats.draw_calls += 1;
                     }
@@ -1239,9 +1255,10 @@ impl AppHandler<Renderer> for App {
                     let mut r_pass = renderer.begin_render_pass(&mut frame.encoder, main_view);
 
                     if let Some(first) = batches.first() {
-                        renderer.bind_pass_state(&mut r_pass, first.texture_id, first.shader_id);
+                        renderer.bind_pass_state(&mut r_pass, first.texture_id, first.shader_id, first.replace_blend);
                         let mut cur_tex = first.texture_id;
                         let mut cur_shd = first.shader_id;
+                        let mut cur_replace_blend = first.replace_blend;
                         let mut cur_cam_offset = u32::MAX;
                         let mut quad_bound = true;
                         let full_scissor = (0u32, 0u32, w.max(1), h.max(1));
@@ -1269,9 +1286,11 @@ impl AppHandler<Renderer> for App {
                                     &mut batch.geometry,
                                     batch.texture_id,
                                     batch.shader_id,
+                                    batch.replace_blend,
                                     offset,
                                     &mut cur_tex,
                                     &mut cur_shd,
+                                    &mut cur_replace_blend,
                                     &mut cur_cam_offset,
                                     &mut quad_bound,
                                     shared_buf,
@@ -1283,9 +1302,11 @@ impl AppHandler<Renderer> for App {
                                     &mut batch.geometry,
                                     batch.texture_id,
                                     batch.shader_id,
+                                    batch.replace_blend,
                                     offset,
                                     &mut cur_tex,
                                     &mut cur_shd,
+                                    &mut cur_replace_blend,
                                     &mut cur_cam_offset,
                                     &mut quad_bound,
                                 );
@@ -1294,10 +1315,14 @@ impl AppHandler<Renderer> for App {
                     }
 
                     if has_text {
+                        text_renderer.prepare(&device, &queue, w, h, None);
                         text_renderer.render(&mut r_pass);
                         frame_stats.draw_calls += 1;
                     }
                 }
+            }
+            if has_text {
+                text_renderer.finish_frame();
             }
 
             // Recycle batch GPU buffers for reuse next frame.
@@ -1305,12 +1330,24 @@ impl AppHandler<Renderer> for App {
         } // profile_scope render_pass
         self.last_frame_stats = frame_stats;
 
+        if let Some(source_rt_id) = self.screen_capture.take_composite_render_target() {
+            #[cfg(feature = "profiling")]
+            profiling::scope!("watch_composite");
+            let source_view = self.render_targets.get(source_rt_id).view();
+            self.screen_capture
+                .composite_sampled_view(&device, &mut frame.encoder, source_view, &frame.view, format);
+        }
+
         // Screen capture: blit-downsample the final frame into a small capture
         // texture and encode a copy_texture_to_buffer for async readback.
         if capture_active {
             #[cfg(feature = "profiling")]
             profiling::scope!("screen_capture");
-            if let Some(source_view) = capture_frame_view {
+            if let Some(source_rt_id) = capture_source_render_target {
+                let source_view = self.render_targets.get(source_rt_id).view();
+                self.screen_capture
+                    .capture_from_sampled_view(&device, &mut frame.encoder, source_view, format.is_srgb());
+            } else if let Some(source_view) = capture_frame_view {
                 self.screen_capture
                     .capture_from_sampled_view(&device, &mut frame.encoder, source_view, format.is_srgb());
                 self.screen_capture

@@ -130,6 +130,7 @@ pub(crate) struct CustomPipeline {
 /// - Camera bind group layout (for view/projection transforms)
 pub(crate) struct Pipelines {
     primitive: RenderPipeline,
+    primitive_replace: RenderPipeline,
     custom: Vec<CustomPipeline>,
     texture_layout: BindGroupLayout,
     pub camera_layout: BindGroupLayout,
@@ -141,10 +142,20 @@ impl Pipelines {
         let texture_layout = create_texture_bind_group_layout(device);
         let camera_layout = create_camera_bind_group_layout(device);
 
-        let primitive = create_primitive_pipeline(device, surface_format, &texture_layout, &camera_layout);
+        let primitive = create_primitive_pipeline(
+            device,
+            surface_format,
+            &texture_layout,
+            &camera_layout,
+            Some(BlendState::ALPHA_BLENDING),
+            true,
+            false,
+        );
+        let primitive_replace = create_primitive_pipeline(device, surface_format, &texture_layout, &camera_layout, None, false, true);
 
         Self {
             primitive,
+            primitive_replace,
             custom: Vec::new(),
             texture_layout,
             camera_layout,
@@ -176,7 +187,10 @@ impl Pipelines {
         self.custom.len() - 1
     }
 
-    pub fn resolve(&self, shader_id: Option<usize>) -> (&RenderPipeline, &[usize]) {
+    pub fn resolve_with_replace(&self, shader_id: Option<usize>, replace_blend: bool) -> (&RenderPipeline, &[usize]) {
+        if replace_blend && shader_id.is_none() {
+            return (&self.primitive_replace, &[]);
+        }
         if let Some(custom) = shader_id.and_then(|id| self.custom.get(id)) {
             (&custom.pipeline, &custom.uniform_ids)
         } else {
@@ -250,12 +264,16 @@ fn create_primitive_pipeline(
     surface_format: TextureFormat,
     texture_layout: &BindGroupLayout,
     camera_layout: &BindGroupLayout,
+    blend: Option<BlendState>,
+    depth_enabled: bool,
+    replace: bool,
 ) -> RenderPipeline {
     let shader = device.create_shader_module(include_wgsl!("../shader.wgsl"));
-    let fragment_entry_point = if surface_needs_srgb_encode(surface_format) {
-        "fs_main_srgb_encoded"
-    } else {
-        "fs_main"
+    let fragment_entry_point = match (replace, surface_needs_srgb_encode(surface_format)) {
+        (true, true) => "fs_replace_srgb_encoded",
+        (true, false) => "fs_replace",
+        (false, true) => "fs_main_srgb_encoded",
+        (false, false) => "fs_main",
     };
 
     let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
@@ -276,8 +294,12 @@ fn create_primitive_pipeline(
         primitive: Default::default(),
         depth_stencil: Some(DepthStencilState {
             format: crate::Renderer::DEPTH_FORMAT,
-            depth_write_enabled: Some(true),
-            depth_compare: Some(CompareFunction::LessEqual),
+            depth_write_enabled: Some(depth_enabled),
+            depth_compare: Some(if depth_enabled {
+                CompareFunction::LessEqual
+            } else {
+                CompareFunction::Always
+            }),
             stencil: StencilState::default(),
             bias: Default::default(),
         }),
@@ -287,7 +309,7 @@ fn create_primitive_pipeline(
             entry_point: Some(fragment_entry_point),
             targets: &[Some(ColorTargetState {
                 format: surface_format,
-                blend: Some(BlendState::ALPHA_BLENDING),
+                blend,
                 write_mask: ColorWrites::ALL,
             })],
             compilation_options: Default::default(),

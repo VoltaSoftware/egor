@@ -21,6 +21,7 @@ pub(crate) struct BatchEntry {
     pub scissor: Option<(u32, u32, u32, u32)>,
     pub camera_slot: u32,
     pub render_target: Option<usize>,
+    pub replace_blend: bool,
     pub geometry: GeometryBatch,
 }
 
@@ -37,6 +38,7 @@ pub struct PrimitiveBatch {
     render_target: Option<usize>,
     draw_depth: f32,
     has_rt_overrides: bool,
+    replace_blend: bool,
 }
 
 impl Default for PrimitiveBatch {
@@ -60,11 +62,21 @@ impl PrimitiveBatch {
             render_target: None,
             draw_depth: 0.0,
             has_rt_overrides: false,
+            replace_blend: false,
         }
     }
 
     fn new_entry(&mut self, texture_id: Option<usize>, shader_id: Option<usize>) -> BatchEntry {
-        if self.render_target.is_some() {
+        self.new_entry_for_target(texture_id, shader_id, self.render_target)
+    }
+
+    fn new_entry_for_target(
+        &mut self,
+        texture_id: Option<usize>,
+        shader_id: Option<usize>,
+        render_target: Option<usize>,
+    ) -> BatchEntry {
+        if render_target.is_some() {
             self.has_rt_overrides = true;
         }
         let geometry = self
@@ -76,7 +88,8 @@ impl PrimitiveBatch {
             shader_id,
             scissor: self.scissor,
             camera_slot: self.camera_slot,
-            render_target: self.render_target,
+            render_target,
+            replace_blend: self.replace_blend,
             geometry,
         }
     }
@@ -98,6 +111,7 @@ impl PrimitiveBatch {
             && last.scissor == self.scissor
             && last.camera_slot == self.camera_slot
             && last.render_target == self.render_target
+            && last.replace_blend == self.replace_blend
             && !last.geometry.would_overflow(vert_count, idx_count)
         {
             return self.batches.last_mut().unwrap().geometry.try_allocate(vert_count, idx_count);
@@ -111,18 +125,29 @@ impl PrimitiveBatch {
     /// Pushes an instance into the current batch if it matches `texture_id` + `shader_id`,
     /// otherwise starts a new batch. Preserves insertion order for correct draw ordering.
     pub(crate) fn push_instance(&mut self, instance: Instance, texture_id: Option<usize>, shader_id: Option<usize>) {
+        self.push_instance_for_target(instance, texture_id, shader_id, self.render_target);
+    }
+
+    fn push_instance_for_target(
+        &mut self,
+        instance: Instance,
+        texture_id: Option<usize>,
+        shader_id: Option<usize>,
+        render_target: Option<usize>,
+    ) {
         if let Some(last) = self.batches.last_mut()
             && last.texture_id == texture_id
             && last.shader_id == shader_id
             && last.scissor == self.scissor
             && last.camera_slot == self.camera_slot
-            && last.render_target == self.render_target
+            && last.render_target == render_target
+            && last.replace_blend == self.replace_blend
         {
             last.geometry.push_instance(instance);
             return;
         }
 
-        let mut entry = self.new_entry(texture_id, shader_id);
+        let mut entry = self.new_entry_for_target(texture_id, shader_id, render_target);
         entry.geometry.push_instance(instance);
         self.batches.push(entry);
     }
@@ -151,6 +176,7 @@ impl PrimitiveBatch {
                 && last.scissor == self.scissor
                 && last.camera_slot == self.camera_slot
                 && last.render_target == self.render_target
+                && last.replace_blend == self.replace_blend
             {
                 last.geometry.mark_instances_dirty();
                 return false;
@@ -220,10 +246,18 @@ impl PrimitiveBatch {
         self.render_target = id;
     }
 
+    pub fn render_target(&self) -> Option<usize> {
+        self.render_target
+    }
+
     /// Set the depth value for subsequent draw commands.
     /// Used for GPU depth testing (LessOrEqual).
     pub fn set_draw_depth(&mut self, depth: f32) {
         self.draw_depth = depth;
+    }
+
+    pub fn set_replace_blend(&mut self, replace_blend: bool) {
+        self.replace_blend = replace_blend;
     }
 
     /// Returns the current draw depth value.

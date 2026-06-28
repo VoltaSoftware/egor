@@ -10,6 +10,7 @@ use crate::{color::Color, math::Rect};
 struct TextEntry {
     buffer: Buffer,
     position: Vec2,
+    render_target: Option<usize>,
 }
 
 pub struct TextRenderer {
@@ -62,10 +63,12 @@ impl TextRenderer {
 
     /// Prepare the text renderer for drawing.
     /// Skipping this when `has_entries()` is false avoids glyphon overhead.
-    pub(crate) fn prepare(&mut self, device: &Device, queue: &Queue, width: u32, height: u32) {
+    pub(crate) fn prepare(&mut self, device: &Device, queue: &Queue, width: u32, height: u32, render_target: Option<usize>) {
+        self.viewport.update(queue, Resolution { width, height });
         let text_areas: Vec<TextArea> = self
             .entries
             .iter()
+            .filter(|entry| entry.render_target == render_target)
             .map(|entry| TextArea {
                 buffer: &entry.buffer,
                 left: entry.position.x,
@@ -91,7 +94,9 @@ impl TextRenderer {
                 &mut self.swash_cache,
             )
             .unwrap();
+    }
 
+    pub(crate) fn finish_frame(&mut self) {
         // Return buffers to the pool for reuse next frame
         for entry in self.entries.drain(..) {
             if self.buffer_pool.len() < MAX_POOLED_BUFFERS {
@@ -142,6 +147,7 @@ pub enum Align {
 pub struct TextBuilder<'a> {
     /// Reference to the renderer that will draw this text
     renderer: &'a mut TextRenderer,
+    render_target: Option<usize>,
     /// The string content to render
     text: String,
     /// Top-left anchor position; may be offset by alignment
@@ -163,9 +169,10 @@ impl<'a> TextBuilder<'a> {
     /// Create a new text builder that will push text to the renderer
     ///
     /// A default font family is selected automatically. Use [`Self::font`] to override it
-    pub fn new(renderer: &'a mut TextRenderer, text: String) -> Self {
+    pub fn new(renderer: &'a mut TextRenderer, text: String, render_target: Option<usize>) -> Self {
         Self {
             renderer,
+            render_target,
             text,
             position: Vec2::new(10.0, 10.0),
             rect: None,
@@ -285,6 +292,10 @@ impl Drop for TextBuilder<'_> {
             self.position
         };
 
-        self.renderer.entries.push(TextEntry { buffer, position });
+        self.renderer.entries.push(TextEntry {
+            buffer,
+            position,
+            render_target: self.render_target,
+        });
     }
 }

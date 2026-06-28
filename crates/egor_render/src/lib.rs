@@ -596,12 +596,24 @@ impl Renderer {
         depth_view: &'a TextureView,
         clear_depth: bool,
     ) -> RenderPass<'a> {
+        self.begin_render_pass_with_depth_clear_color(encoder, view, depth_view, self.clear_color, clear_depth)
+    }
+
+    /// Begins a render pass with an explicit depth view and explicit clear color.
+    pub fn begin_render_pass_with_depth_clear_color<'a>(
+        &'a self,
+        encoder: &'a mut CommandEncoder,
+        view: &'a TextureView,
+        depth_view: &'a TextureView,
+        clear_color: wgpu::Color,
+        clear_depth: bool,
+    ) -> RenderPass<'a> {
         encoder.begin_render_pass(&RenderPassDescriptor {
             color_attachments: &[Some(RenderPassColorAttachment {
                 view,
                 resolve_target: None,
                 ops: Operations {
-                    load: LoadOp::Clear(self.clear_color),
+                    load: LoadOp::Clear(clear_color),
                     store: StoreOp::Store,
                 },
                 depth_slice: None,
@@ -650,11 +662,17 @@ impl Renderer {
     /// Binds pipeline, texture, and shared quad buffers once for a render pass.
     /// Returns the previously bound (texture_id, shader_id) so the caller can
     /// track state and skip redundant calls between batches.
-    pub fn bind_pass_state(&self, r_pass: &mut RenderPass<'_>, texture_id: Option<usize>, shader_id: Option<usize>) {
+    pub fn bind_pass_state(
+        &self,
+        r_pass: &mut RenderPass<'_>,
+        texture_id: Option<usize>,
+        shader_id: Option<usize>,
+        replace_blend: bool,
+    ) {
         let texture = self.textures.get(texture_id);
         texture.bind(r_pass, 0);
 
-        let (pipeline, uniform_ids) = self.pipelines.resolve(shader_id);
+        let (pipeline, uniform_ids) = self.pipelines.resolve_with_replace(shader_id, replace_blend);
         r_pass.set_pipeline(pipeline);
 
         for (i, &uid) in uniform_ids.iter().enumerate() {
@@ -674,9 +692,11 @@ impl Renderer {
         batch: &mut GeometryBatch,
         texture_id: Option<usize>,
         shader_id: Option<usize>,
+        replace_blend: bool,
         camera_offset: u32,
         current_texture: &mut Option<usize>,
         current_shader: &mut Option<usize>,
+        current_replace_blend: &mut bool,
         current_camera_offset: &mut u32,
         quad_bound: &mut bool,
     ) -> u32 {
@@ -692,13 +712,14 @@ impl Renderer {
             *current_texture = texture_id;
         }
 
-        if *current_shader != shader_id {
-            let (pipeline, uniform_ids) = self.pipelines.resolve(shader_id);
+        if *current_shader != shader_id || *current_replace_blend != replace_blend {
+            let (pipeline, uniform_ids) = self.pipelines.resolve_with_replace(shader_id, replace_blend);
             r_pass.set_pipeline(pipeline);
             for (i, &uid) in uniform_ids.iter().enumerate() {
                 r_pass.set_bind_group((2 + i) as u32, self.uniforms.bind_group(uid), &[]);
             }
             *current_shader = shader_id;
+            *current_replace_blend = replace_blend;
         }
 
         if *current_camera_offset != camera_offset {
@@ -726,9 +747,11 @@ impl Renderer {
         batch: &mut GeometryBatch,
         texture_id: Option<usize>,
         shader_id: Option<usize>,
+        replace_blend: bool,
         camera_offset: u32,
         current_texture: &mut Option<usize>,
         current_shader: &mut Option<usize>,
+        current_replace_blend: &mut bool,
         current_camera_offset: &mut u32,
         quad_bound: &mut bool,
         shared_buf: &'a Buffer,
@@ -746,13 +769,14 @@ impl Renderer {
             *current_texture = texture_id;
         }
 
-        if *current_shader != shader_id {
-            let (pipeline, uniform_ids) = self.pipelines.resolve(shader_id);
+        if *current_shader != shader_id || *current_replace_blend != replace_blend {
+            let (pipeline, uniform_ids) = self.pipelines.resolve_with_replace(shader_id, replace_blend);
             r_pass.set_pipeline(pipeline);
             for (i, &uid) in uniform_ids.iter().enumerate() {
                 r_pass.set_bind_group((2 + i) as u32, self.uniforms.bind_group(uid), &[]);
             }
             *current_shader = shader_id;
+            *current_replace_blend = replace_blend;
         }
 
         if *current_camera_offset != camera_offset {
@@ -869,7 +893,7 @@ impl Renderer {
 
     /// Adds a texture from raw RGBA bytes & returns its id
     pub fn add_texture_raw(&mut self, w: u32, h: u32, data: &[u8]) -> usize {
-        self.textures.insert_raw(&self.gpu.device, &self.gpu.queue, w, h, data)
+        self.textures.insert_raw_nearest(&self.gpu.device, &self.gpu.queue, w, h, data)
     }
 
     /// Replaces an existing texture with new image data
