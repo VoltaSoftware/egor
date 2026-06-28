@@ -6,6 +6,7 @@ use egor_render::{
 use glam::Vec2;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use web_time::Instant;
 
 use crate::primitives::PathBuilder;
 use crate::{
@@ -131,6 +132,35 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Grayscale+alpha capture variant. Writes luminance to R and alpha to G in
+/// an Rg8Unorm target so CPU readback is 2 B/px instead of RGBA8 4 B/px.
+const BLIT_GRAY_ALPHA_SHADER_WGSL: &str = r#"
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
+    let uv = vec2<f32>(f32((idx << 1u) & 2u), f32(idx & 2u));
+    var out: VertexOutput;
+    out.position = vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
+    out.uv = vec2<f32>(uv.x, 1.0 - uv.y);
+    return out;
+}
+
+@group(0) @binding(0) var t_src: texture_2d<f32>;
+@group(0) @binding(1) var s_src: sampler;
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let c = textureSample(t_src, s_src, in.uv);
+    let lum = dot(c.rgb, vec3<f32>(0.299, 0.587, 0.114));
+    let gray = select(0.0, lum, c.a > 0.0);
+    return vec4<f32>(gray, c.a, 0.0, 1.0);
+}
+"#;
+
 /// Capture shader for sources sampled as linear color where the displayed
 /// backbuffer uses sRGB encoding. It writes display-encoded RGB into a
 /// non-sRGB readback target so CPU-side packing sees the same byte domain as
@@ -198,6 +228,42 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let c = linear_to_srgb(textureSample(t_src, s_src, in.uv).rgb);
     let lum = dot(c, vec3<f32>(0.299, 0.587, 0.114));
     return vec4<f32>(lum, 0.0, 0.0, 1.0);
+}
+"#;
+
+/// Grayscale+alpha capture variant for linear sources shown through an sRGB target.
+const BLIT_GRAY_ALPHA_ENCODE_SHADER_WGSL: &str = r#"
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
+    let uv = vec2<f32>(f32((idx << 1u) & 2u), f32(idx & 2u));
+    var out: VertexOutput;
+    out.position = vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
+    out.uv = vec2<f32>(uv.x, 1.0 - uv.y);
+    return out;
+}
+
+@group(0) @binding(0) var t_src: texture_2d<f32>;
+@group(0) @binding(1) var s_src: sampler;
+
+fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
+    let x = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+    let lo = x * 12.92;
+    let hi = 1.055 * pow(x, vec3<f32>(1.0 / 2.4)) - 0.055;
+    return select(hi, lo, x <= vec3<f32>(0.0031308));
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let sampled = textureSample(t_src, s_src, in.uv);
+    let c = linear_to_srgb(sampled.rgb);
+    let lum = dot(c, vec3<f32>(0.299, 0.587, 0.114));
+    let gray = select(0.0, lum, sampled.a > 0.0);
+    return vec4<f32>(gray, sampled.a, 0.0, 1.0);
 }
 "#;
 
@@ -290,8 +356,10 @@ pub struct ScreenCaptureState {
     // -- GPU blit resources (lazily initialised) --
     blit_pipeline: Option<egor_render::wgpu::RenderPipeline>,
     blit_gray_pipeline: Option<egor_render::wgpu::RenderPipeline>,
+    blit_gray_alpha_pipeline: Option<egor_render::wgpu::RenderPipeline>,
     blit_encode_pipeline: Option<egor_render::wgpu::RenderPipeline>,
     blit_gray_encode_pipeline: Option<egor_render::wgpu::RenderPipeline>,
+    blit_gray_alpha_encode_pipeline: Option<egor_render::wgpu::RenderPipeline>,
     blit_sampler: Option<egor_render::wgpu::Sampler>,
     blit_bind_group_layout: Option<egor_render::wgpu::BindGroupLayout>,
     present_pipeline: Option<egor_render::wgpu::RenderPipeline>,
@@ -340,8 +408,10 @@ impl ScreenCaptureState {
         Self {
             blit_pipeline: None,
             blit_gray_pipeline: None,
+            blit_gray_alpha_pipeline: None,
             blit_encode_pipeline: None,
             blit_gray_encode_pipeline: None,
+            blit_gray_alpha_encode_pipeline: None,
             blit_sampler: None,
             blit_bind_group_layout: None,
             present_pipeline: None,
@@ -486,6 +556,11 @@ impl ScreenCaptureState {
             source: egor_render::wgpu::ShaderSource::Wgsl(BLIT_GRAY_SHADER_WGSL.into()),
         });
 
+        let gray_alpha_shader = device.create_shader_module(egor_render::wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: egor_render::wgpu::ShaderSource::Wgsl(BLIT_GRAY_ALPHA_SHADER_WGSL.into()),
+        });
+
         let encode_shader = device.create_shader_module(egor_render::wgpu::ShaderModuleDescriptor {
             label: None,
             source: egor_render::wgpu::ShaderSource::Wgsl(BLIT_ENCODE_SHADER_WGSL.into()),
@@ -494,6 +569,11 @@ impl ScreenCaptureState {
         let gray_encode_shader = device.create_shader_module(egor_render::wgpu::ShaderModuleDescriptor {
             label: None,
             source: egor_render::wgpu::ShaderSource::Wgsl(BLIT_GRAY_ENCODE_SHADER_WGSL.into()),
+        });
+
+        let gray_alpha_encode_shader = device.create_shader_module(egor_render::wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: egor_render::wgpu::ShaderSource::Wgsl(BLIT_GRAY_ALPHA_ENCODE_SHADER_WGSL.into()),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&egor_render::wgpu::BindGroupLayoutDescriptor {
@@ -557,8 +637,10 @@ impl ScreenCaptureState {
 
         let pipeline = make_pipeline(None, &shader, TextureFormat::Rgba8Unorm);
         let gray_pipeline = make_pipeline(None, &gray_shader, TextureFormat::R8Unorm);
+        let gray_alpha_pipeline = make_pipeline(None, &gray_alpha_shader, TextureFormat::Rg8Unorm);
         let encode_pipeline = make_pipeline(None, &encode_shader, TextureFormat::Rgba8Unorm);
         let gray_encode_pipeline = make_pipeline(None, &gray_encode_shader, TextureFormat::R8Unorm);
+        let gray_alpha_encode_pipeline = make_pipeline(None, &gray_alpha_encode_shader, TextureFormat::Rg8Unorm);
 
         let sampler = device.create_sampler(&egor_render::wgpu::SamplerDescriptor {
             label: None,
@@ -571,8 +653,10 @@ impl ScreenCaptureState {
 
         self.blit_pipeline = Some(pipeline);
         self.blit_gray_pipeline = Some(gray_pipeline);
+        self.blit_gray_alpha_pipeline = Some(gray_alpha_pipeline);
         self.blit_encode_pipeline = Some(encode_pipeline);
         self.blit_gray_encode_pipeline = Some(gray_encode_pipeline);
+        self.blit_gray_alpha_encode_pipeline = Some(gray_alpha_encode_pipeline);
         self.blit_sampler = Some(sampler);
         self.blit_bind_group_layout = Some(bind_group_layout);
     }
@@ -587,10 +671,10 @@ impl ScreenCaptureState {
             return;
         }
 
-        let format = if grayscale && !alpha_mask {
-            TextureFormat::R8Unorm
-        } else {
-            TextureFormat::Rgba8Unorm
+        let format = match (grayscale, alpha_mask) {
+            (true, false) => TextureFormat::R8Unorm,
+            (true, true) => TextureFormat::Rg8Unorm,
+            (false, _) => TextureFormat::Rgba8Unorm,
         };
 
         let texture = device.create_texture(&egor_render::wgpu::TextureDescriptor {
@@ -707,11 +791,13 @@ impl ScreenCaptureState {
         self.ensure_pipeline(device);
         self.ensure_capture_texture(device, cap_w, cap_h, grayscale, alpha_mask);
 
-        let pipeline = match (grayscale && !alpha_mask, encode_srgb) {
-            (false, false) => self.blit_pipeline.as_ref().expect("pipeline init"),
-            (true, false) => self.blit_gray_pipeline.as_ref().expect("pipeline init"),
-            (false, true) => self.blit_encode_pipeline.as_ref().expect("pipeline init"),
-            (true, true) => self.blit_gray_encode_pipeline.as_ref().expect("pipeline init"),
+        let pipeline = match (grayscale, alpha_mask, encode_srgb) {
+            (true, false, false) => self.blit_gray_pipeline.as_ref().expect("pipeline init"),
+            (true, false, true) => self.blit_gray_encode_pipeline.as_ref().expect("pipeline init"),
+            (true, true, false) => self.blit_gray_alpha_pipeline.as_ref().expect("pipeline init"),
+            (true, true, true) => self.blit_gray_alpha_encode_pipeline.as_ref().expect("pipeline init"),
+            (false, _, false) => self.blit_pipeline.as_ref().expect("pipeline init"),
+            (false, _, true) => self.blit_encode_pipeline.as_ref().expect("pipeline init"),
         };
         let capture_view = self.capture_view.as_ref().expect("capture texture init");
 
@@ -741,7 +827,11 @@ impl ScreenCaptureState {
 
         // Copy capture texture → staging buffer for CPU readback
         let slot = &mut self.slots[idx];
-        let bytes_per_pixel: u32 = if grayscale && !alpha_mask { 1 } else { 4 };
+        let bytes_per_pixel: u32 = match (grayscale, alpha_mask) {
+            (true, false) => 1,
+            (true, true) => 2,
+            (false, _) => 4,
+        };
         let unpadded_row = cap_w * bytes_per_pixel;
         let align = egor_render::wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let padded_row = (unpadded_row + align - 1) / align * align;
@@ -1090,6 +1180,7 @@ impl ScreenCaptureState {
     /// staging buffer already holds R8 data from the GPU — just strip row
     /// padding. For RGB565, convert BGRA→RGB565 with unsafe pointer math.
     fn complete_slot(&mut self, idx: usize) {
+        let complete_start = Instant::now();
         let cap_w = self.slots[idx].cap_w;
         let cap_h = self.slots[idx].cap_h;
         let row_pitch = self.slots[idx].row_pitch as usize;
@@ -1115,19 +1206,17 @@ impl ScreenCaptureState {
                 let out_len = pixel_count * 2;
                 self.rgb_buf.reserve(out_len.saturating_sub(self.rgb_buf.len()));
                 unsafe { self.rgb_buf.set_len(out_len) };
-                let (gray_out, alpha_out) = self.rgb_buf.split_at_mut(pixel_count);
-                for y in 0..h {
-                    let row = unsafe { src.add(y * row_pitch) };
-                    for x in 0..w {
-                        let s = unsafe { row.add(x * 4) };
-                        let r = unsafe { *s };
-                        let g = unsafe { *s.add(1) };
-                        let b = unsafe { *s.add(2) };
-                        let a = unsafe { *s.add(3) };
-                        let lum = ((r as u32 * 77 + g as u32 * 150 + b as u32 * 29) >> 8) as u8;
-                        let idx = y * w + x;
-                        gray_out[idx] = if a == 0 { 0 } else { lum };
-                        alpha_out[idx] = a;
+                let unpadded_row = w * 2;
+                if row_pitch == unpadded_row {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(src, self.rgb_buf.as_mut_ptr(), out_len);
+                    }
+                } else {
+                    let dst = self.rgb_buf.as_mut_ptr();
+                    for y in 0..h {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(src.add(y * row_pitch), dst.add(y * unpadded_row), unpadded_row);
+                        }
                     }
                 }
             } else {
@@ -1192,6 +1281,18 @@ impl ScreenCaptureState {
         self.result_w = cap_w as u16;
         self.result_h = cap_h as u16;
         self.result_metadata = self.slots[idx].metadata.take();
+        log::info!(
+            target: "watchperf",
+            "[watchperf] egor_complete slot={} size={}x{} grayscale={} alpha={} row_pitch={} output_bytes={} complete_us={}",
+            idx,
+            cap_w,
+            cap_h,
+            grayscale,
+            alpha_mask,
+            row_pitch,
+            self.rgb_buf.len(),
+            complete_start.elapsed().as_micros(),
+        );
     }
 
     /// Poll for a completed readback. Returns `Some((width, height))` when
