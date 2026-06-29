@@ -240,7 +240,7 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
-        self.input.clear_all_input_state();
+        self.input.force_release_all_input_state();
         if let Some(handler) = self.handler.as_mut() {
             handler.suspended();
         }
@@ -296,7 +296,7 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
                     handler.resize(size.width, size.height, resource);
                 }
             }
-            WindowEvent::Focused(false) => self.input.clear_all_input_state(),
+            WindowEvent::Focused(false) => self.input.force_release_all_input_state(),
             WindowEvent::KeyboardInput { event, .. } => self.input.update_key(event),
             WindowEvent::MouseInput { button, state, .. } => {
                 self.input.update_mouse_button(button, state);

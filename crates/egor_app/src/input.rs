@@ -283,6 +283,40 @@ impl Input {
         self.primary_touch_id = None;
     }
 
+    /// Force all currently held input to release for the current frame.
+    ///
+    /// This is useful when the platform interrupts input delivery (for example
+    /// browser context menus or window focus loss) and normal release events may
+    /// never arrive.
+    pub fn force_release_all_input_state(&mut self) {
+        for (curr, prev) in self.keyboard.values_mut() {
+            if *curr == ElementState::Pressed {
+                *curr = ElementState::Released;
+                *prev = ElementState::Pressed;
+            }
+        }
+
+        for (curr, prev) in self.mouse_buttons.values_mut() {
+            if *curr == ElementState::Pressed {
+                *curr = ElementState::Released;
+                *prev = ElementState::Pressed;
+            }
+        }
+
+        for touch in &mut self.touches {
+            touch.phase = TouchPhase::Ended;
+        }
+
+        if self.simulate_mouse_with_touch && self.primary_touch_id.is_some() {
+            self.update_mouse_button(MouseButton::Left, ElementState::Released);
+        }
+
+        self.mouse_delta = (0.0, 0.0);
+        self.mouse_wheel_delta = 0.0;
+        self.text_events.clear();
+        self.primary_touch_id = None;
+    }
+
     /// True if the key went from not pressed last frame to pressed this frame
     pub fn key_pressed(&self, key: KeyCode) -> bool {
         self.keyboard
@@ -461,6 +495,34 @@ mod tests {
 
         input.end_frame(); // delta should reset
         assert_eq!(input.mouse_delta(), (0.0, 0.0));
+    }
+
+    #[test]
+    fn force_release_all_input_state_releases_held_inputs() {
+        let mut input = Input::default();
+        input.inject_key(KeyCode::KeyA, Pressed);
+        input.inject_mouse_button(MouseButton::Left, Pressed);
+        input.touches.push(Touch {
+            device_id: DeviceId::dummy(),
+            id: 11,
+            phase: TouchPhase::Started,
+            location: PhysicalPosition::new(10.0, 20.0),
+            force: None,
+        });
+
+        input.force_release_all_input_state();
+
+        assert!(!input.key_held(KeyCode::KeyA));
+        assert!(input.key_released(KeyCode::KeyA));
+        assert!(!input.mouse_held(MouseButton::Left));
+        assert!(input.mouse_released(MouseButton::Left));
+        assert_eq!(input.touches()[0].phase, TouchPhase::Ended);
+
+        input.end_frame();
+
+        assert!(!input.key_released(KeyCode::KeyA));
+        assert!(!input.mouse_released(MouseButton::Left));
+        assert!(input.touches().is_empty());
     }
 
     #[test]
