@@ -311,6 +311,7 @@ pub struct App {
     window_focused: bool,
     surface_occluded: bool,
     app_suspended: bool,
+    frame_timer_reset_requested: bool,
     renderer_recreate_requested: bool,
     renderer_recreate_in_progress: bool,
     gpu_device_recreated_pending_frame: bool,
@@ -354,6 +355,7 @@ impl App {
             window_focused: true,
             surface_occluded: false,
             app_suspended: false,
+            frame_timer_reset_requested: true,
             renderer_recreate_requested: false,
             renderer_recreate_in_progress: false,
             gpu_device_recreated_pending_frame: false,
@@ -703,6 +705,10 @@ impl AppHandler<Renderer> for App {
         self.renderer_recreate_requested
     }
 
+    fn frame_timer_reset_requested(&self) -> bool {
+        self.frame_timer_reset_requested
+    }
+
     fn before_resource_recreate(&mut self) {
         self.renderer_recreate_requested = false;
         self.renderer_recreate_in_progress = true;
@@ -795,22 +801,27 @@ impl AppHandler<Renderer> for App {
         #[cfg(feature = "profiling")]
         profiling::scope!("frame");
 
+        self.frame_timer_reset_requested = false;
+
         if self.update.is_none() {
             return;
         }
 
         if self.app_suspended {
+            self.frame_timer_reset_requested = true;
             self.backbuffer = None;
             self.surface_acquire_retry_interval = None;
             return;
         }
 
         if self.surface_occluded {
+            self.frame_timer_reset_requested = true;
             self.surface_acquire_retry_interval = Some(surface_wait_retry_interval());
             return;
         }
 
         if should_wait_for_surface_restore(_window.is_minimized().unwrap_or(false), window_surface_size(_window)) {
+            self.frame_timer_reset_requested = true;
             self.backbuffer = None;
             self.surface_recovery.record_surface_failure(SurfaceFailure::ZeroSizedSurface);
             self.surface_acquire_retry_interval = Some(surface_wait_retry_interval());
@@ -824,11 +835,13 @@ impl AppHandler<Renderer> for App {
             }
             match action {
                 DeviceLossAction::PauseRendering => {
+                    self.frame_timer_reset_requested = true;
                     self.backbuffer = None;
                     self.surface_acquire_retry_interval = Some(Duration::from_millis(1000));
                     return;
                 }
                 DeviceLossAction::RecreateRenderer => {
+                    self.frame_timer_reset_requested = true;
                     self.request_renderer_recreation("wgpu device lost");
                     return;
                 }
@@ -844,17 +857,20 @@ impl AppHandler<Renderer> for App {
         }
 
         if self.backbuffer.is_none() && should_wait_for_surface_restore(false, window_surface_size(_window)) {
+            self.frame_timer_reset_requested = true;
             self.surface_recovery.record_surface_failure(SurfaceFailure::ZeroSizedSurface);
             self.surface_acquire_retry_interval = Some(surface_wait_retry_interval());
             return;
         }
 
         if self.backbuffer.is_none() && self.waiting_for_surface_change {
+            self.frame_timer_reset_requested = true;
             self.surface_acquire_retry_interval = Some(surface_wait_retry_interval());
             return;
         }
 
         if self.backbuffer.is_none() && !self.recreate_backbuffer(renderer) {
+            self.frame_timer_reset_requested = true;
             let action = self.surface_recovery.record_surface_failure(SurfaceFailure::BackbufferCreateFailed);
             match action {
                 SurfaceRecoveryAction::WaitForResize => {
@@ -880,6 +896,7 @@ impl AppHandler<Renderer> for App {
         }
 
         let Some(backbuffer) = &mut self.backbuffer else {
+            self.frame_timer_reset_requested = true;
             return;
         };
 
@@ -1438,6 +1455,7 @@ impl AppHandler<Renderer> for App {
     fn suspended(&mut self) {
         log::info!("[egor] app suspended: dropping backbuffer");
         self.app_suspended = true;
+        self.frame_timer_reset_requested = true;
         self.surface_acquire_retry_interval = None;
         self.waiting_for_surface_change = false;
         self.backbuffer = None;
@@ -1450,6 +1468,7 @@ impl AppHandler<Renderer> for App {
         let size = window_surface_size(&window);
         self.window = Some(window.clone());
         self.app_suspended = false;
+        self.frame_timer_reset_requested = true;
         self.surface_acquire_retry_interval = None;
         self.waiting_for_surface_change = false;
         self.surface_occluded = false;

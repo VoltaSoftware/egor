@@ -128,6 +128,12 @@ pub trait AppHandler<R> {
     fn resource_recreate_requested(&self) -> bool {
         false
     }
+    /// Return true when the next rendered frame should discard elapsed
+    /// wall-clock time, usually because the current frame did not run visual
+    /// simulation due to lifecycle or surface state.
+    fn frame_timer_reset_requested(&self) -> bool {
+        false
+    }
     /// Called immediately before the current resource is dropped for recreation.
     fn before_resource_recreate(&mut self) {}
     /// Called on window resize
@@ -172,6 +178,8 @@ pub struct AppRunner<R: 'static, H: AppHandler<R> + 'static> {
 #[doc(hidden)]
 impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, H> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        self.timer.reset_next_update();
+
         if let (Some(window), Some(resource), Some(handler)) = (self.window.clone(), self.resource.as_mut(), self.handler.as_mut()) {
             handler.resumed(window, resource);
         }
@@ -240,6 +248,7 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        self.timer.reset_next_update();
         self.input.force_release_all_input_state();
         if let Some(handler) = self.handler.as_mut() {
             handler.suspended();
@@ -277,7 +286,12 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
                 self.timer.update();
                 handler.frame(window, resource, &mut self.input, &self.timer);
                 let recreate_resource = handler.resource_recreate_requested();
+                let reset_frame_timer = handler.frame_timer_reset_requested();
                 self.input.end_frame();
+
+                if reset_frame_timer {
+                    self.timer.reset_next_update();
+                }
 
                 if recreate_resource {
                     self.recreate_resource();
@@ -296,7 +310,15 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
                     handler.resize(size.width, size.height, resource);
                 }
             }
-            WindowEvent::Focused(false) => self.input.force_release_all_input_state(),
+            WindowEvent::Focused(focused) => {
+                self.timer.reset_next_update();
+                if !focused {
+                    self.input.force_release_all_input_state();
+                }
+            }
+            WindowEvent::Occluded(_) => {
+                self.timer.reset_next_update();
+            }
             WindowEvent::KeyboardInput { event, .. } => self.input.update_key(event),
             WindowEvent::MouseInput { button, state, .. } => {
                 self.input.update_mouse_button(button, state);
@@ -330,6 +352,7 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
         let Some(window) = &self.window else { return };
 
         handler.on_ready(window, &mut resource);
+        self.timer.reset_next_update();
         let frame_started_at = Instant::now();
         #[cfg(not(target_os = "android"))]
         handler.frame(window, &mut resource, &mut self.input, &self.timer);
@@ -421,6 +444,7 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
 
     #[cfg(target_os = "android")]
     fn android_lifecycle(&mut self, _event_loop: &ActiveEventLoop, lifecycle: AndroidLifecycle) {
+        self.timer.reset_next_update();
         if let Some(handler) = self.handler.as_mut() {
             handler.android_lifecycle(lifecycle);
         }
