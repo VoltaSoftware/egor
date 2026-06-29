@@ -61,7 +61,7 @@ fn fs_main_linear(input: VertexOutput) -> vec4<f32> {
         let glyph_min = input.uv_rect.xy + texel;
         let glyph_max = input.uv_rect.zw - texel;
         let uv = input.tex_coords;
-        let center = textureSample(texture_binding, texture_sampler, uv);
+        let center = textureSampleLevel(texture_binding, texture_sampler, uv, 0.0);
         let c_in = inside(uv, glyph_min, glyph_max);
         if c_in > 0.5 && center.a > 0.004 {
             return center * input.color;
@@ -93,7 +93,7 @@ fn fs_main_linear(input: VertexOutput) -> vec4<f32> {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
 
-    let color = textureSample(texture_binding, texture_sampler, input.tex_coords) * input.color;
+    let color = textureSampleLevel(texture_binding, texture_sampler, input.tex_coords, 0.0) * input.color;
     if color.a < 0.004 {
         discard;
     }
