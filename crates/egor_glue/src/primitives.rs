@@ -37,6 +37,7 @@ pub struct PrimitiveBatch {
     camera_count: usize,
     render_target: Option<usize>,
     draw_depth: f32,
+    watch_overlay: f32,
     has_rt_overrides: bool,
     replace_blend: bool,
 }
@@ -61,6 +62,7 @@ impl PrimitiveBatch {
             camera_count: 0,
             render_target: None,
             draw_depth: 0.0,
+            watch_overlay: 1.0,
             has_rt_overrides: false,
             replace_blend: false,
         }
@@ -70,12 +72,7 @@ impl PrimitiveBatch {
         self.new_entry_for_target(texture_id, shader_id, self.render_target)
     }
 
-    fn new_entry_for_target(
-        &mut self,
-        texture_id: Option<usize>,
-        shader_id: Option<usize>,
-        render_target: Option<usize>,
-    ) -> BatchEntry {
+    fn new_entry_for_target(&mut self, texture_id: Option<usize>, shader_id: Option<usize>, render_target: Option<usize>) -> BatchEntry {
         if render_target.is_some() {
             self.has_rt_overrides = true;
         }
@@ -256,6 +253,10 @@ impl PrimitiveBatch {
         self.draw_depth = depth;
     }
 
+    pub fn set_watch_overlay(&mut self, watch_overlay: f32) {
+        self.watch_overlay = watch_overlay.clamp(0.0, 1.0);
+    }
+
     pub fn set_replace_blend(&mut self, replace_blend: bool) {
         self.replace_blend = replace_blend;
     }
@@ -263,6 +264,10 @@ impl PrimitiveBatch {
     /// Returns the current draw depth value.
     pub fn draw_depth(&self) -> f32 {
         self.draw_depth
+    }
+
+    pub fn watch_overlay(&self) -> f32 {
+        self.watch_overlay
     }
 
     /// Returns whether any batch targets an offscreen render target.
@@ -304,6 +309,7 @@ impl PrimitiveBatch {
         self.camera_count = 0;
         self.render_target = None;
         self.draw_depth = 0.0;
+        self.watch_overlay = 1.0;
         self.has_rt_overrides = false;
     }
 
@@ -322,6 +328,7 @@ impl PrimitiveBatch {
         self.camera_count = 0;
         self.render_target = None;
         self.draw_depth = 0.0;
+        self.watch_overlay = 1.0;
         self.has_rt_overrides = false;
     }
 }
@@ -342,12 +349,7 @@ mod tests {
         batch.set_scissor(Some((1, 2, 3, 4)));
         batch.set_draw_depth(0.75);
         batch.ensure_batch(Some(7), Some(3));
-        batch.push_instance_unchecked(Instance::new(
-            [1.0, 0.0, 0.0, 1.0],
-            [0.0, 0.0, 0.0],
-            [1.0; 4],
-            [0.0, 0.0, 1.0, 1.0],
-        ));
+        batch.push_instance_unchecked(Instance::new([1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0], [1.0; 4], [0.0, 0.0, 1.0, 1.0]));
 
         let drained = batch.drain_all();
         assert_eq!(drained.len(), 1);
@@ -462,7 +464,7 @@ impl Drop for RectangleBuilder<'_> {
         let color = self.color.components();
 
         self.batch.push_instance(
-            Instance::new(affine, [center.x, center.y, self.depth], color, self.uvs),
+            Instance::new(affine, [center.x, center.y, self.depth], color, self.uvs).with_watch_overlay(self.batch.watch_overlay()),
             self.tex_id,
             self.shader_id,
         );

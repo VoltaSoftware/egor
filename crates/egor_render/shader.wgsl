@@ -21,6 +21,7 @@ struct InstanceInput {
     @location(5) color: vec4<f32>,
     @location(6) uv: vec4<f32>,
     @location(7) outline_color: vec4<f32>,
+    @location(8) watch_overlay: f32,
 };
 
 struct VertexOutput {
@@ -29,6 +30,12 @@ struct VertexOutput {
     @location(1) tex_coords: vec2<f32>,
     @location(2) @interpolate(flat) uv_rect: vec4<f32>,
     @location(3) @interpolate(flat) outline_color: vec4<f32>,
+    @location(4) @interpolate(flat) watch_overlay: f32,
+};
+
+struct WatchFragmentOutput {
+    @location(0) color: vec4<f32>,
+    @location(1) overlay: vec4<f32>,
 };
 
 @vertex
@@ -46,6 +53,7 @@ fn vs_main(vert: VertexInput, inst: InstanceInput) -> VertexOutput {
     out.tex_coords = uv;
     out.uv_rect = inst.uv;
     out.outline_color = inst.outline_color;
+    out.watch_overlay = inst.watch_overlay;
     return out;
 }
 
@@ -135,4 +143,42 @@ fn fs_replace(input: VertexOutput) -> @location(0) vec4<f32> {
 @fragment
 fn fs_replace_srgb_encoded(input: VertexOutput) -> @location(0) vec4<f32> {
     return linear_to_srgb(input.color);
+}
+
+@fragment
+fn fs_main_watch(input: VertexOutput) -> WatchFragmentOutput {
+    let color = fs_main_linear(input);
+    var out: WatchFragmentOutput;
+    out.color = color;
+    out.overlay = vec4<f32>(color.rgb, color.a * input.watch_overlay);
+    return out;
+}
+
+@fragment
+fn fs_main_srgb_encoded_watch(input: VertexOutput) -> WatchFragmentOutput {
+    let color = fs_main_linear(input);
+    let encoded = linear_to_srgb(color);
+    var out: WatchFragmentOutput;
+    out.color = encoded;
+    out.overlay = vec4<f32>(encoded.rgb, color.a * input.watch_overlay);
+    return out;
+}
+
+@fragment
+fn fs_replace_watch(input: VertexOutput) -> WatchFragmentOutput {
+    let alpha = input.color.a * input.watch_overlay;
+    var out: WatchFragmentOutput;
+    out.color = input.color;
+    out.overlay = vec4<f32>(input.color.rgb * alpha, alpha);
+    return out;
+}
+
+@fragment
+fn fs_replace_srgb_encoded_watch(input: VertexOutput) -> WatchFragmentOutput {
+    let encoded = linear_to_srgb(input.color);
+    let alpha = input.color.a * input.watch_overlay;
+    var out: WatchFragmentOutput;
+    out.color = encoded;
+    out.overlay = vec4<f32>(encoded.rgb * alpha, alpha);
+    return out;
 }

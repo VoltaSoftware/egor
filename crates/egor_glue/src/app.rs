@@ -185,6 +185,95 @@ impl CaptureFrameTarget {
     }
 }
 
+struct WatchFrameTarget {
+    _color_texture: egor_render::Texture,
+    color_view: egor_render::wgpu::TextureView,
+    _overlay_texture: egor_render::Texture,
+    overlay_view: egor_render::wgpu::TextureView,
+    _depth_texture: egor_render::Texture,
+    depth_view: egor_render::wgpu::TextureView,
+    width: u32,
+    height: u32,
+    format: TextureFormat,
+}
+
+impl WatchFrameTarget {
+    fn new(device: &egor_render::Device, width: u32, height: u32, format: TextureFormat) -> Self {
+        let width = width.max(1);
+        let height = height.max(1);
+        let color_texture = device.create_texture(&egor_render::wgpu::TextureDescriptor {
+            label: Some("Watch Frame Color Target"),
+            size: egor_render::wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: egor_render::wgpu::TextureDimension::D2,
+            format,
+            usage: egor_render::wgpu::TextureUsages::RENDER_ATTACHMENT | egor_render::wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let color_view = color_texture.create_view(&Default::default());
+
+        let overlay_texture = device.create_texture(&egor_render::wgpu::TextureDescriptor {
+            label: Some("Watch Frame Dynamic Overlay Target"),
+            size: egor_render::wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: egor_render::wgpu::TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: egor_render::wgpu::TextureUsages::RENDER_ATTACHMENT | egor_render::wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let overlay_view = overlay_texture.create_view(&Default::default());
+
+        let depth_texture = device.create_texture(&egor_render::wgpu::TextureDescriptor {
+            label: Some("Watch Frame Depth Target"),
+            size: egor_render::wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: egor_render::wgpu::TextureDimension::D2,
+            format: egor_render::Renderer::DEPTH_FORMAT,
+            usage: egor_render::wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let depth_view = depth_texture.create_view(&Default::default());
+
+        Self {
+            _color_texture: color_texture,
+            color_view,
+            _overlay_texture: overlay_texture,
+            overlay_view,
+            _depth_texture: depth_texture,
+            depth_view,
+            width,
+            height,
+            format,
+        }
+    }
+
+    fn ensure(slot: &mut Option<Self>, device: &egor_render::Device, width: u32, height: u32, format: TextureFormat) {
+        let width = width.max(1);
+        let height = height.max(1);
+        let needs_new = slot
+            .as_ref()
+            .is_none_or(|target| target.width != width || target.height != height || target.format != format);
+        if needs_new {
+            *slot = Some(Self::new(device, width, height, format));
+        }
+    }
+}
+
 pub struct AppControl<'a> {
     window: &'a Window,
     requested_size: Option<(u32, u32)>,
@@ -303,6 +392,8 @@ pub struct App {
     fps_limit: Option<u16>,
     native_refresh_rate_fps: Option<u16>,
     capture_frame_target: Option<CaptureFrameTarget>,
+    watch_frame_target: Option<WatchFrameTarget>,
+    watch_overlay_capture_unsupported_logged: bool,
     offscreen_batches: Vec<PrimitiveBatch>,
     instance_byte_offsets: Vec<u64>,
     surface_acquire_retry_interval: Option<Duration>,
@@ -347,6 +438,8 @@ impl App {
             fps_limit: None,
             native_refresh_rate_fps: None,
             capture_frame_target: None,
+            watch_frame_target: None,
+            watch_overlay_capture_unsupported_logged: false,
             offscreen_batches: Vec::new(),
             instance_byte_offsets: Vec::new(),
             surface_acquire_retry_interval: None,
@@ -624,6 +717,8 @@ impl App {
         self.render_targets = RenderTargetStore::new();
         self.screen_capture = ScreenCaptureState::new();
         self.capture_frame_target = None;
+        self.watch_frame_target = None;
+        self.watch_overlay_capture_unsupported_logged = false;
         self.primitive_batch.drop_gpu_resources();
         self.offscreen_batches.clear();
         self.instance_byte_offsets.clear();
@@ -1057,9 +1152,38 @@ impl AppHandler<Renderer> for App {
             }
         } // profile_scope batch_upload
 
-        let capture_active = self.screen_capture.is_requested();
-        let capture_source_render_target = self.screen_capture.requested_source_render_target();
-        let use_capture_frame_target = capture_active && capture_source_render_target.is_none() && !backbuffer.supports_copy_src();
+        let mut capture_active = self.screen_capture.is_requested();
+        let mut capture_source_render_target = self.screen_capture.requested_source_render_target();
+        let mut use_watch_frame_target = self.screen_capture.is_watch_overlay_capture_requested();
+        if use_watch_frame_target {
+            let unsupported_capture = !renderer.supports_watch_overlay_capture();
+            let unsupported_shader = batches
+                .iter()
+                .filter(|batch| batch.render_target.is_none())
+                .find_map(|batch| (!renderer.supports_watch_overlay_pipeline(batch.shader_id)).then_some(batch.shader_id));
+            if unsupported_capture || has_text || unsupported_shader.is_some() {
+                if unsupported_capture {
+                    if !self.watch_overlay_capture_unsupported_logged {
+                        log::warn!("[egor] watch overlay capture skipped: backend does not support the dynamic overlay MRT path");
+                        self.watch_overlay_capture_unsupported_logged = true;
+                    }
+                } else {
+                    log::warn!(
+                        "[egor] watch overlay capture skipped: unsupported main-pass source (has_text={}, shader={:?})",
+                        has_text,
+                        unsupported_shader.flatten()
+                    );
+                }
+                self.screen_capture.cancel_request();
+                capture_active = false;
+                capture_source_render_target = None;
+                use_watch_frame_target = false;
+            } else {
+                WatchFrameTarget::ensure(&mut self.watch_frame_target, &device, w, h, format);
+            }
+        }
+        let use_capture_frame_target =
+            capture_active && !use_watch_frame_target && capture_source_render_target.is_none() && !backbuffer.supports_copy_src();
         if use_capture_frame_target {
             CaptureFrameTarget::ensure(&mut self.capture_frame_target, &device, w, h, format);
         }
@@ -1114,7 +1238,17 @@ impl AppHandler<Renderer> for App {
         self.waiting_for_surface_change = false;
         self.surface_acquire_retry_interval = None;
 
-        let main_view = capture_frame_view.unwrap_or(&frame.view);
+        let watch_frame_target = if use_watch_frame_target {
+            self.watch_frame_target.as_ref()
+        } else {
+            None
+        };
+        let main_view = watch_frame_target
+            .map(|target| &target.color_view)
+            .or(capture_frame_view)
+            .unwrap_or(&frame.view);
+        let main_depth_view = watch_frame_target.map(|target| &target.depth_view).unwrap_or(renderer.depth_view());
+        let watch_overlay_view = watch_frame_target.map(|target| &target.overlay_view);
         let mut frame_stats = FrameStats::default();
 
         {
@@ -1156,7 +1290,7 @@ impl AppHandler<Renderer> for App {
                         if is_first {
                             first_pass_on_backbuffer = false;
                         }
-                        (main_view, renderer.depth_view(), is_first)
+                        (main_view, main_depth_view, is_first)
                     };
 
                     let (rt_w, rt_h) = if let Some(rt_id) = group_rt {
@@ -1166,6 +1300,7 @@ impl AppHandler<Renderer> for App {
                     };
 
                     {
+                        let watch_pass = use_watch_frame_target && group_rt.is_none();
                         let mut r_pass = if is_first {
                             if group_rt.is_some() {
                                 renderer.begin_render_pass_with_depth_clear_color(
@@ -1175,15 +1310,37 @@ impl AppHandler<Renderer> for App {
                                     egor_render::wgpu::Color::TRANSPARENT,
                                     true,
                                 )
+                            } else if watch_pass {
+                                renderer.begin_render_pass_with_watch_overlay_depth_clear_color(
+                                    &mut frame.encoder,
+                                    view,
+                                    watch_overlay_view.expect("watch overlay view"),
+                                    depth_view,
+                                    renderer.clear_color(),
+                                    true,
+                                )
                             } else {
                                 renderer.begin_render_pass_with_depth(&mut frame.encoder, view, depth_view, true)
                             }
+                        } else if watch_pass {
+                            renderer.begin_render_pass_load_with_watch_overlay_depth(
+                                &mut frame.encoder,
+                                view,
+                                watch_overlay_view.expect("watch overlay view"),
+                                depth_view,
+                            )
                         } else {
                             renderer.begin_render_pass_load_with_depth(&mut frame.encoder, view, depth_view)
                         };
 
                         let first_batch = &batches[batch_start];
-                        renderer.bind_pass_state(&mut r_pass, first_batch.texture_id, first_batch.shader_id, first_batch.replace_blend);
+                        renderer.bind_pass_state_with_watch_overlay(
+                            &mut r_pass,
+                            first_batch.texture_id,
+                            first_batch.shader_id,
+                            first_batch.replace_blend,
+                            watch_pass,
+                        );
                         let mut cur_tex = first_batch.texture_id;
                         let mut cur_shd = first_batch.shader_id;
                         let mut cur_replace_blend = first_batch.replace_blend;
@@ -1210,7 +1367,7 @@ impl AppHandler<Renderer> for App {
                             }
                             let offset = batch.camera_slot * stride;
                             if let Some(shared_buf) = renderer.shared_instance_buffer() {
-                                frame_stats.draw_calls += renderer.draw_batch_shared(
+                                frame_stats.draw_calls += renderer.draw_batch_shared_with_watch_overlay(
                                     &mut r_pass,
                                     &mut batch.geometry,
                                     batch.texture_id,
@@ -1224,9 +1381,10 @@ impl AppHandler<Renderer> for App {
                                     &mut quad_bound,
                                     shared_buf,
                                     self.instance_byte_offsets[idx],
+                                    watch_pass,
                                 );
                             } else {
-                                frame_stats.draw_calls += renderer.draw_batch(
+                                frame_stats.draw_calls += renderer.draw_batch_with_watch_overlay(
                                     &mut r_pass,
                                     &mut batch.geometry,
                                     batch.texture_id,
@@ -1238,6 +1396,7 @@ impl AppHandler<Renderer> for App {
                                     &mut cur_replace_blend,
                                     &mut cur_cam_offset,
                                     &mut quad_bound,
+                                    watch_pass,
                                 );
                             }
                         }
@@ -1259,7 +1418,18 @@ impl AppHandler<Renderer> for App {
                 }
 
                 if batches.is_empty() {
-                    let mut r_pass = renderer.begin_render_pass(&mut frame.encoder, main_view);
+                    let mut r_pass = if use_watch_frame_target {
+                        renderer.begin_render_pass_with_watch_overlay_depth_clear_color(
+                            &mut frame.encoder,
+                            main_view,
+                            watch_overlay_view.expect("watch overlay view"),
+                            main_depth_view,
+                            renderer.clear_color(),
+                            true,
+                        )
+                    } else {
+                        renderer.begin_render_pass(&mut frame.encoder, main_view)
+                    };
                     if has_text {
                         text_renderer.prepare(&device, &queue, w, h, None);
                         text_renderer.render(&mut r_pass);
@@ -1269,10 +1439,28 @@ impl AppHandler<Renderer> for App {
             } else {
                 // Single render pass (no render target overrides)
                 {
-                    let mut r_pass = renderer.begin_render_pass(&mut frame.encoder, main_view);
+                    let watch_pass = use_watch_frame_target;
+                    let mut r_pass = if watch_pass {
+                        renderer.begin_render_pass_with_watch_overlay_depth_clear_color(
+                            &mut frame.encoder,
+                            main_view,
+                            watch_overlay_view.expect("watch overlay view"),
+                            main_depth_view,
+                            renderer.clear_color(),
+                            true,
+                        )
+                    } else {
+                        renderer.begin_render_pass(&mut frame.encoder, main_view)
+                    };
 
                     if let Some(first) = batches.first() {
-                        renderer.bind_pass_state(&mut r_pass, first.texture_id, first.shader_id, first.replace_blend);
+                        renderer.bind_pass_state_with_watch_overlay(
+                            &mut r_pass,
+                            first.texture_id,
+                            first.shader_id,
+                            first.replace_blend,
+                            watch_pass,
+                        );
                         let mut cur_tex = first.texture_id;
                         let mut cur_shd = first.shader_id;
                         let mut cur_replace_blend = first.replace_blend;
@@ -1298,7 +1486,7 @@ impl AppHandler<Renderer> for App {
                             }
                             let offset = batch.camera_slot * stride;
                             if let Some(shared_buf) = renderer.shared_instance_buffer() {
-                                frame_stats.draw_calls += renderer.draw_batch_shared(
+                                frame_stats.draw_calls += renderer.draw_batch_shared_with_watch_overlay(
                                     &mut r_pass,
                                     &mut batch.geometry,
                                     batch.texture_id,
@@ -1312,9 +1500,10 @@ impl AppHandler<Renderer> for App {
                                     &mut quad_bound,
                                     shared_buf,
                                     self.instance_byte_offsets[idx],
+                                    watch_pass,
                                 );
                             } else {
-                                frame_stats.draw_calls += renderer.draw_batch(
+                                frame_stats.draw_calls += renderer.draw_batch_with_watch_overlay(
                                     &mut r_pass,
                                     &mut batch.geometry,
                                     batch.texture_id,
@@ -1326,6 +1515,7 @@ impl AppHandler<Renderer> for App {
                                     &mut cur_replace_blend,
                                     &mut cur_cam_offset,
                                     &mut quad_bound,
+                                    watch_pass,
                                 );
                             }
                         }
@@ -1360,7 +1550,19 @@ impl AppHandler<Renderer> for App {
         if capture_active {
             #[cfg(feature = "profiling")]
             profiling::scope!("screen_capture");
-            if let Some(source_rt_id) = capture_source_render_target {
+            if let Some(watch_target) = watch_frame_target {
+                self.screen_capture.capture_from_watch_overlay(
+                    &device,
+                    &queue,
+                    &mut frame.encoder,
+                    &watch_target.overlay_view,
+                    w,
+                    h,
+                    format.is_srgb(),
+                );
+                self.screen_capture
+                    .present_sampled_view(&device, &mut frame.encoder, &watch_target.color_view, &frame.view, format);
+            } else if let Some(source_rt_id) = capture_source_render_target {
                 let source_view = self.render_targets.get(source_rt_id).view();
                 self.screen_capture
                     .capture_from_sampled_view(&device, &mut frame.encoder, source_view, format.is_srgb());

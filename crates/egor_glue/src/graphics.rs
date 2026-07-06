@@ -6,6 +6,10 @@ use egor_render::{
 use glam::Vec2;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::mpsc::{self, Receiver, Sender};
+#[cfg(not(target_arch = "wasm32"))]
+use std::thread;
 use web_time::Instant;
 
 use crate::primitives::PathBuilder;
@@ -75,6 +79,39 @@ const SLOT_COUNT: usize = 3;
 const MAP_PENDING: u8 = 0;
 const MAP_READY: u8 = 1;
 const MAP_FAILED: u8 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WatchCaptureUniform {
+    source_w: u32,
+    source_h: u32,
+    logical_w: u32,
+    logical_h: u32,
+    factor: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+struct PreparedCapture {
+    slot_idx: usize,
+    cap_w: u32,
+    cap_h: u32,
+    grayscale: bool,
+    alpha_mask: bool,
+    metadata: Option<[f32; 10]>,
+    dirty_rects: Option<Vec<[u16; 4]>>,
+    frame_tag: Option<[u64; 4]>,
+}
+
+pub type WatchCaptureDirtyRects = Vec<[u16; 4]>;
+pub type WatchCaptureFrameTag = [u64; 4];
+
+impl WatchCaptureUniform {
+    fn bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts((self as *const Self).cast::<u8>(), std::mem::size_of::<Self>()) }
+    }
+}
 
 /// WGSL shader for fullscreen-triangle blit with bilinear sampling.
 const BLIT_SHADER_WGSL: &str = r#"
@@ -267,6 +304,350 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+const WATCH_CAPTURE_SHADER_WGSL: &str = r#"
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
+    let uv = vec2<f32>(f32((idx << 1u) & 2u), f32(idx & 2u));
+    var out: VertexOutput;
+    out.position = vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
+    return out;
+}
+
+struct CaptureUniform {
+    source_w: u32,
+    source_h: u32,
+    logical_w: u32,
+    logical_h: u32,
+    factor: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+};
+
+@group(0) @binding(0) var t_overlay: texture_2d<f32>;
+@group(0) @binding(1) var<uniform> capture: CaptureUniform;
+
+fn logical_to_source(logical: u32, logical_size: u32, source_size: u32) -> u32 {
+    if logical_size <= 1u || source_size <= 1u {
+        return 0u;
+    }
+    let mapped = u32(((f32(logical) + 0.5) * f32(source_size)) / f32(logical_size));
+    return min(mapped, source_size - 1u);
+}
+
+fn unpremultiply(rgb: vec3<f32>, alpha: f32) -> vec3<f32> {
+    if alpha <= 0.0001 {
+        return vec3<f32>(0.0);
+    }
+    return clamp(rgb / alpha, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+fn selected_overlay(pixel: vec2<u32>) -> vec4<f32> {
+    let factor = max(capture.factor, 1u);
+    let start_x = pixel.x * factor;
+    let start_y = pixel.y * factor;
+    var best_sample = vec4<f32>(0.0);
+    var best_alpha = -1.0;
+    var max_alpha = 0.0;
+
+    for (var by = 0u; by < 8u; by = by + 1u) {
+        if by >= factor || start_y + by >= capture.logical_h {
+            break;
+        }
+        let sy = logical_to_source(start_y + by, capture.logical_h, capture.source_h);
+        for (var bx = 0u; bx < 8u; bx = bx + 1u) {
+            if bx >= factor || start_x + bx >= capture.logical_w {
+                break;
+            }
+            let sx = logical_to_source(start_x + bx, capture.logical_w, capture.source_w);
+            let sample = textureLoad(t_overlay, vec2<i32>(i32(sx), i32(sy)), 0);
+            max_alpha = max(max_alpha, sample.a);
+            if sample.a > best_alpha {
+                best_alpha = sample.a;
+                best_sample = sample;
+            }
+        }
+    }
+
+    if max_alpha <= 0.0 {
+        return vec4<f32>(0.0);
+    }
+    return vec4<f32>(unpremultiply(best_sample.rgb, best_sample.a), max_alpha);
+}
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let pixel = vec2<u32>(u32(in.position.x), u32(in.position.y));
+    let c = selected_overlay(pixel);
+    return vec4<f32>(c.rgb * c.a, c.a);
+}
+"#;
+
+const WATCH_CAPTURE_GRAY_SHADER_WGSL: &str = r#"
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
+    let uv = vec2<f32>(f32((idx << 1u) & 2u), f32(idx & 2u));
+    var out: VertexOutput;
+    out.position = vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
+    return out;
+}
+
+struct CaptureUniform {
+    source_w: u32,
+    source_h: u32,
+    logical_w: u32,
+    logical_h: u32,
+    factor: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+};
+
+@group(0) @binding(0) var t_overlay: texture_2d<f32>;
+@group(0) @binding(1) var<uniform> capture: CaptureUniform;
+
+fn logical_to_source(logical: u32, logical_size: u32, source_size: u32) -> u32 {
+    if logical_size <= 1u || source_size <= 1u {
+        return 0u;
+    }
+    let mapped = u32(((f32(logical) + 0.5) * f32(source_size)) / f32(logical_size));
+    return min(mapped, source_size - 1u);
+}
+
+fn unpremultiply(rgb: vec3<f32>, alpha: f32) -> vec3<f32> {
+    if alpha <= 0.0001 {
+        return vec3<f32>(0.0);
+    }
+    return clamp(rgb / alpha, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+fn selected_overlay(pixel: vec2<u32>) -> vec4<f32> {
+    let factor = max(capture.factor, 1u);
+    let start_x = pixel.x * factor;
+    let start_y = pixel.y * factor;
+    var best_sample = vec4<f32>(0.0);
+    var best_alpha = -1.0;
+    var max_alpha = 0.0;
+
+    for (var by = 0u; by < 8u; by = by + 1u) {
+        if by >= factor || start_y + by >= capture.logical_h {
+            break;
+        }
+        let sy = logical_to_source(start_y + by, capture.logical_h, capture.source_h);
+        for (var bx = 0u; bx < 8u; bx = bx + 1u) {
+            if bx >= factor || start_x + bx >= capture.logical_w {
+                break;
+            }
+            let sx = logical_to_source(start_x + bx, capture.logical_w, capture.source_w);
+            let sample = textureLoad(t_overlay, vec2<i32>(i32(sx), i32(sy)), 0);
+            max_alpha = max(max_alpha, sample.a);
+            if sample.a > best_alpha {
+                best_alpha = sample.a;
+                best_sample = sample;
+            }
+        }
+    }
+
+    if max_alpha <= 0.0 {
+        return vec4<f32>(0.0);
+    }
+    return vec4<f32>(unpremultiply(best_sample.rgb, best_sample.a), max_alpha);
+}
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let pixel = vec2<u32>(u32(in.position.x), u32(in.position.y));
+    let c = selected_overlay(pixel);
+    let lum = dot(c.rgb, vec3<f32>(0.299, 0.587, 0.114));
+    return vec4<f32>(select(0.0, lum, c.a > 0.0), c.a, 0.0, 1.0);
+}
+"#;
+
+const WATCH_CAPTURE_ENCODE_SHADER_WGSL: &str = r#"
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
+    let uv = vec2<f32>(f32((idx << 1u) & 2u), f32(idx & 2u));
+    var out: VertexOutput;
+    out.position = vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
+    return out;
+}
+
+struct CaptureUniform {
+    source_w: u32,
+    source_h: u32,
+    logical_w: u32,
+    logical_h: u32,
+    factor: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+};
+
+@group(0) @binding(0) var t_overlay: texture_2d<f32>;
+@group(0) @binding(1) var<uniform> capture: CaptureUniform;
+
+fn logical_to_source(logical: u32, logical_size: u32, source_size: u32) -> u32 {
+    if logical_size <= 1u || source_size <= 1u {
+        return 0u;
+    }
+    let mapped = u32(((f32(logical) + 0.5) * f32(source_size)) / f32(logical_size));
+    return min(mapped, source_size - 1u);
+}
+
+fn unpremultiply(rgb: vec3<f32>, alpha: f32) -> vec3<f32> {
+    if alpha <= 0.0001 {
+        return vec3<f32>(0.0);
+    }
+    return clamp(rgb / alpha, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+fn selected_overlay(pixel: vec2<u32>) -> vec4<f32> {
+    let factor = max(capture.factor, 1u);
+    let start_x = pixel.x * factor;
+    let start_y = pixel.y * factor;
+    var best_sample = vec4<f32>(0.0);
+    var best_alpha = -1.0;
+    var max_alpha = 0.0;
+
+    for (var by = 0u; by < 8u; by = by + 1u) {
+        if by >= factor || start_y + by >= capture.logical_h {
+            break;
+        }
+        let sy = logical_to_source(start_y + by, capture.logical_h, capture.source_h);
+        for (var bx = 0u; bx < 8u; bx = bx + 1u) {
+            if bx >= factor || start_x + bx >= capture.logical_w {
+                break;
+            }
+            let sx = logical_to_source(start_x + bx, capture.logical_w, capture.source_w);
+            let sample = textureLoad(t_overlay, vec2<i32>(i32(sx), i32(sy)), 0);
+            max_alpha = max(max_alpha, sample.a);
+            if sample.a > best_alpha {
+                best_alpha = sample.a;
+                best_sample = sample;
+            }
+        }
+    }
+
+    if max_alpha <= 0.0 {
+        return vec4<f32>(0.0);
+    }
+    return vec4<f32>(unpremultiply(best_sample.rgb, best_sample.a), max_alpha);
+}
+fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
+    let x = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+    let lo = x * 12.92;
+    let hi = 1.055 * pow(x, vec3<f32>(1.0 / 2.4)) - 0.055;
+    return select(hi, lo, x <= vec3<f32>(0.0031308));
+}
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let pixel = vec2<u32>(u32(in.position.x), u32(in.position.y));
+    let c = selected_overlay(pixel);
+    let rgb = linear_to_srgb(c.rgb);
+    return vec4<f32>(rgb * c.a, c.a);
+}
+"#;
+
+const WATCH_CAPTURE_GRAY_ENCODE_SHADER_WGSL: &str = r#"
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
+    let uv = vec2<f32>(f32((idx << 1u) & 2u), f32(idx & 2u));
+    var out: VertexOutput;
+    out.position = vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
+    return out;
+}
+
+struct CaptureUniform {
+    source_w: u32,
+    source_h: u32,
+    logical_w: u32,
+    logical_h: u32,
+    factor: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+};
+
+@group(0) @binding(0) var t_overlay: texture_2d<f32>;
+@group(0) @binding(1) var<uniform> capture: CaptureUniform;
+
+fn logical_to_source(logical: u32, logical_size: u32, source_size: u32) -> u32 {
+    if logical_size <= 1u || source_size <= 1u {
+        return 0u;
+    }
+    let mapped = u32(((f32(logical) + 0.5) * f32(source_size)) / f32(logical_size));
+    return min(mapped, source_size - 1u);
+}
+
+fn unpremultiply(rgb: vec3<f32>, alpha: f32) -> vec3<f32> {
+    if alpha <= 0.0001 {
+        return vec3<f32>(0.0);
+    }
+    return clamp(rgb / alpha, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+fn selected_overlay(pixel: vec2<u32>) -> vec4<f32> {
+    let factor = max(capture.factor, 1u);
+    let start_x = pixel.x * factor;
+    let start_y = pixel.y * factor;
+    var best_sample = vec4<f32>(0.0);
+    var best_alpha = -1.0;
+    var max_alpha = 0.0;
+
+    for (var by = 0u; by < 8u; by = by + 1u) {
+        if by >= factor || start_y + by >= capture.logical_h {
+            break;
+        }
+        let sy = logical_to_source(start_y + by, capture.logical_h, capture.source_h);
+        for (var bx = 0u; bx < 8u; bx = bx + 1u) {
+            if bx >= factor || start_x + bx >= capture.logical_w {
+                break;
+            }
+            let sx = logical_to_source(start_x + bx, capture.logical_w, capture.source_w);
+            let sample = textureLoad(t_overlay, vec2<i32>(i32(sx), i32(sy)), 0);
+            max_alpha = max(max_alpha, sample.a);
+            if sample.a > best_alpha {
+                best_alpha = sample.a;
+                best_sample = sample;
+            }
+        }
+    }
+
+    if max_alpha <= 0.0 {
+        return vec4<f32>(0.0);
+    }
+    return vec4<f32>(unpremultiply(best_sample.rgb, best_sample.a), max_alpha);
+}
+fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
+    let x = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+    let lo = x * 12.92;
+    let hi = 1.055 * pow(x, vec3<f32>(1.0 / 2.4)) - 0.055;
+    return select(hi, lo, x <= vec3<f32>(0.0031308));
+}
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let pixel = vec2<u32>(u32(in.position.x), u32(in.position.y));
+    let c = selected_overlay(pixel);
+    let rgb = linear_to_srgb(c.rgb);
+    let lum = dot(rgb, vec3<f32>(0.299, 0.587, 0.114));
+    return vec4<f32>(select(0.0, lum, c.a > 0.0), c.a, 0.0, 1.0);
+}
+"#;
+
 // -- Unsafe pixel-format conversion (matches old OpenGL PBO path perf) ------
 
 /// RGBA → RGB565 with row-pitch padding.
@@ -299,6 +680,81 @@ fn unpremultiply_channel(channel: u8, alpha: u8) -> u8 {
     }
 }
 
+fn readback_output_len(cap_w: u32, cap_h: u32, grayscale: bool, alpha_mask: bool) -> usize {
+    let pixel_count = cap_w as usize * cap_h as usize;
+    match (grayscale, alpha_mask) {
+        (true, false) => pixel_count,
+        (true, true) => pixel_count * 2,
+        (false, false) => pixel_count * 2,
+        (false, true) => pixel_count * 3,
+    }
+}
+
+fn decode_readback_into(buffer: &Buffer, dst: &mut Vec<u8>, cap_w: u32, cap_h: u32, row_pitch: usize, grayscale: bool, alpha_mask: bool) {
+    let w = cap_w as usize;
+    let h = cap_h as usize;
+    let pixel_count = w * h;
+    let out_len = readback_output_len(cap_w, cap_h, grayscale, alpha_mask);
+
+    dst.reserve(out_len.saturating_sub(dst.len()));
+    unsafe { dst.set_len(out_len) };
+
+    let data = buffer.slice(..).get_mapped_range();
+    let src = data.as_ref().as_ptr();
+
+    if alpha_mask {
+        if grayscale {
+            let unpadded_row = w * 2;
+            if row_pitch == unpadded_row {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), out_len);
+                }
+            } else {
+                let out = dst.as_mut_ptr();
+                for y in 0..h {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(src.add(y * row_pitch), out.add(y * unpadded_row), unpadded_row);
+                    }
+                }
+            }
+        } else {
+            let color_len = pixel_count * 2;
+            let (color_out, alpha_out) = dst.split_at_mut(color_len);
+            let d = color_out.as_mut_ptr() as *mut u16;
+            for y in 0..h {
+                let row = unsafe { src.add(y * row_pitch) };
+                let dst_off = y * w;
+                for x in 0..w {
+                    let s = unsafe { row.add(x * 4) };
+                    let a = unsafe { *s.add(3) };
+                    let r = unpremultiply_channel(unsafe { *s }, a) as u16;
+                    let g = unpremultiply_channel(unsafe { *s.add(1) }, a) as u16;
+                    let b = unpremultiply_channel(unsafe { *s.add(2) }, a) as u16;
+                    let idx = dst_off + x;
+                    let packed = if a == 0 { 0 } else { ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3) };
+                    unsafe { *d.add(idx) = packed };
+                    alpha_out[idx] = a;
+                }
+            }
+        }
+    } else if grayscale {
+        if row_pitch == w {
+            unsafe {
+                std::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), out_len);
+            }
+        } else {
+            let out = dst.as_mut_ptr();
+            for y in 0..h {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.add(y * row_pitch), out.add(y * w), w);
+                }
+            }
+        }
+    } else {
+        unsafe { pack_rgba_to_rgb565(src, dst.as_mut_ptr(), w, h, row_pitch) };
+    }
+}
+
 // -- Ring-buffer staging slot -----------------------------------------------
 
 struct StagingSlot {
@@ -310,6 +766,8 @@ struct StagingSlot {
     grayscale: bool,
     alpha_mask: bool,
     metadata: Option<[f32; 10]>,
+    dirty_rects: Option<WatchCaptureDirtyRects>,
+    frame_tag: Option<WatchCaptureFrameTag>,
     map_signal: Arc<AtomicU8>,
     pending: bool,
 }
@@ -325,8 +783,99 @@ impl StagingSlot {
             grayscale: false,
             alpha_mask: false,
             metadata: None,
+            dirty_rects: None,
+            frame_tag: None,
             map_signal: Arc::new(AtomicU8::new(MAP_PENDING)),
             pending: false,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct ReadbackJob {
+    slot_idx: usize,
+    buffer: Buffer,
+    buf_size: u64,
+    row_pitch: usize,
+    cap_w: u32,
+    cap_h: u32,
+    grayscale: bool,
+    alpha_mask: bool,
+    metadata: Option<[f32; 10]>,
+    dirty_rects: Option<WatchCaptureDirtyRects>,
+    frame_tag: Option<WatchCaptureFrameTag>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct ReadbackResult {
+    slot_idx: usize,
+    buffer: Buffer,
+    buf_size: u64,
+    row_pitch: u32,
+    cap_w: u32,
+    cap_h: u32,
+    grayscale: bool,
+    alpha_mask: bool,
+    metadata: Option<[f32; 10]>,
+    dirty_rects: Option<WatchCaptureDirtyRects>,
+    frame_tag: Option<WatchCaptureFrameTag>,
+    rgb_buf: Vec<u8>,
+    complete_us: u128,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct ReadbackWorker {
+    jobs: Sender<ReadbackJob>,
+    results: Receiver<ReadbackResult>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ReadbackWorker {
+    fn new() -> Self {
+        let (job_tx, job_rx) = mpsc::channel::<ReadbackJob>();
+        let (result_tx, result_rx) = mpsc::channel::<ReadbackResult>();
+        thread::Builder::new()
+            .name("egor-readback".to_owned())
+            .spawn(move || {
+                let mut rgb_buf = Vec::new();
+                while let Ok(job) = job_rx.recv() {
+                    let complete_start = Instant::now();
+                    decode_readback_into(
+                        &job.buffer,
+                        &mut rgb_buf,
+                        job.cap_w,
+                        job.cap_h,
+                        job.row_pitch,
+                        job.grayscale,
+                        job.alpha_mask,
+                    );
+                    job.buffer.unmap();
+                    let complete_us = complete_start.elapsed().as_micros();
+                    let result = ReadbackResult {
+                        slot_idx: job.slot_idx,
+                        buffer: job.buffer,
+                        buf_size: job.buf_size,
+                        row_pitch: job.row_pitch as u32,
+                        cap_w: job.cap_w,
+                        cap_h: job.cap_h,
+                        grayscale: job.grayscale,
+                        alpha_mask: job.alpha_mask,
+                        metadata: job.metadata,
+                        dirty_rects: job.dirty_rects,
+                        frame_tag: job.frame_tag,
+                        rgb_buf: std::mem::take(&mut rgb_buf),
+                        complete_us,
+                    };
+                    if result_tx.send(result).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("failed to spawn egor readback worker");
+
+        Self {
+            jobs: job_tx,
+            results: result_rx,
         }
     }
 }
@@ -350,8 +899,8 @@ impl StagingSlot {
 ///   3. After `queue.submit()`, [`App`] calls
 ///      [`ScreenCaptureState::begin_readback_map`] to issue the async map.
 ///   4. On a subsequent frame the game polls
-///      [`ScreenCaptureState::try_complete`]. The oldest ready slot is
-///      consumed: raw BGRA → RGB565 (2 B/px) or grayscale (1 B/px).
+///      [`ScreenCaptureState::try_complete`]. Native builds hand ready slots
+///      to a worker thread; wasm consumes the ready slot synchronously.
 pub struct ScreenCaptureState {
     // -- GPU blit resources (lazily initialised) --
     blit_pipeline: Option<egor_render::wgpu::RenderPipeline>,
@@ -360,8 +909,14 @@ pub struct ScreenCaptureState {
     blit_encode_pipeline: Option<egor_render::wgpu::RenderPipeline>,
     blit_gray_encode_pipeline: Option<egor_render::wgpu::RenderPipeline>,
     blit_gray_alpha_encode_pipeline: Option<egor_render::wgpu::RenderPipeline>,
+    watch_capture_pipeline: Option<egor_render::wgpu::RenderPipeline>,
+    watch_capture_gray_pipeline: Option<egor_render::wgpu::RenderPipeline>,
+    watch_capture_encode_pipeline: Option<egor_render::wgpu::RenderPipeline>,
+    watch_capture_gray_encode_pipeline: Option<egor_render::wgpu::RenderPipeline>,
     blit_sampler: Option<egor_render::wgpu::Sampler>,
     blit_bind_group_layout: Option<egor_render::wgpu::BindGroupLayout>,
+    watch_capture_bind_group_layout: Option<egor_render::wgpu::BindGroupLayout>,
+    watch_capture_uniform: Option<Buffer>,
     present_pipeline: Option<egor_render::wgpu::RenderPipeline>,
     present_pipeline_format: Option<TextureFormat>,
     composite_pipeline: Option<egor_render::wgpu::RenderPipeline>,
@@ -387,18 +942,28 @@ pub struct ScreenCaptureState {
     pub grayscale: bool,
     pub alpha_mask: bool,
     source_render_target: Option<usize>,
+    watch_overlay_capture: bool,
+    final_frame_logical_w: u32,
+    final_frame_logical_h: u32,
+    final_frame_scale_factor: u32,
     request_metadata: Option<[f32; 10]>,
+    request_dirty_rects: Option<WatchCaptureDirtyRects>,
+    request_frame_tag: Option<WatchCaptureFrameTag>,
 
     // -- ring buffer of staging slots --
     slots: [StagingSlot; SLOT_COUNT],
     write_idx: usize,
     needs_map: Option<usize>,
+    #[cfg(not(target_arch = "wasm32"))]
+    readback_worker: Option<ReadbackWorker>,
 
     // -- completed result --
     result_ready: bool,
     result_w: u16,
     result_h: u16,
     result_metadata: Option<[f32; 10]>,
+    result_dirty_rects: Option<WatchCaptureDirtyRects>,
+    result_frame_tag: Option<WatchCaptureFrameTag>,
     rgb_buf: Vec<u8>,
     composite_render_target: Option<usize>,
 }
@@ -412,8 +977,14 @@ impl ScreenCaptureState {
             blit_encode_pipeline: None,
             blit_gray_encode_pipeline: None,
             blit_gray_alpha_encode_pipeline: None,
+            watch_capture_pipeline: None,
+            watch_capture_gray_pipeline: None,
+            watch_capture_encode_pipeline: None,
+            watch_capture_gray_encode_pipeline: None,
             blit_sampler: None,
             blit_bind_group_layout: None,
+            watch_capture_bind_group_layout: None,
+            watch_capture_uniform: None,
             present_pipeline: None,
             present_pipeline_format: None,
             composite_pipeline: None,
@@ -434,14 +1005,24 @@ impl ScreenCaptureState {
             grayscale: false,
             alpha_mask: false,
             source_render_target: None,
+            watch_overlay_capture: false,
+            final_frame_logical_w: 0,
+            final_frame_logical_h: 0,
+            final_frame_scale_factor: 1,
             request_metadata: None,
+            request_dirty_rects: None,
+            request_frame_tag: None,
             slots: [StagingSlot::new(), StagingSlot::new(), StagingSlot::new()],
             write_idx: 0,
             needs_map: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            readback_worker: None,
             result_ready: false,
             result_w: 0,
             result_h: 0,
             result_metadata: None,
+            result_dirty_rects: None,
+            result_frame_tag: None,
             rgb_buf: Vec::new(),
             composite_render_target: None,
         }
@@ -471,32 +1052,67 @@ impl ScreenCaptureState {
         self.grayscale = grayscale;
         self.alpha_mask = false;
         self.source_render_target = None;
+        self.watch_overlay_capture = false;
         self.request_metadata = None;
+        self.request_dirty_rects = None;
+        self.request_frame_tag = None;
     }
 
-    pub fn request_with_alpha_mask(
-        &mut self,
-        w: u32,
-        h: u32,
-        grayscale: bool,
-        source_render_target: usize,
-        metadata: Option<[f32; 10]>,
-    ) {
+    pub fn request_with_alpha_mask(&mut self, w: u32, h: u32, grayscale: bool, source_render_target: usize, metadata: Option<[f32; 10]>) {
         self.requested = true;
         self.capture_w = w;
         self.capture_h = h;
         self.grayscale = grayscale;
         self.alpha_mask = true;
         self.source_render_target = Some(source_render_target);
+        self.watch_overlay_capture = false;
         self.request_metadata = metadata;
+        self.request_dirty_rects = None;
+        self.request_frame_tag = None;
+    }
+
+    pub fn request_watch_overlay_capture(
+        &mut self,
+        w: u32,
+        h: u32,
+        logical_w: u32,
+        logical_h: u32,
+        scale_factor: u32,
+        grayscale: bool,
+        metadata: Option<[f32; 10]>,
+        dirty_rects: Option<WatchCaptureDirtyRects>,
+        frame_tag: Option<WatchCaptureFrameTag>,
+    ) {
+        self.requested = true;
+        self.capture_w = w;
+        self.capture_h = h;
+        self.grayscale = grayscale;
+        self.alpha_mask = true;
+        self.source_render_target = None;
+        self.watch_overlay_capture = true;
+        self.final_frame_logical_w = logical_w.max(1);
+        self.final_frame_logical_h = logical_h.max(1);
+        self.final_frame_scale_factor = scale_factor.clamp(1, 8);
+        self.request_metadata = metadata;
+        self.request_dirty_rects = dirty_rects;
+        self.request_frame_tag = frame_tag;
     }
 
     pub fn requested_source_render_target(&self) -> Option<usize> {
-        if self.requested {
-            self.source_render_target
-        } else {
-            None
-        }
+        if self.requested { self.source_render_target } else { None }
+    }
+
+    pub fn is_watch_overlay_capture_requested(&self) -> bool {
+        self.requested && self.watch_overlay_capture
+    }
+
+    pub fn cancel_request(&mut self) {
+        self.requested = false;
+        self.source_render_target = None;
+        self.watch_overlay_capture = false;
+        self.request_metadata = None;
+        self.request_dirty_rects = None;
+        self.request_frame_tag = None;
     }
 
     pub fn request_composite_render_target(&mut self, source_render_target: usize) {
@@ -514,8 +1130,11 @@ impl ScreenCaptureState {
     pub fn release_buffers(&mut self) {
         self.requested = false;
         self.source_render_target = None;
+        self.watch_overlay_capture = false;
         self.composite_render_target = None;
         self.request_metadata = None;
+        self.request_dirty_rects = None;
+        self.request_frame_tag = None;
         self.capture_texture = None;
         self.capture_view = None;
         self.capture_tex_w = 0;
@@ -526,6 +1145,7 @@ impl ScreenCaptureState {
         self.source_copy_view = None;
         self.source_copy_w = 0;
         self.source_copy_h = 0;
+        self.watch_capture_uniform = None;
         self.rgb_buf.clear();
     }
 
@@ -724,14 +1344,13 @@ impl ScreenCaptureState {
         self.source_copy_h = h;
     }
 
-    fn prepare_capture(&mut self) -> Option<(usize, u32, u32, bool, bool, Option<[f32; 10]>)> {
+    fn prepare_capture(&mut self) -> Option<PreparedCapture> {
         self.requested = false;
 
         let cap_w = self.capture_w.max(1);
         let cap_h = self.capture_h.max(1);
         let grayscale = self.grayscale;
         let alpha_mask = self.alpha_mask;
-        let metadata = self.request_metadata.take();
         self.source_render_target = None;
 
         // -- Ring-buffer slot availability check --------------------------
@@ -740,8 +1359,9 @@ impl ScreenCaptureState {
         if self.slots[idx].pending {
             let status = self.slots[idx].map_signal.load(Ordering::Acquire);
             if status == MAP_READY {
-                // Harvest the completed readback before reusing this slot.
-                self.complete_slot(idx);
+                // Capture submission runs on the frame path. Do not consume
+                // mapped readbacks here; the poll path/worker owns that work.
+                return None;
             } else if status == MAP_FAILED {
                 self.slots[idx].pending = false;
             } else {
@@ -751,7 +1371,16 @@ impl ScreenCaptureState {
             }
         }
 
-        Some((idx, cap_w, cap_h, grayscale, alpha_mask, metadata))
+        Some(PreparedCapture {
+            slot_idx: idx,
+            cap_w,
+            cap_h,
+            grayscale,
+            alpha_mask,
+            metadata: self.request_metadata.take(),
+            dirty_rects: self.request_dirty_rects.take(),
+            frame_tag: self.request_frame_tag.take(),
+        })
     }
 
     fn source_bind_group(&self, device: &Device, source_view: &egor_render::wgpu::TextureView) -> egor_render::wgpu::BindGroup {
@@ -774,19 +1403,160 @@ impl ScreenCaptureState {
         })
     }
 
+    fn ensure_watch_capture_pipeline(&mut self, device: &Device) {
+        if self.watch_capture_pipeline.is_some() {
+            return;
+        }
+
+        let shader = device.create_shader_module(egor_render::wgpu::ShaderModuleDescriptor {
+            label: Some("Watch Capture Shader"),
+            source: egor_render::wgpu::ShaderSource::Wgsl(WATCH_CAPTURE_SHADER_WGSL.into()),
+        });
+        let gray_shader = device.create_shader_module(egor_render::wgpu::ShaderModuleDescriptor {
+            label: Some("Watch Capture Gray Shader"),
+            source: egor_render::wgpu::ShaderSource::Wgsl(WATCH_CAPTURE_GRAY_SHADER_WGSL.into()),
+        });
+        let encode_shader = device.create_shader_module(egor_render::wgpu::ShaderModuleDescriptor {
+            label: Some("Watch Capture Encode Shader"),
+            source: egor_render::wgpu::ShaderSource::Wgsl(WATCH_CAPTURE_ENCODE_SHADER_WGSL.into()),
+        });
+        let gray_encode_shader = device.create_shader_module(egor_render::wgpu::ShaderModuleDescriptor {
+            label: Some("Watch Capture Gray Encode Shader"),
+            source: egor_render::wgpu::ShaderSource::Wgsl(WATCH_CAPTURE_GRAY_ENCODE_SHADER_WGSL.into()),
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&egor_render::wgpu::BindGroupLayoutDescriptor {
+            label: Some("Watch Capture Bind Group Layout"),
+            entries: &[
+                egor_render::wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: egor_render::wgpu::ShaderStages::FRAGMENT,
+                    ty: egor_render::wgpu::BindingType::Texture {
+                        sample_type: egor_render::wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: egor_render::wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                egor_render::wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: egor_render::wgpu::ShaderStages::FRAGMENT,
+                    ty: egor_render::wgpu::BindingType::Buffer {
+                        ty: egor_render::wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&egor_render::wgpu::PipelineLayoutDescriptor {
+            label: Some("Watch Capture Pipeline Layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        let make_pipeline = |label, module: &egor_render::wgpu::ShaderModule, format| {
+            device.create_render_pipeline(&egor_render::wgpu::RenderPipelineDescriptor {
+                label,
+                layout: Some(&pipeline_layout),
+                vertex: egor_render::wgpu::VertexState {
+                    module,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(egor_render::wgpu::FragmentState {
+                    module,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(egor_render::wgpu::ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: egor_render::wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: egor_render::wgpu::PrimitiveState {
+                    topology: egor_render::wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+
+        self.watch_capture_pipeline = Some(make_pipeline(Some("Watch Capture"), &shader, TextureFormat::Rgba8Unorm));
+        self.watch_capture_gray_pipeline = Some(make_pipeline(Some("Watch Capture Gray"), &gray_shader, TextureFormat::Rg8Unorm));
+        self.watch_capture_encode_pipeline = Some(make_pipeline(
+            Some("Watch Capture Encode"),
+            &encode_shader,
+            TextureFormat::Rgba8Unorm,
+        ));
+        self.watch_capture_gray_encode_pipeline = Some(make_pipeline(
+            Some("Watch Capture Gray Encode"),
+            &gray_encode_shader,
+            TextureFormat::Rg8Unorm,
+        ));
+        self.watch_capture_bind_group_layout = Some(bind_group_layout);
+    }
+
+    fn watch_capture_bind_group(
+        &mut self,
+        device: &Device,
+        queue: &egor_render::Queue,
+        overlay_view: &egor_render::wgpu::TextureView,
+        uniform: WatchCaptureUniform,
+    ) -> egor_render::wgpu::BindGroup {
+        self.ensure_watch_capture_pipeline(device);
+        if self.watch_capture_uniform.is_none() {
+            self.watch_capture_uniform = Some(device.create_buffer(&BufferDescriptor {
+                label: Some("Watch Capture Uniform"),
+                size: std::mem::size_of::<WatchCaptureUniform>() as u64,
+                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        let uniform_buffer = self.watch_capture_uniform.as_ref().expect("watch capture uniform");
+        queue.write_buffer(uniform_buffer, 0, uniform.bytes());
+        let layout = self.watch_capture_bind_group_layout.as_ref().expect("watch capture layout");
+
+        device.create_bind_group(&egor_render::wgpu::BindGroupDescriptor {
+            label: Some("Watch Capture Bind Group"),
+            layout,
+            entries: &[
+                egor_render::wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: egor_render::wgpu::BindingResource::TextureView(overlay_view),
+                },
+                egor_render::wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
     fn capture_prepared_bind_group(
         &mut self,
         device: &Device,
         encoder: &mut CommandEncoder,
-        idx: usize,
-        cap_w: u32,
-        cap_h: u32,
-        grayscale: bool,
-        alpha_mask: bool,
-        metadata: Option<[f32; 10]>,
+        prepared: PreparedCapture,
         encode_srgb: bool,
         bind_group: &egor_render::wgpu::BindGroup,
     ) {
+        let PreparedCapture {
+            slot_idx,
+            cap_w,
+            cap_h,
+            grayscale,
+            alpha_mask,
+            metadata,
+            dirty_rects,
+            frame_tag,
+        } = prepared;
         // Ensure GPU resources exist
         self.ensure_pipeline(device);
         self.ensure_capture_texture(device, cap_w, cap_h, grayscale, alpha_mask);
@@ -826,7 +1596,7 @@ impl ScreenCaptureState {
         }
 
         // Copy capture texture → staging buffer for CPU readback
-        let slot = &mut self.slots[idx];
+        let slot = &mut self.slots[slot_idx];
         let bytes_per_pixel: u32 = match (grayscale, alpha_mask) {
             (true, false) => 1,
             (true, true) => 2,
@@ -877,15 +1647,17 @@ impl ScreenCaptureState {
 
         // Store capture metadata on the slot so try_complete knows how to
         // decode regardless of whether the request params changed since then.
-        let slot = &mut self.slots[idx];
+        let slot = &mut self.slots[slot_idx];
         slot.cap_w = cap_w;
         slot.cap_h = cap_h;
         slot.grayscale = grayscale;
         slot.alpha_mask = alpha_mask;
         slot.metadata = metadata;
+        slot.dirty_rects = dirty_rects;
+        slot.frame_tag = frame_tag;
         slot.pending = true;
 
-        self.needs_map = Some(idx);
+        self.needs_map = Some(slot_idx);
         self.write_idx = (self.write_idx + 1) % SLOT_COUNT;
     }
 
@@ -897,7 +1669,7 @@ impl ScreenCaptureState {
     /// `source` is the backbuffer `Texture` (must have `COPY_SRC` usage).
     /// The encoder must be the same one that will be submitted this frame.
     pub fn capture_from_texture(&mut self, device: &Device, encoder: &mut CommandEncoder, source: &Texture) {
-        let Some((idx, cap_w, cap_h, grayscale, alpha_mask, metadata)) = self.prepare_capture() else {
+        let Some(prepared) = self.prepare_capture() else {
             return;
         };
 
@@ -929,18 +1701,7 @@ impl ScreenCaptureState {
 
         let source_view = self.source_copy_view.as_ref().expect("source copy init");
         let bind_group = self.source_bind_group(device, source_view);
-        self.capture_prepared_bind_group(
-            device,
-            encoder,
-            idx,
-            cap_w,
-            cap_h,
-            grayscale,
-            alpha_mask,
-            metadata,
-            source.format().is_srgb(),
-            &bind_group,
-        );
+        self.capture_prepared_bind_group(device, encoder, prepared, source.format().is_srgb(), &bind_group);
     }
 
     /// Capture from an already bindable render target. Used on surfaces that
@@ -953,24 +1714,145 @@ impl ScreenCaptureState {
         source_view: &egor_render::wgpu::TextureView,
         encode_srgb: bool,
     ) {
-        let Some((idx, cap_w, cap_h, grayscale, alpha_mask, metadata)) = self.prepare_capture() else {
+        let Some(prepared) = self.prepare_capture() else {
             return;
         };
 
         self.ensure_pipeline(device);
         let bind_group = self.source_bind_group(device, source_view);
-        self.capture_prepared_bind_group(
-            device,
-            encoder,
-            idx,
+        self.capture_prepared_bind_group(device, encoder, prepared, encode_srgb, &bind_group);
+    }
+
+    pub fn capture_from_watch_overlay(
+        &mut self,
+        device: &Device,
+        queue: &egor_render::Queue,
+        encoder: &mut CommandEncoder,
+        overlay_view: &egor_render::wgpu::TextureView,
+        source_w: u32,
+        source_h: u32,
+        encode_srgb: bool,
+    ) {
+        let logical_w = self.final_frame_logical_w.max(1);
+        let logical_h = self.final_frame_logical_h.max(1);
+        let factor = self.final_frame_scale_factor.clamp(1, 8);
+        let Some(prepared) = self.prepare_capture() else {
+            return;
+        };
+        let PreparedCapture {
+            slot_idx,
             cap_w,
             cap_h,
             grayscale,
             alpha_mask,
             metadata,
-            encode_srgb,
-            &bind_group,
+            dirty_rects,
+            frame_tag,
+        } = prepared;
+
+        self.ensure_watch_capture_pipeline(device);
+        self.ensure_capture_texture(device, cap_w, cap_h, grayscale, alpha_mask);
+
+        let uniform = WatchCaptureUniform {
+            source_w: source_w.max(1),
+            source_h: source_h.max(1),
+            logical_w,
+            logical_h,
+            factor,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        let bind_group = self.watch_capture_bind_group(device, queue, overlay_view, uniform);
+        let pipeline = match (grayscale, encode_srgb) {
+            (true, false) => self.watch_capture_gray_pipeline.as_ref().expect("watch capture pipeline"),
+            (true, true) => self.watch_capture_gray_encode_pipeline.as_ref().expect("watch capture pipeline"),
+            (false, false) => self.watch_capture_pipeline.as_ref().expect("watch capture pipeline"),
+            (false, true) => self.watch_capture_encode_pipeline.as_ref().expect("watch capture pipeline"),
+        };
+        let capture_view = self.capture_view.as_ref().expect("capture texture init");
+
+        {
+            let mut rpass = encoder.begin_render_pass(&egor_render::wgpu::RenderPassDescriptor {
+                label: Some("Watch Capture Downsample Pass"),
+                color_attachments: &[Some(egor_render::wgpu::RenderPassColorAttachment {
+                    view: capture_view,
+                    resolve_target: None,
+                    ops: egor_render::wgpu::Operations {
+                        load: egor_render::wgpu::LoadOp::Clear(egor_render::wgpu::Color::BLACK),
+                        store: egor_render::wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            rpass.set_pipeline(pipeline);
+            rpass.set_bind_group(0, &bind_group, &[]);
+            rpass.draw(0..3, 0..1);
+        }
+
+        let slot = &mut self.slots[slot_idx];
+        let bytes_per_pixel: u32 = match (grayscale, alpha_mask) {
+            (true, false) => 1,
+            (true, true) => 2,
+            (false, _) => 4,
+        };
+        let unpadded_row = cap_w * bytes_per_pixel;
+        let align = egor_render::wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_row = (unpadded_row + align - 1) / align * align;
+        let buffer_size = (padded_row * cap_h) as u64;
+
+        let needs_new = slot.buffer.is_none() || slot.buf_size != buffer_size || slot.row_pitch != padded_row;
+        if needs_new {
+            slot.buffer = Some(device.create_buffer(&BufferDescriptor {
+                label: None,
+                size: buffer_size,
+                usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            }));
+            slot.buf_size = buffer_size;
+            slot.row_pitch = padded_row;
+        }
+
+        let buffer = slot.buffer.as_ref().expect("staging buffer");
+        encoder.copy_texture_to_buffer(
+            egor_render::wgpu::TexelCopyTextureInfo {
+                texture: self.capture_texture.as_ref().expect("capture texture"),
+                mip_level: 0,
+                origin: egor_render::wgpu::Origin3d::ZERO,
+                aspect: egor_render::wgpu::TextureAspect::All,
+            },
+            egor_render::wgpu::TexelCopyBufferInfo {
+                buffer,
+                layout: egor_render::wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row),
+                    rows_per_image: Some(cap_h),
+                },
+            },
+            Extent3d {
+                width: cap_w,
+                height: cap_h,
+                depth_or_array_layers: 1,
+            },
         );
+
+        let slot = &mut self.slots[slot_idx];
+        slot.cap_w = cap_w;
+        slot.cap_h = cap_h;
+        slot.grayscale = grayscale;
+        slot.alpha_mask = alpha_mask;
+        slot.metadata = metadata;
+        slot.dirty_rects = dirty_rects;
+        slot.frame_tag = frame_tag;
+        slot.pending = true;
+
+        self.needs_map = Some(slot_idx);
+        self.write_idx = (self.write_idx + 1) % SLOT_COUNT;
     }
 
     fn ensure_present_pipeline(&mut self, device: &Device, format: TextureFormat) {
@@ -1179,6 +2061,7 @@ impl ScreenCaptureState {
     /// Consume the oldest completed ring-buffer slot. For grayscale the
     /// staging buffer already holds R8 data from the GPU — just strip row
     /// padding. For RGB565, convert BGRA→RGB565 with unsafe pointer math.
+    #[cfg(target_arch = "wasm32")]
     fn complete_slot(&mut self, idx: usize) {
         let complete_start = Instant::now();
         let cap_w = self.slots[idx].cap_w;
@@ -1186,9 +2069,6 @@ impl ScreenCaptureState {
         let row_pitch = self.slots[idx].row_pitch as usize;
         let grayscale = self.slots[idx].grayscale;
         let alpha_mask = self.slots[idx].alpha_mask;
-        let w = cap_w as usize;
-        let h = cap_h as usize;
-        let pixel_count = w * h;
 
         let buffer = match self.slots[idx].buffer.take() {
             Some(b) => b,
@@ -1198,81 +2078,7 @@ impl ScreenCaptureState {
             }
         };
 
-        let data = buffer.slice(..).get_mapped_range();
-        let src = data.as_ref().as_ptr();
-
-        if alpha_mask {
-            if grayscale {
-                let out_len = pixel_count * 2;
-                self.rgb_buf.reserve(out_len.saturating_sub(self.rgb_buf.len()));
-                unsafe { self.rgb_buf.set_len(out_len) };
-                let unpadded_row = w * 2;
-                if row_pitch == unpadded_row {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(src, self.rgb_buf.as_mut_ptr(), out_len);
-                    }
-                } else {
-                    let dst = self.rgb_buf.as_mut_ptr();
-                    for y in 0..h {
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(src.add(y * row_pitch), dst.add(y * unpadded_row), unpadded_row);
-                        }
-                    }
-                }
-            } else {
-                let color_len = pixel_count * 2;
-                let out_len = color_len + pixel_count;
-                self.rgb_buf.reserve(out_len.saturating_sub(self.rgb_buf.len()));
-                unsafe { self.rgb_buf.set_len(out_len) };
-                let (color_out, alpha_out) = self.rgb_buf.split_at_mut(color_len);
-                let d = color_out.as_mut_ptr() as *mut u16;
-                for y in 0..h {
-                    let row = unsafe { src.add(y * row_pitch) };
-                    let dst_off = y * w;
-                    for x in 0..w {
-                        let s = unsafe { row.add(x * 4) };
-                        let a = unsafe { *s.add(3) };
-                        let r = unpremultiply_channel(unsafe { *s }, a) as u16;
-                        let g = unpremultiply_channel(unsafe { *s.add(1) }, a) as u16;
-                        let b = unpremultiply_channel(unsafe { *s.add(2) }, a) as u16;
-                        let idx = dst_off + x;
-                        let packed = if a == 0 { 0 } else { ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3) };
-                        unsafe { *d.add(idx) = packed };
-                        alpha_out[idx] = a;
-                    }
-                }
-            }
-        } else if grayscale {
-            // R8Unorm capture texture — data is already single-channel.
-            // Just strip row padding via a tight copy.
-            let out_len = pixel_count;
-            self.rgb_buf.reserve(out_len.saturating_sub(self.rgb_buf.len()));
-            // SAFETY: we've reserved enough capacity; the buffer is
-            // immediately filled by the copy loop below.
-            unsafe { self.rgb_buf.set_len(out_len) };
-            if row_pitch == w {
-                // No padding — single memcpy.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(src, self.rgb_buf.as_mut_ptr(), out_len);
-                }
-            } else {
-                let dst = self.rgb_buf.as_mut_ptr();
-                for y in 0..h {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(src.add(y * row_pitch), dst.add(y * w), w);
-                    }
-                }
-            }
-        } else {
-            let out_len = pixel_count * 2;
-            self.rgb_buf.reserve(out_len.saturating_sub(self.rgb_buf.len()));
-            // SAFETY: we've reserved enough capacity; pack_rgba_to_rgb565
-            // writes exactly pixel_count * 2 bytes.
-            unsafe { self.rgb_buf.set_len(out_len) };
-            unsafe { pack_rgba_to_rgb565(src, self.rgb_buf.as_mut_ptr(), w, h, row_pitch) };
-        }
-
-        drop(data);
+        decode_readback_into(&buffer, &mut self.rgb_buf, cap_w, cap_h, row_pitch, grayscale, alpha_mask);
         buffer.unmap();
 
         self.slots[idx].buffer = Some(buffer);
@@ -1281,18 +2087,127 @@ impl ScreenCaptureState {
         self.result_w = cap_w as u16;
         self.result_h = cap_h as u16;
         self.result_metadata = self.slots[idx].metadata.take();
-        log::info!(
-            target: "watchperf",
-            "[watchperf] egor_complete slot={} size={}x{} grayscale={} alpha={} row_pitch={} output_bytes={} complete_us={}",
-            idx,
-            cap_w,
-            cap_h,
-            grayscale,
-            alpha_mask,
-            row_pitch,
-            self.rgb_buf.len(),
-            complete_start.elapsed().as_micros(),
-        );
+        self.result_dirty_rects = self.slots[idx].dirty_rects.take();
+        self.result_frame_tag = self.slots[idx].frame_tag.take();
+        // log::info!(
+        //     target: "watchperf",
+        //     "[watchperf] egor_complete slot={} size={}x{} grayscale={} alpha={} row_pitch={} output_bytes={} complete_us={}",
+        //     idx,
+        //     cap_w,
+        //     cap_h,
+        //     grayscale,
+        //     alpha_mask,
+        //     row_pitch,
+        //     self.rgb_buf.len(),
+        //     complete_start.elapsed().as_micros(),
+        // );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn dispatch_slot_to_worker(&mut self, idx: usize) {
+        let job = {
+            let slot = &mut self.slots[idx];
+            let Some(buffer) = slot.buffer.take() else {
+                slot.pending = false;
+                return;
+            };
+
+            ReadbackJob {
+                slot_idx: idx,
+                buffer,
+                buf_size: slot.buf_size,
+                row_pitch: slot.row_pitch as usize,
+                cap_w: slot.cap_w,
+                cap_h: slot.cap_h,
+                grayscale: slot.grayscale,
+                alpha_mask: slot.alpha_mask,
+                metadata: slot.metadata.take(),
+                dirty_rects: slot.dirty_rects.take(),
+                frame_tag: slot.frame_tag.take(),
+            }
+        };
+
+        let worker = self.readback_worker.get_or_insert_with(ReadbackWorker::new);
+        match worker.jobs.send(job) {
+            Ok(()) => {
+                self.slots[idx].pending = false;
+            }
+            Err(err) => {
+                let job = err.0;
+                let complete_start = Instant::now();
+                let cap_w = job.cap_w;
+                let cap_h = job.cap_h;
+                let grayscale = job.grayscale;
+                let alpha_mask = job.alpha_mask;
+                let row_pitch = job.row_pitch;
+                let metadata = job.metadata;
+                decode_readback_into(&job.buffer, &mut self.rgb_buf, cap_w, cap_h, row_pitch, grayscale, alpha_mask);
+                job.buffer.unmap();
+                self.slots[idx].buffer = Some(job.buffer);
+                self.slots[idx].pending = false;
+                self.result_ready = true;
+                self.result_w = cap_w as u16;
+                self.result_h = cap_h as u16;
+                self.result_metadata = metadata;
+                self.result_dirty_rects = job.dirty_rects;
+                self.result_frame_tag = job.frame_tag;
+                // log::warn!(
+                //     target: "watchperf",
+                //     "[watchperf] egor_complete_worker_fallback slot={} size={}x{} grayscale={} alpha={} row_pitch={} output_bytes={} complete_us={}",
+                //     idx,
+                //     self.result_w,
+                //     self.result_h,
+                //     grayscale,
+                //     alpha_mask,
+                //     row_pitch,
+                //     self.rgb_buf.len(),
+                //     complete_start.elapsed().as_micros(),
+                // );
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn collect_worker_result(&mut self) {
+        if self.result_ready {
+            return;
+        }
+
+        let Some(worker) = self.readback_worker.as_ref() else {
+            return;
+        };
+        let Ok(result) = worker.results.try_recv() else {
+            return;
+        };
+
+        if let Some(slot) = self.slots.get_mut(result.slot_idx)
+            && !slot.pending
+            && slot.buffer.is_none()
+            && slot.buf_size == result.buf_size
+            && slot.row_pitch == result.row_pitch
+        {
+            slot.buffer = Some(result.buffer);
+        }
+
+        self.rgb_buf = result.rgb_buf;
+        self.result_ready = true;
+        self.result_w = result.cap_w as u16;
+        self.result_h = result.cap_h as u16;
+        self.result_metadata = result.metadata;
+        self.result_dirty_rects = result.dirty_rects;
+        self.result_frame_tag = result.frame_tag;
+        // log::info!(
+        //     target: "watchperf",
+        //     "[watchperf] egor_complete_worker slot={} size={}x{} grayscale={} alpha={} row_pitch={} output_bytes={} worker_complete_us={}",
+        //     result.slot_idx,
+        //     result.cap_w,
+        //     result.cap_h,
+        //     result.grayscale,
+        //     result.alpha_mask,
+        //     result.row_pitch,
+        //     self.rgb_buf.len(),
+        //     result.complete_us,
+        // );
     }
 
     /// Poll for a completed readback. Returns `Some((width, height))` when
@@ -1301,10 +2216,27 @@ impl ScreenCaptureState {
     /// Non-blocking: iterates ring-buffer slots oldest-first and consumes
     /// the first whose `map_async` callback has fired. Driven by the game
     /// loop's existing `device.poll(PollType::Poll)`.
-    pub fn try_complete(&mut self) -> Option<(u16, u16, Option<[f32; 10]>)> {
+    pub fn try_complete(
+        &mut self,
+    ) -> Option<(
+        u16,
+        u16,
+        Option<[f32; 10]>,
+        Option<WatchCaptureDirtyRects>,
+        Option<WatchCaptureFrameTag>,
+    )> {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.collect_worker_result();
+
         if self.result_ready {
             self.result_ready = false;
-            return Some((self.result_w, self.result_h, self.result_metadata.take()));
+            return Some((
+                self.result_w,
+                self.result_h,
+                self.result_metadata.take(),
+                self.result_dirty_rects.take(),
+                self.result_frame_tag.take(),
+            ));
         }
 
         // Iterate oldest → newest (write_idx is the next write position,
@@ -1324,10 +2256,35 @@ impl ScreenCaptureState {
                 continue;
             }
             // MAP_READY
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                self.dispatch_slot_to_worker(idx);
+                self.collect_worker_result();
+                if self.result_ready {
+                    self.result_ready = false;
+                    return Some((
+                        self.result_w,
+                        self.result_h,
+                        self.result_metadata.take(),
+                        self.result_dirty_rects.take(),
+                        self.result_frame_tag.take(),
+                    ));
+                }
+                continue;
+            }
+
+            #[cfg(target_arch = "wasm32")]
             self.complete_slot(idx);
+            #[cfg(target_arch = "wasm32")]
             if self.result_ready {
                 self.result_ready = false;
-                return Some((self.result_w, self.result_h, self.result_metadata.take()));
+                return Some((
+                    self.result_w,
+                    self.result_h,
+                    self.result_metadata.take(),
+                    self.result_dirty_rects.take(),
+                    self.result_frame_tag.take(),
+                ));
             }
         }
 
@@ -1553,7 +2510,8 @@ impl<'a> Graphics<'a> {
     #[inline(always)]
     pub fn push_sprite(&mut self, tex_id: usize, x: f32, y: f32, w: f32, h: f32, uvs: [f32; 4], color: [f32; 4]) {
         self.batch.push_instance(
-            egor_render::instance::Instance::new([w, 0.0, 0.0, h], [x + w * 0.5, y + h * 0.5, self.batch.draw_depth()], color, uvs),
+            egor_render::instance::Instance::new([w, 0.0, 0.0, h], [x + w * 0.5, y + h * 0.5, self.batch.draw_depth()], color, uvs)
+                .with_watch_overlay(self.batch.watch_overlay()),
             Some(tex_id),
             self.current_shader,
         );
@@ -1578,12 +2536,10 @@ impl<'a> Graphics<'a> {
     /// first whenever the texture changes.
     #[inline(always)]
     pub fn push_tile(&mut self, x: f32, y: f32, w: f32, h: f32, depth: f32, uvs: [f32; 4]) {
-        self.batch.push_instance_unchecked(egor_render::instance::Instance::new(
-            [w, 0.0, 0.0, h],
-            [x + w * 0.5, y + h * 0.5, depth],
-            [1.0, 1.0, 1.0, 1.0],
-            uvs,
-        ));
+        self.batch.push_instance_unchecked(
+            egor_render::instance::Instance::new([w, 0.0, 0.0, h], [x + w * 0.5, y + h * 0.5, depth], [1.0, 1.0, 1.0, 1.0], uvs)
+                .with_watch_overlay(self.batch.watch_overlay()),
+        );
     }
 
     /// Push a colored sprite instance into the current batch WITHOUT any
@@ -1591,12 +2547,10 @@ impl<'a> Graphics<'a> {
     /// first whenever the texture changes. Uses the current draw_depth.
     #[inline(always)]
     pub fn push_sprite_unchecked(&mut self, x: f32, y: f32, w: f32, h: f32, uvs: [f32; 4], color: [f32; 4]) {
-        self.batch.push_instance_unchecked(egor_render::instance::Instance::new(
-            [w, 0.0, 0.0, h],
-            [x + w * 0.5, y + h * 0.5, self.batch.draw_depth()],
-            color,
-            uvs,
-        ));
+        self.batch.push_instance_unchecked(
+            egor_render::instance::Instance::new([w, 0.0, 0.0, h], [x + w * 0.5, y + h * 0.5, self.batch.draw_depth()], color, uvs)
+                .with_watch_overlay(self.batch.watch_overlay()),
+        );
     }
 
     /// Push an outlined glyph through the default sprite pipeline. The UV rect
@@ -1613,13 +2567,16 @@ impl<'a> Graphics<'a> {
         color: [f32; 4],
         outline_color: [f32; 4],
     ) {
-        self.batch.push_instance_unchecked(egor_render::instance::Instance::new_outlined(
-            [w, 0.0, 0.0, h],
-            [x + w * 0.5, y + h * 0.5, self.batch.draw_depth()],
-            color,
-            uvs,
-            outline_color,
-        ));
+        self.batch.push_instance_unchecked(
+            egor_render::instance::Instance::new_outlined(
+                [w, 0.0, 0.0, h],
+                [x + w * 0.5, y + h * 0.5, self.batch.draw_depth()],
+                color,
+                uvs,
+                outline_color,
+            )
+            .with_watch_overlay(self.batch.watch_overlay()),
+        );
     }
     /// Start building an arbitrary polygon primitive, capable of triangles, circles, n-gons
     pub fn polygon(&mut self) -> PolygonBuilder<'_> {
@@ -1747,6 +2704,10 @@ impl<'a> Graphics<'a> {
         self.batch.set_replace_blend(replace_blend);
     }
 
+    pub fn set_watch_overlay(&mut self, watch_overlay: f32) {
+        self.batch.set_watch_overlay(watch_overlay);
+    }
+
     // -- managed render targets -----------------------------------------
 
     /// Create a managed offscreen render target and return its store index.
@@ -1795,6 +2756,31 @@ impl<'a> Graphics<'a> {
             .request_with_alpha_mask(w, h, grayscale, source_render_target, metadata);
     }
 
+    pub fn request_watch_frame_capture(
+        &mut self,
+        w: u32,
+        h: u32,
+        logical_w: u32,
+        logical_h: u32,
+        scale_factor: u32,
+        grayscale: bool,
+        metadata: Option<[f32; 10]>,
+        dirty_rects: Option<WatchCaptureDirtyRects>,
+        frame_tag: Option<WatchCaptureFrameTag>,
+    ) {
+        self.screen_capture.request_watch_overlay_capture(
+            w,
+            h,
+            logical_w,
+            logical_h,
+            scale_factor,
+            grayscale,
+            metadata,
+            dirty_rects,
+            frame_tag,
+        );
+    }
+
     pub fn composite_render_target_to_backbuffer(&mut self, source_render_target: usize) {
         self.screen_capture.request_composite_render_target(source_render_target);
     }
@@ -1804,8 +2790,16 @@ impl<'a> Graphics<'a> {
     }
 
     /// Poll for a completed screen capture result.
-    /// Returns `Some((width, height, metadata))` when pixel data is available.
-    pub fn poll_screen_capture(&mut self) -> Option<(u16, u16, Option<[f32; 10]>)> {
+    /// Returns `Some((width, height, metadata, dirty_rects, frame_tag))` when pixel data is available.
+    pub fn poll_screen_capture(
+        &mut self,
+    ) -> Option<(
+        u16,
+        u16,
+        Option<[f32; 10]>,
+        Option<WatchCaptureDirtyRects>,
+        Option<WatchCaptureFrameTag>,
+    )> {
         self.screen_capture.try_complete()
     }
 

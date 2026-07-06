@@ -1,6 +1,6 @@
 use wgpu::{BufferAddress, VertexAttribute, VertexBufferLayout, VertexFormat, VertexStepMode};
 
-/// Per-instance data for 2D instanced drawing (76 bytes)
+/// Per-instance data for 2D instanced drawing (80 bytes)
 ///
 /// Uses a compact 2D affine representation instead of a full `mat4x4`:
 /// - `affine`: column-major 2×2 rotation+scale matrix `[col0.x, col0.y, col1.x, col1.y]`
@@ -15,6 +15,9 @@ pub struct Instance {
     /// Transparent for normal sprites. Non-zero alpha enables the built-in
     /// single-pass font outline path in the default sprite shader.
     pub outline_color: [f32; 4],
+    /// Multiplies the alpha written to the optional watch-mode overlay target.
+    /// `0.0` means server-owned/background, `1.0` means dynamic/client-owned.
+    pub watch_overlay: f32,
 }
 
 impl Instance {
@@ -25,23 +28,24 @@ impl Instance {
             color,
             uv,
             outline_color: [0.0; 4],
+            watch_overlay: 1.0,
         }
     }
 
-    pub fn new_outlined(
-        affine: [f32; 4],
-        translate: [f32; 3],
-        color: [f32; 4],
-        uv: [f32; 4],
-        outline_color: [f32; 4],
-    ) -> Self {
+    pub fn new_outlined(affine: [f32; 4], translate: [f32; 3], color: [f32; 4], uv: [f32; 4], outline_color: [f32; 4]) -> Self {
         Self {
             affine,
             translate,
             color,
             uv,
             outline_color,
+            watch_overlay: 1.0,
         }
+    }
+
+    pub fn with_watch_overlay(mut self, watch_overlay: f32) -> Self {
+        self.watch_overlay = watch_overlay;
+        self
     }
 
     pub(crate) fn desc() -> VertexBufferLayout<'static> {
@@ -80,6 +84,12 @@ impl Instance {
                     shader_location: 7,
                     format: VertexFormat::Float32x4,
                 },
+                // watch overlay factor
+                VertexAttribute {
+                    offset: 76,
+                    shader_location: 8,
+                    format: VertexFormat::Float32,
+                },
             ],
         }
     }
@@ -91,6 +101,7 @@ impl Instance {
             color: [1.0; 4],
             uv: [0.0, 0.0, 1.0, 1.0],
             outline_color: [0.0; 4],
+            watch_overlay: 1.0,
         }
     }
 }
