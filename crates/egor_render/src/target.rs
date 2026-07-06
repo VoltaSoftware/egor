@@ -12,6 +12,21 @@ use wasm_bindgen::JsCast;
 
 use crate::frame::Presentable;
 
+#[cfg(target_os = "android")]
+const DESIRED_MAXIMUM_FRAME_LATENCY: u32 = 1;
+#[cfg(not(target_os = "android"))]
+const DESIRED_MAXIMUM_FRAME_LATENCY: u32 = 2;
+
+#[cfg(target_os = "android")]
+fn vsync_present_mode() -> PresentMode {
+    PresentMode::AutoVsync
+}
+
+#[cfg(not(target_os = "android"))]
+fn vsync_present_mode() -> PresentMode {
+    PresentMode::Fifo
+}
+
 #[derive(Debug)]
 pub enum BackbufferError {
     ZeroSize { width: u32, height: u32 },
@@ -79,8 +94,8 @@ fn android_gl_fallback_surface_config(w: u32, h: u32) -> Result<(SurfaceConfigur
         format,
         width: w,
         height: h,
-        present_mode: PresentMode::Fifo,
-        desired_maximum_frame_latency: 2,
+        present_mode: vsync_present_mode(),
+        desired_maximum_frame_latency: DESIRED_MAXIMUM_FRAME_LATENCY,
         alpha_mode: CompositeAlphaMode::Auto,
         view_formats: Vec::new(),
     };
@@ -111,8 +126,18 @@ pub(crate) fn surface_config(
     let mut config = surface
         .get_default_config(adapter, w, h)
         .ok_or(BackbufferError::UnsupportedSurface { width: w, height: h })?;
-    config.present_mode = PresentMode::Fifo;
+    config.present_mode = vsync_present_mode();
+    config.desired_maximum_frame_latency = DESIRED_MAXIMUM_FRAME_LATENCY;
+    log::info!(
+        "[egor] surface capabilities: present_modes={:?} usages={:?} formats={:?}",
+        caps.present_modes,
+        caps.usages,
+        caps.formats
+    );
 
+    #[cfg(target_os = "android")]
+    let surface_copy_src = false;
+    #[cfg(not(target_os = "android"))]
     let surface_copy_src = caps.usages.contains(TextureUsages::COPY_SRC);
     if surface_copy_src {
         config.usage |= TextureUsages::COPY_SRC;
@@ -215,9 +240,12 @@ impl Backbuffer {
         log::info!("[egor] backbuffer init: building surface config");
         let (config, view_format, surface_copy_src) = surface_config_with_android_gl_fallback(&surface, adapter, w, h)?;
         log::info!(
-            "[egor] backbuffer init: configuring surface format={:?} view_format={:?} copy_src={}",
+            "[egor] backbuffer init: configuring surface format={:?} view_format={:?} present_mode={:?} frame_latency={} usage={:?} copy_src={}",
             config.format,
             view_format,
+            config.present_mode,
+            config.desired_maximum_frame_latency,
+            config.usage,
             surface_copy_src
         );
         Self::configure_surface(&surface, device, &config)?;
@@ -375,11 +403,16 @@ impl RenderTarget for Backbuffer {
     }
 
     fn set_vsync(&mut self, device: &Device, on: bool) {
-        let present_mode = if on { PresentMode::Fifo } else { PresentMode::AutoNoVsync };
+        let present_mode = if on { vsync_present_mode() } else { PresentMode::AutoNoVsync };
         if self.config.present_mode == present_mode {
             return;
         }
         self.config.present_mode = present_mode;
+        log::info!(
+            "[egor] surface vsync change: enabled={} present_mode={:?}",
+            on,
+            self.config.present_mode
+        );
         if let Err(error) = self.reconfigure(device) {
             log::warn!("[egor] surface vsync configure failed: {error:?}");
         }

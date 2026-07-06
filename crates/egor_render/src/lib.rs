@@ -617,6 +617,12 @@ impl Renderer {
         self.begin_render_pass_with_depth(encoder, view, &self.depth_view, true)
     }
 
+    /// Begins a one-pass render pass and discards depth after drawing.
+    /// Use this when no later pass needs to load the depth buffer.
+    pub fn begin_render_pass_discard_depth<'a>(&'a self, encoder: &'a mut CommandEncoder, view: &'a TextureView) -> RenderPass<'a> {
+        self.begin_render_pass_with_depth_clear_color_and_store(encoder, view, &self.depth_view, self.clear_color, true, StoreOp::Discard)
+    }
+
     /// Begins a render pass that preserves existing content (LoadOp::Load).
     /// Used when splitting a frame into multiple passes (e.g. camera changes).
     pub fn begin_render_pass_load<'a>(&'a self, encoder: &'a mut CommandEncoder, view: &'a TextureView) -> RenderPass<'a> {
@@ -647,6 +653,18 @@ impl Renderer {
         clear_color: wgpu::Color,
         clear_depth: bool,
     ) -> RenderPass<'a> {
+        self.begin_render_pass_with_depth_clear_color_and_store(encoder, view, depth_view, clear_color, clear_depth, StoreOp::Store)
+    }
+
+    fn begin_render_pass_with_depth_clear_color_and_store<'a>(
+        &'a self,
+        encoder: &'a mut CommandEncoder,
+        view: &'a TextureView,
+        depth_view: &'a TextureView,
+        clear_color: wgpu::Color,
+        clear_depth: bool,
+        depth_store: StoreOp,
+    ) -> RenderPass<'a> {
         encoder.begin_render_pass(&RenderPassDescriptor {
             color_attachments: &[Some(RenderPassColorAttachment {
                 view,
@@ -661,7 +679,7 @@ impl Renderer {
                 view: depth_view,
                 depth_ops: Some(Operations {
                     load: if clear_depth { LoadOp::Clear(1.0) } else { LoadOp::Load },
-                    store: StoreOp::Store,
+                    store: depth_store,
                 }),
                 stencil_ops: None,
             }),
