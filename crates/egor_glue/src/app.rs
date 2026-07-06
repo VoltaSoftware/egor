@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use web_time::Duration;
+use web_time::{Duration, Instant};
 
 use crate::{
     graphics::{Graphics, RenderTargetStore, ScreenCaptureState},
@@ -370,6 +370,32 @@ pub struct FrameContext<'a> {
 pub struct FrameStats {
     /// GPU draw calls emitted by egor's main renderer in the previous frame.
     pub draw_calls: u32,
+    /// Full egor frame time, including the user callback and egor render/present work.
+    pub egor_frame_time: Duration,
+    /// Time spent in the user update callback.
+    pub user_callback_time: Duration,
+    /// Egor work between the user callback and surface acquisition.
+    pub prep_time: Duration,
+    /// Time spent acquiring the current surface texture.
+    pub surface_acquire_time: Duration,
+    /// Time spent encoding draw calls into render passes.
+    pub render_pass_time: Duration,
+    /// Time spent encoding optional screen capture work.
+    pub screen_capture_time: Duration,
+    /// Time spent finishing the command encoder.
+    pub finish_encoder_time: Duration,
+    /// Time spent submitting command buffers to the GPU queue.
+    pub queue_submit_time: Duration,
+    /// Time spent presenting the backbuffer.
+    pub present_time: Duration,
+    /// Time spent after present handling readback/resizes/pacing changes.
+    pub post_present_time: Duration,
+}
+
+impl FrameStats {
+    pub fn egor_outside_callback_time(self) -> Duration {
+        self.egor_frame_time.saturating_sub(self.user_callback_time)
+    }
 }
 
 pub struct App {
@@ -643,6 +669,11 @@ impl App {
         }
     }
 
+    fn finish_frame_stats(&mut self, mut frame_stats: FrameStats, frame_started_at: Instant) {
+        frame_stats.egor_frame_time = frame_started_at.elapsed();
+        self.last_frame_stats = frame_stats;
+    }
+
     fn recreate_backbuffer(&mut self, renderer: &mut Renderer) -> bool {
         if self.waiting_for_surface_change {
             return false;
@@ -892,6 +923,9 @@ impl AppHandler<Renderer> for App {
     }
 
     fn frame(&mut self, _window: &Window, renderer: &mut Renderer, input: &mut Input, timer: &FrameTimer) {
+        let egor_frame_started_at = Instant::now();
+        let mut frame_stats = FrameStats::default();
+
         profile_new_frame!();
         #[cfg(feature = "profiling")]
         profiling::scope!("frame");
@@ -899,6 +933,7 @@ impl AppHandler<Renderer> for App {
         self.frame_timer_reset_requested = false;
 
         if self.update.is_none() {
+            self.finish_frame_stats(frame_stats, egor_frame_started_at);
             return;
         }
 
@@ -906,12 +941,14 @@ impl AppHandler<Renderer> for App {
             self.frame_timer_reset_requested = true;
             self.backbuffer = None;
             self.surface_acquire_retry_interval = None;
+            self.finish_frame_stats(frame_stats, egor_frame_started_at);
             return;
         }
 
         if self.surface_occluded {
             self.frame_timer_reset_requested = true;
             self.surface_acquire_retry_interval = Some(surface_wait_retry_interval());
+            self.finish_frame_stats(frame_stats, egor_frame_started_at);
             return;
         }
 
@@ -920,6 +957,7 @@ impl AppHandler<Renderer> for App {
             self.backbuffer = None;
             self.surface_recovery.record_surface_failure(SurfaceFailure::ZeroSizedSurface);
             self.surface_acquire_retry_interval = Some(surface_wait_retry_interval());
+            self.finish_frame_stats(frame_stats, egor_frame_started_at);
             return;
         }
 
@@ -933,11 +971,13 @@ impl AppHandler<Renderer> for App {
                     self.frame_timer_reset_requested = true;
                     self.backbuffer = None;
                     self.surface_acquire_retry_interval = Some(Duration::from_millis(1000));
+                    self.finish_frame_stats(frame_stats, egor_frame_started_at);
                     return;
                 }
                 DeviceLossAction::RecreateRenderer => {
                     self.frame_timer_reset_requested = true;
                     self.request_renderer_recreation("wgpu device lost");
+                    self.finish_frame_stats(frame_stats, egor_frame_started_at);
                     return;
                 }
             }
@@ -955,12 +995,14 @@ impl AppHandler<Renderer> for App {
             self.frame_timer_reset_requested = true;
             self.surface_recovery.record_surface_failure(SurfaceFailure::ZeroSizedSurface);
             self.surface_acquire_retry_interval = Some(surface_wait_retry_interval());
+            self.finish_frame_stats(frame_stats, egor_frame_started_at);
             return;
         }
 
         if self.backbuffer.is_none() && self.waiting_for_surface_change {
             self.frame_timer_reset_requested = true;
             self.surface_acquire_retry_interval = Some(surface_wait_retry_interval());
+            self.finish_frame_stats(frame_stats, egor_frame_started_at);
             return;
         }
 
@@ -987,11 +1029,13 @@ impl AppHandler<Renderer> for App {
                     ));
                 }
             }
+            self.finish_frame_stats(frame_stats, egor_frame_started_at);
             return;
         }
 
         let Some(backbuffer) = &mut self.backbuffer else {
             self.frame_timer_reset_requested = true;
+            self.finish_frame_stats(frame_stats, egor_frame_started_at);
             return;
         };
 
@@ -1037,9 +1081,11 @@ impl AppHandler<Renderer> for App {
             {
                 #[cfg(feature = "profiling")]
                 profiling::scope!("user_callback");
+                let user_callback_started_at = Instant::now();
                 let update_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     update(&mut ctx);
                 }));
+                frame_stats.user_callback_time = user_callback_started_at.elapsed();
                 if let Err(payload) = update_result {
                     let panic_message = payload
                         .downcast_ref::<&str>()
@@ -1052,6 +1098,7 @@ impl AppHandler<Renderer> for App {
                         log::error!("[egor] user frame callback panicked after GPU device loss: {panic_message:?}");
                         self.gpu_device_recreated_pending_frame = false;
                         self.request_renderer_recreation("user callback panicked after device loss");
+                        self.finish_frame_stats(frame_stats, egor_frame_started_at);
                         return;
                     }
                     std::panic::resume_unwind(payload);
@@ -1079,6 +1126,8 @@ impl AppHandler<Renderer> for App {
                 requested_native_refresh_rate_fps,
             )
         };
+
+        let prep_started_at = Instant::now();
 
         if let Some(native_refresh_rate_fps) = requested_native_refresh_rate_fps {
             self.native_refresh_rate_fps = native_refresh_rate_fps;
@@ -1193,15 +1242,21 @@ impl AppHandler<Renderer> for App {
             None
         };
 
+        frame_stats.prep_time = prep_started_at.elapsed();
+
+        let surface_acquire_started_at = Instant::now();
         let frame_result = match renderer.try_begin_frame(backbuffer) {
             Ok(frame_result) => frame_result,
             Err(error) => {
+                frame_stats.surface_acquire_time = surface_acquire_started_at.elapsed();
                 log::error!("[egor] begin frame failed: {error:?}");
                 self.primitive_batch.recycle(batches);
                 self.request_renderer_recreation("begin frame failed");
+                self.finish_frame_stats(frame_stats, egor_frame_started_at);
                 return;
             }
         };
+        frame_stats.surface_acquire_time = surface_acquire_started_at.elapsed();
 
         let Some(mut frame) = frame_result else {
             let acquire_failure = backbuffer.last_acquire_failure();
@@ -1232,6 +1287,7 @@ impl AppHandler<Renderer> for App {
                 }
                 SurfaceRecoveryAction::SkipFrame | SurfaceRecoveryAction::WaitForResize => {}
             }
+            self.finish_frame_stats(frame_stats, egor_frame_started_at);
             return;
         };
         self.surface_recovery.record_frame_acquired();
@@ -1249,8 +1305,8 @@ impl AppHandler<Renderer> for App {
             .unwrap_or(&frame.view);
         let main_depth_view = watch_frame_target.map(|target| &target.depth_view).unwrap_or(renderer.depth_view());
         let watch_overlay_view = watch_frame_target.map(|target| &target.overlay_view);
-        let mut frame_stats = FrameStats::default();
 
+        let render_pass_started_at = Instant::now();
         {
             #[cfg(feature = "profiling")]
             profiling::scope!("render_pass");
@@ -1428,7 +1484,7 @@ impl AppHandler<Renderer> for App {
                             true,
                         )
                     } else {
-                        renderer.begin_render_pass(&mut frame.encoder, main_view)
+                        renderer.begin_render_pass_discard_depth(&mut frame.encoder, main_view)
                     };
                     if has_text {
                         text_renderer.prepare(&device, &queue, w, h, None);
@@ -1450,7 +1506,7 @@ impl AppHandler<Renderer> for App {
                             true,
                         )
                     } else {
-                        renderer.begin_render_pass(&mut frame.encoder, main_view)
+                        renderer.begin_render_pass_discard_depth(&mut frame.encoder, main_view)
                     };
 
                     if let Some(first) = batches.first() {
@@ -1535,8 +1591,9 @@ impl AppHandler<Renderer> for App {
             // Recycle batch GPU buffers for reuse next frame.
             self.primitive_batch.recycle(batches);
         } // profile_scope render_pass
-        self.last_frame_stats = frame_stats;
+        frame_stats.render_pass_time = render_pass_started_at.elapsed();
 
+        let screen_capture_started_at = Instant::now();
         if let Some(source_rt_id) = self.screen_capture.take_composite_render_target() {
             #[cfg(feature = "profiling")]
             profiling::scope!("watch_composite");
@@ -1584,31 +1641,47 @@ impl AppHandler<Renderer> for App {
                 }
             }
         }
+        frame_stats.screen_capture_time = screen_capture_started_at.elapsed();
 
         {
             #[cfg(feature = "profiling")]
             profiling::scope!("submit_present");
+            let finish_encoder_started_at = Instant::now();
             let (commands, presentable) = match renderer.try_finish_encoder(frame) {
                 Ok(result) => result,
                 Err(error) => {
+                    frame_stats.finish_encoder_time = finish_encoder_started_at.elapsed();
                     log::error!("[egor] finish encoder failed: {error:?}");
                     self.request_renderer_recreation("finish encoder failed");
+                    self.finish_frame_stats(frame_stats, egor_frame_started_at);
                     return;
                 }
             };
+            frame_stats.finish_encoder_time = finish_encoder_started_at.elapsed();
+
+            let queue_submit_started_at = Instant::now();
             if let Err(error) = renderer.try_submit_commands(commands) {
+                frame_stats.queue_submit_time = queue_submit_started_at.elapsed();
                 log::error!("[egor] queue submit failed: {error:?}");
                 self.request_renderer_recreation("queue submit failed");
+                self.finish_frame_stats(frame_stats, egor_frame_started_at);
                 return;
             }
+            frame_stats.queue_submit_time = queue_submit_started_at.elapsed();
             if let Some(p) = presentable {
+                let present_started_at = Instant::now();
                 if let Err(error) = renderer.try_present(p) {
+                    frame_stats.present_time = present_started_at.elapsed();
                     log::error!("[egor] present failed: {error:?}");
                     self.request_renderer_recreation("present failed");
+                    self.finish_frame_stats(frame_stats, egor_frame_started_at);
                     return;
                 }
+                frame_stats.present_time = present_started_at.elapsed();
             }
         } // profile_scope submit_present
+
+        let post_present_started_at = Instant::now();
 
         // Start the async map AFTER submit so the staging buffer isn't
         // in a pending-map state when the command buffer is submitted.
@@ -1629,6 +1702,8 @@ impl AppHandler<Renderer> for App {
                 backbuffer.set_vsync(&device, hardware_vsync_enabled(self.vsync, self.fps_limit));
             }
         }
+        frame_stats.post_present_time = post_present_started_at.elapsed();
+        self.finish_frame_stats(frame_stats, egor_frame_started_at);
     }
 
     fn resize(&mut self, w: u32, h: u32, renderer: &mut Renderer) {
