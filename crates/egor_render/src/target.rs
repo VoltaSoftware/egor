@@ -128,12 +128,14 @@ pub(crate) fn surface_config(
         .ok_or(BackbufferError::UnsupportedSurface { width: w, height: h })?;
     config.present_mode = vsync_present_mode();
     config.desired_maximum_frame_latency = DESIRED_MAXIMUM_FRAME_LATENCY;
-    log::info!(
-        "[egor] surface capabilities: present_modes={:?} usages={:?} formats={:?}",
-        caps.present_modes,
-        caps.usages,
-        caps.formats
-    );
+    if cfg!(debug_assertions) {
+        log::info!(
+            "[egor] surface capabilities: present_modes={:?} usages={:?} formats={:?}",
+            caps.present_modes,
+            caps.usages,
+            caps.formats
+        );
+    }
 
     #[cfg(target_os = "android")]
     let surface_copy_src = false;
@@ -239,15 +241,17 @@ impl Backbuffer {
     ) -> Result<Self, BackbufferError> {
         log::info!("[egor] backbuffer init: building surface config");
         let (config, view_format, surface_copy_src) = surface_config_with_android_gl_fallback(&surface, adapter, w, h)?;
-        log::info!(
-            "[egor] backbuffer init: configuring surface format={:?} view_format={:?} present_mode={:?} frame_latency={} usage={:?} copy_src={}",
-            config.format,
-            view_format,
-            config.present_mode,
-            config.desired_maximum_frame_latency,
-            config.usage,
-            surface_copy_src
-        );
+        if cfg!(debug_assertions) {
+            log::info!(
+                "[egor] backbuffer init: configuring surface format={:?} view_format={:?} present_mode={:?} frame_latency={} usage={:?} copy_src={}",
+                config.format,
+                view_format,
+                config.present_mode,
+                config.desired_maximum_frame_latency,
+                config.usage,
+                surface_copy_src
+            );
+        }
         Self::configure_surface(&surface, device, &config)?;
         log::info!("[egor] backbuffer init: complete");
         Ok(Self {
@@ -408,11 +412,13 @@ impl RenderTarget for Backbuffer {
             return;
         }
         self.config.present_mode = present_mode;
-        log::info!(
-            "[egor] surface vsync change: enabled={} present_mode={:?}",
-            on,
-            self.config.present_mode
-        );
+        if cfg!(debug_assertions) {
+            log::info!(
+                "[egor] surface vsync change: enabled={} present_mode={:?}",
+                on,
+                self.config.present_mode
+            );
+        }
         if let Err(error) = self.reconfigure(device) {
             log::warn!("[egor] surface vsync configure failed: {error:?}");
         }
