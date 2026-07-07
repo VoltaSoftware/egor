@@ -23,6 +23,12 @@ pub enum TextInputEvent {
     ImeDisabled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TouchSource {
+    RealTouch,
+    MouseSimulated,
+}
+
 pub struct Input {
     keyboard: HashMap<KeyCode, (ElementState, ElementState)>, // (current, previous) state
     mouse_buttons: HashMap<MouseButton, (ElementState, ElementState)>,
@@ -30,6 +36,7 @@ pub struct Input {
     mouse_delta: (f32, f32),
     mouse_wheel_delta: f32,
     touches: Vec<Touch>,
+    touch_sources: HashMap<u64, TouchSource>,
     text_events: Vec<TextInputEvent>,
     simulate_touch_with_mouse: bool,
     simulate_mouse_with_touch: bool,
@@ -49,6 +56,7 @@ impl Default for Input {
             mouse_delta: (0.0, 0.0),
             mouse_wheel_delta: 0.0,
             touches: Vec::new(),
+            touch_sources: HashMap::default(),
             text_events: Vec::new(),
             simulate_touch_with_mouse: false,
             simulate_mouse_with_touch: false,
@@ -81,6 +89,10 @@ impl Input {
     /// Returns whether mouse-from-touch simulation is enabled
     pub fn simulate_mouse_with_touch(&self) -> bool {
         self.simulate_mouse_with_touch
+    }
+
+    pub fn touch_source(&self, id: u64) -> TouchSource {
+        self.touch_sources.get(&id).copied().unwrap_or(TouchSource::RealTouch)
     }
 
     /// Update keyboard state from a `winit` KeyEvent
@@ -165,6 +177,7 @@ impl Input {
         };
 
         self.touches.push(logical_touch);
+        self.touch_sources.insert(id, TouchSource::RealTouch);
 
         if self.simulate_mouse_with_touch {
             match phase {
@@ -210,6 +223,7 @@ impl Input {
             force: None,
         };
         self.touches.push(touch);
+        self.touch_sources.insert(0, TouchSource::MouseSimulated);
     }
 
     /// Simulate a touch move from mouse cursor movement (called internally when simulation is enabled)
@@ -227,6 +241,7 @@ impl Input {
                 force: None,
             };
             self.touches.push(touch);
+            self.touch_sources.insert(0, TouchSource::MouseSimulated);
         }
     }
 
@@ -251,6 +266,7 @@ impl Input {
         for touch in self.touches.iter() {
             if matches!(touch.phase, TouchPhase::Ended | TouchPhase::Cancelled) {
                 map.remove(&touch.id);
+                self.touch_sources.remove(&touch.id);
                 continue;
             }
             map.insert(touch.id, *touch);
@@ -280,6 +296,7 @@ impl Input {
         self.mouse_delta = (0.0, 0.0);
         self.mouse_wheel_delta = 0.0;
         self.touches.clear();
+        self.touch_sources.clear();
         self.primary_touch_id = None;
     }
 
@@ -523,6 +540,31 @@ mod tests {
         assert!(!input.key_released(KeyCode::KeyA));
         assert!(!input.mouse_released(MouseButton::Left));
         assert!(input.touches().is_empty());
+    }
+
+    #[test]
+    fn real_touches_are_marked_real_touch() {
+        let mut input = Input::default();
+        input.update_touch(Touch {
+            device_id: DeviceId::dummy(),
+            id: 11,
+            phase: TouchPhase::Started,
+            location: PhysicalPosition::new(10.0, 20.0),
+            force: None,
+        });
+
+        assert_eq!(input.touch_source(11), TouchSource::RealTouch);
+    }
+
+    #[test]
+    fn mouse_simulated_touches_are_marked_mouse_simulated() {
+        let mut input = Input::default();
+        input.set_simulate_touch_with_mouse(true);
+        input.inject_cursor(10.0, 20.0);
+
+        input.simulate_touch_from_mouse(MouseButton::Left, Pressed);
+
+        assert_eq!(input.touch_source(0), TouchSource::MouseSimulated);
     }
 
     #[test]
