@@ -23,13 +23,39 @@ pub use winit::{
 pub use winit::platform::ios::WindowExtIOS;
 
 #[cfg(target_os = "android")]
-use std::sync::OnceLock;
+use parking_lot::{RwLock, const_rwlock};
 #[cfg(target_os = "android")]
 pub use winit::platform::android::activity::AndroidApp;
 #[cfg(target_os = "android")]
 pub use winit::platform::android::activity::AndroidAppWaker;
 #[cfg(target_os = "android")]
-pub static ANDROID_APP: OnceLock<AndroidApp> = OnceLock::new();
+// GameActivity can recreate the Activity and call android_main again without
+// restarting the process, so this must accept replacement apps.
+pub static ANDROID_APP: AndroidAppStore = AndroidAppStore::new();
+
+#[cfg(target_os = "android")]
+pub struct AndroidAppStore {
+    app: RwLock<Option<AndroidApp>>,
+}
+
+#[cfg(target_os = "android")]
+impl AndroidAppStore {
+    pub const fn new() -> Self {
+        Self { app: const_rwlock(None) }
+    }
+
+    pub fn set(&self, app: AndroidApp) {
+        *self.app.write() = Some(app);
+    }
+
+    pub fn with<R>(&self, f: impl FnOnce(&AndroidApp) -> R) -> Option<R> {
+        self.app.read().as_ref().map(f)
+    }
+
+    pub fn cloned(&self) -> Option<AndroidApp> {
+        self.app.read().clone()
+    }
+}
 
 use winit::{
     application::ApplicationHandler,
@@ -536,7 +562,7 @@ impl<R, H: AppHandler<R> + 'static> AppRunner<R, H> {
             android_logger::init_once(android_logger::Config::default().with_max_level(log::LevelFilter::Info));
 
             use winit::platform::android::EventLoopBuilderExtAndroid;
-            let android_app = ANDROID_APP.get().unwrap().clone();
+            let android_app = ANDROID_APP.cloned().unwrap();
             event_loop_builder.with_android_app(android_app);
         }
 
