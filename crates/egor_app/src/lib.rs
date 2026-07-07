@@ -257,7 +257,9 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         if let Some(handler) = &mut self.handler {
-            handler.on_window_event(self.window.as_ref().unwrap(), &event);
+            if let Some(window) = &self.window {
+                handler.on_window_event(window, &event);
+            }
         }
 
         match event {
