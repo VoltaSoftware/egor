@@ -76,13 +76,16 @@ fn set_native_preferred_fps(window: &Window, fps: u16) {
 fn set_native_preferred_fps(_window: &Window, _fps: u16) {}
 
 #[cfg(target_os = "ios")]
-fn clear_native_preferred_fps(window: &Window) {
-    window.set_preferred_frames_per_second(0);
-    window.set_native_display_link_enabled(true);
+fn clear_native_preferred_fps(window: &Window, native_refresh_rate_fps: Option<u16>) {
+    // MTKView treats preferredFramesPerSecond as an actual rate, not as an
+    // optional limit. Restore the display's maximum rate explicitly: passing
+    // zero through winit is clamped to 1 FPS and leaves the app stuck there.
+    let native_fps = refresh_rate_fps(window, native_refresh_rate_fps).unwrap_or(60);
+    set_native_preferred_fps(window, native_fps);
 }
 
 #[cfg(not(target_os = "ios"))]
-fn clear_native_preferred_fps(_window: &Window) {}
+fn clear_native_preferred_fps(_window: &Window, _native_refresh_rate_fps: Option<u16>) {}
 
 #[cfg(target_os = "ios")]
 fn set_native_redraw_enabled(window: &Window, enabled: bool) {
@@ -1145,7 +1148,7 @@ impl AppHandler<Renderer> for App {
                 }
                 None => {
                     if self.fps_limit.is_some() {
-                        clear_native_preferred_fps(_window);
+                        clear_native_preferred_fps(_window, self.native_refresh_rate_fps);
                         fps_limit_changed = true;
                     }
                     self.fps_limit = None;
