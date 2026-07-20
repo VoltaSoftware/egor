@@ -256,7 +256,11 @@ impl Textures {
             ],
         });
 
-        let default_sampler = device.create_sampler(&Default::default());
+        let default_sampler = device.create_sampler(&SamplerDescriptor {
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            ..Default::default()
+        });
 
         let nearest_sampler = device.create_sampler(&SamplerDescriptor {
             mag_filter: FilterMode::Nearest,
