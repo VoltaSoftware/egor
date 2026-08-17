@@ -1,16 +1,30 @@
 use egor_render::{Device, Queue, RenderPass, TextureFormat};
 use glam::Vec2;
 use glyphon::{
-    Attrs, Buffer, Cache, Color as GlyphonColor, Family, FontSystem, Metrics, Resolution, Shaping, Style, SwashCache, TextArea, TextAtlas,
-    TextBounds, TextRenderer as GlyphonRenderer, Viewport, Weight,
+    Attrs, Buffer, Cache, Color as GlyphonColor, Family, FontSystem, Metrics, Resolution, Shaping,
+    Style, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer as GlyphonRenderer, Viewport,
+    Weight, Wrap, fontdb,
 };
 
 use crate::{color::Color, math::Rect};
 
+use std::ops::Range;
+
 struct TextEntry {
     buffer: Buffer,
+    effect_buffer: Option<Buffer>,
     position: Vec2,
+    bounds: Option<Rect>,
+    color: GlyphonColor,
+    effect: TextEffect,
     render_target: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+enum TextEffect {
+    None,
+    Shadow { offset: Vec2, color: GlyphonColor },
+    Outline { radius: f32, color: GlyphonColor },
 }
 
 pub struct TextRenderer {
@@ -27,11 +41,7 @@ const MAX_POOLED_BUFFERS: usize = 64;
 
 impl TextRenderer {
     pub(crate) fn new(device: &Device, queue: &Queue, format: TextureFormat) -> Self {
-        let mut font_system = FontSystem::new();
-        // Glyphon will use sytstem font but we embed one for wasm + consistency
-        font_system
-            .db_mut()
-            .load_font_data(include_bytes!("../inter-v19-latin-regular.ttf").to_vec());
+        let font_system = new_font_system("en");
         let swash_cache = SwashCache::new();
         let cache = Cache::new(device);
         let viewport = Viewport::new(device, &cache);
@@ -50,10 +60,24 @@ impl TextRenderer {
     }
 
     pub fn load_font_bytes(&mut self, bytes: &[u8]) -> Option<String> {
+        let previous_face_count = self.font_system.db().faces().count();
         self.font_system.db_mut().load_font_data(bytes.to_vec());
-        let face = self.font_system.db().faces().last()?;
+        let face = self.font_system.db().faces().nth(previous_face_count)?;
         let family = face.families.first()?.0.clone();
         Some(family)
+    }
+
+    /// Select the locale used by cosmic-text's script-aware font fallback.
+    /// Loaded font data is retained; only shaping and fallback caches are rebuilt.
+    pub fn set_locale(&mut self, locale: &str) {
+        if self.font_system.locale() == locale {
+            return;
+        }
+
+        let mut database = fontdb::Database::new();
+        std::mem::swap(self.font_system.db_mut(), &mut database);
+        self.font_system = FontSystem::new_with_locale_and_db(locale.to_owned(), database);
+        self.buffer_pool.clear();
     }
 
     /// Returns true if any text was queued this frame.
@@ -63,26 +87,81 @@ impl TextRenderer {
 
     /// Prepare the text renderer for drawing.
     /// Skipping this when `has_entries()` is false avoids glyphon overhead.
-    pub(crate) fn prepare(&mut self, device: &Device, queue: &Queue, width: u32, height: u32, render_target: Option<usize>) {
+    pub(crate) fn prepare(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        width: u32,
+        height: u32,
+        render_target: Option<usize>,
+    ) {
         self.viewport.update(queue, Resolution { width, height });
-        let text_areas: Vec<TextArea> = self
+        let mut text_areas = Vec::with_capacity(self.entries.len());
+        for entry in self
             .entries
             .iter()
             .filter(|entry| entry.render_target == render_target)
-            .map(|entry| TextArea {
-                buffer: &entry.buffer,
-                left: entry.position.x,
-                top: entry.position.y,
-                bounds: TextBounds {
+        {
+            let bounds = entry.bounds.map_or(
+                TextBounds {
+                    left: 0,
+                    top: 0,
                     right: width as i32,
                     bottom: height as i32,
-                    ..Default::default()
                 },
-                scale: 1.0,
-                default_color: GlyphonColor::rgb(255, 255, 255),
-                custom_glyphs: &[],
-            })
-            .collect();
+                |bounds| TextBounds {
+                    left: bounds.position.x.floor() as i32,
+                    top: bounds.position.y.floor() as i32,
+                    right: (bounds.position.x + bounds.size.x).ceil() as i32,
+                    bottom: (bounds.position.y + bounds.size.y).ceil() as i32,
+                },
+            );
+
+            macro_rules! push_area {
+                ($buffer:expr, $position:expr, $color:expr) => {{
+                    let position = $position;
+                    text_areas.push(TextArea {
+                        buffer: $buffer,
+                        left: position.x,
+                        top: position.y,
+                        bounds,
+                        scale: 1.0,
+                        default_color: $color,
+                        custom_glyphs: &[],
+                    });
+                }};
+            }
+
+            match entry.effect {
+                TextEffect::None => {}
+                TextEffect::Shadow { offset, color } => {
+                    push_area!(
+                        entry.effect_buffer.as_ref().unwrap_or(&entry.buffer),
+                        entry.position + offset,
+                        color
+                    )
+                }
+                TextEffect::Outline { radius, color } => {
+                    for offset in [
+                        Vec2::new(-radius, -radius),
+                        Vec2::new(0.0, -radius),
+                        Vec2::new(radius, -radius),
+                        Vec2::new(-radius, 0.0),
+                        Vec2::new(radius, 0.0),
+                        Vec2::new(-radius, radius),
+                        Vec2::new(0.0, radius),
+                        Vec2::new(radius, radius),
+                    ] {
+                        push_area!(
+                            entry.effect_buffer.as_ref().unwrap_or(&entry.buffer),
+                            entry.position + offset,
+                            color
+                        );
+                    }
+                }
+            }
+            push_area!(&entry.buffer, entry.position, entry.color);
+        }
         self.renderer
             .prepare(
                 device,
@@ -102,11 +181,18 @@ impl TextRenderer {
             if self.buffer_pool.len() < MAX_POOLED_BUFFERS {
                 self.buffer_pool.push(entry.buffer);
             }
+            if let Some(buffer) = entry.effect_buffer
+                && self.buffer_pool.len() < MAX_POOLED_BUFFERS
+            {
+                self.buffer_pool.push(buffer);
+            }
         }
     }
 
     pub(crate) fn render<'a>(&'a self, pass: &mut RenderPass<'a>) {
-        self.renderer.render(&self.atlas, &self.viewport, pass).unwrap();
+        self.renderer
+            .render(&self.atlas, &self.viewport, pass)
+            .unwrap();
     }
 
     pub(crate) fn resize(&mut self, width: u32, height: u32, queue: &Queue) {
@@ -116,12 +202,21 @@ impl TextRenderer {
     /// Takes a buffer from the pool, or creates a new one with the given metrics
     fn take_buffer(&mut self, metrics: Metrics) -> Buffer {
         if let Some(mut buf) = self.buffer_pool.pop() {
-            buf.set_metrics(&mut self.font_system, metrics);
+            buf.set_metrics(metrics);
             buf
         } else {
             Buffer::new(&mut self.font_system, metrics)
         }
     }
+}
+
+fn new_font_system(locale: &str) -> FontSystem {
+    // Do not consult platform fonts: desktop, mobile, and WebAssembly must
+    // shape the same text with the same explicitly loaded faces.
+    let mut database = fontdb::Database::new();
+    database.load_font_data(include_bytes!("../inter-v19-latin-regular.ttf").to_vec());
+    database.set_sans_serif_family("Inter");
+    FontSystem::new_with_locale_and_db(locale.to_owned(), database)
 }
 
 /// Alignment of text (for use with and) relative to a rectangle
@@ -152,12 +247,18 @@ pub struct TextBuilder<'a> {
     text: String,
     /// Top-left anchor position; may be offset by alignment
     position: Vec2,
+    position_is_baseline: bool,
     /// Optional bounding rectangle for alignment (origin, size)
     rect: Option<Rect>,
     /// Line height in pixels; defaults to `size * 1.2`
     line_height: Option<f32>,
+    max_width: Option<f32>,
+    wrap: Wrap,
+    clip: Option<Rect>,
     size: f32,
     color: Color,
+    color_ranges: Vec<(Range<usize>, Color)>,
+    effect: TextEffect,
     /// Font family name used for matching
     family: String,
     weight: Weight,
@@ -175,10 +276,16 @@ impl<'a> TextBuilder<'a> {
             render_target,
             text,
             position: Vec2::new(10.0, 10.0),
+            position_is_baseline: false,
             rect: None,
             size: 16.0,
             line_height: None,
+            max_width: None,
+            wrap: Wrap::None,
+            clip: None,
             color: Color::BLACK,
+            color_ranges: Vec::new(),
+            effect: TextEffect::None,
             family: "Inter".into(),
             weight: Weight::NORMAL,
             style: Style::Normal,
@@ -198,6 +305,15 @@ impl<'a> TextBuilder<'a> {
     /// Set the screen-space position of the text (top-left corner)
     pub fn at(mut self, position: impl Into<Vec2>) -> Self {
         self.position = position.into();
+        self.position_is_baseline = false;
+        self
+    }
+
+    /// Set a baseline position, matching APIs which place bitmap-font glyphs
+    /// relative to their baseline rather than their top edge.
+    pub fn baseline_at(mut self, position: impl Into<Vec2>) -> Self {
+        self.position = position.into();
+        self.position_is_baseline = true;
         self
     }
 
@@ -227,9 +343,49 @@ impl<'a> TextBuilder<'a> {
         self
     }
 
+    /// Wrap text within `max_width`, falling back to grapheme boundaries for
+    /// scripts which do not separate every word with spaces.
+    pub fn wrap(mut self, max_width: f32) -> Self {
+        self.max_width = Some(max_width.max(0.0));
+        self.wrap = Wrap::WordOrGlyph;
+        self
+    }
+
+    /// Clip this text to a screen-space rectangle.
+    pub fn clip(mut self, rect: Rect) -> Self {
+        self.clip = Some(rect);
+        self
+    }
+
     /// Set the text color
     pub fn color(mut self, color: Color) -> Self {
         self.color = color;
+        self
+    }
+
+    /// Apply a color to a UTF-8 byte range. Ranges must be ordered,
+    /// non-overlapping, and end on character boundaries.
+    pub fn color_range(mut self, range: Range<usize>, color: Color) -> Self {
+        self.color_ranges.push((range, color));
+        self
+    }
+
+    /// Draw a shadow using the same shaped glyph run.
+    pub fn shadow(mut self, offset: impl Into<Vec2>, color: Color) -> Self {
+        self.effect = TextEffect::Shadow {
+            offset: offset.into(),
+            color: color.into(),
+        };
+        self
+    }
+
+    /// Draw an eight-direction outline using the same shaped glyph run. The
+    /// copies are still emitted by Glyphon in one instanced draw call.
+    pub fn outline(mut self, radius: f32, color: Color) -> Self {
+        self.effect = TextEffect::Outline {
+            radius: radius.max(0.0),
+            color: color.into(),
+        };
         self
     }
 
@@ -257,34 +413,93 @@ impl<'a> TextBuilder<'a> {
 impl Drop for TextBuilder<'_> {
     fn drop(&mut self) {
         let line_height = self.line_height.unwrap_or(self.size * 1.2);
-        let mut buffer = self.renderer.take_buffer(Metrics::new(self.size, line_height));
-        buffer.set_text(
-            &mut self.renderer.font_system,
-            &self.text,
-            &Attrs::new()
-                .family(Family::Name(&self.family))
-                .color(self.color.into())
-                .weight(self.weight)
-                .style(self.style),
-            Shaping::Basic,
-            None,
-        );
+        let mut buffer = self
+            .renderer
+            .take_buffer(Metrics::new(self.size, line_height));
+        buffer.set_size(self.max_width, None);
+        buffer.set_wrap(self.wrap);
+        let default_attrs = Attrs::new()
+            .family(Family::Name(&self.family))
+            .weight(self.weight)
+            .style(self.style);
+        if self.color_ranges.is_empty() {
+            buffer.set_text(&self.text, &default_attrs, Shaping::Advanced, None);
+        } else {
+            self.color_ranges.sort_by_key(|(range, _)| range.start);
+            let mut spans = Vec::with_capacity(self.color_ranges.len() * 2 + 1);
+            let mut cursor = 0;
+            for (range, color) in &self.color_ranges {
+                assert!(
+                    range.start >= cursor
+                        && range.end >= range.start
+                        && range.end <= self.text.len()
+                        && self.text.is_char_boundary(range.start)
+                        && self.text.is_char_boundary(range.end),
+                    "text color ranges must be ordered, non-overlapping UTF-8 byte ranges"
+                );
+                if cursor < range.start {
+                    spans.push((&self.text[cursor..range.start], default_attrs.clone()));
+                }
+                spans.push((
+                    &self.text[range.clone()],
+                    default_attrs.clone().color((*color).into()),
+                ));
+                cursor = range.end;
+            }
+            if cursor < self.text.len() {
+                spans.push((&self.text[cursor..], default_attrs.clone()));
+            }
+            buffer.set_rich_text(spans, &default_attrs, Shaping::Advanced, None);
+        }
 
-        // compute final position, applying alignment within rect if set
-        let position = if let Some(rect) = self.rect {
+        // Rich colors override TextArea::default_color. Use a second, plain
+        // buffer for shadows/outlines so their requested color stays uniform.
+        let effect_buffer =
+            if !self.color_ranges.is_empty() && !matches!(self.effect, TextEffect::None) {
+                let mut effect_buffer = self
+                    .renderer
+                    .take_buffer(Metrics::new(self.size, line_height));
+                effect_buffer.set_size(self.max_width, None);
+                effect_buffer.set_wrap(self.wrap);
+                effect_buffer.set_text(&self.text, &default_attrs, Shaping::Advanced, None);
+                Some(effect_buffer)
+            } else {
+                None
+            };
+
+        let needs_layout = self.rect.is_some() || self.position_is_baseline;
+        if needs_layout {
             buffer.shape_until_scroll(&mut self.renderer.font_system, false);
-            let text_w = buffer.layout_runs().map(|r| r.line_w).fold(0.0_f32, f32::max);
-            let text_h = buffer.layout_runs().count() as f32 * line_height;
+        }
+
+        // Compute final position, applying alignment within rect if set.
+        let mut position = if let Some(rect) = self.rect {
+            let text_w = buffer
+                .layout_runs()
+                .map(|r| r.line_w)
+                .fold(0.0_f32, f32::max);
+            let text_h = buffer
+                .layout_runs()
+                .map(|run| run.line_top + run.line_height)
+                .fold(0.0_f32, f32::max);
 
             let x = match self.align {
                 Align::TopLeft | Align::MiddleLeft | Align::BottomLeft => rect.position.x,
-                Align::TopCenter | Align::MiddleCenter | Align::BottomCenter => rect.position.x + (rect.size.x - text_w) * 0.5,
-                Align::TopRight | Align::MiddleRight | Align::BottomRight => rect.position.x + rect.size.x - text_w,
+                Align::TopCenter | Align::MiddleCenter | Align::BottomCenter => {
+                    rect.position.x + (rect.size.x - text_w) * 0.5
+                }
+                Align::TopRight | Align::MiddleRight | Align::BottomRight => {
+                    rect.position.x + rect.size.x - text_w
+                }
             };
             let y = match self.align {
                 Align::TopLeft | Align::TopCenter | Align::TopRight => rect.position.y,
-                Align::MiddleLeft | Align::MiddleCenter | Align::MiddleRight => rect.position.y + (rect.size.y - text_h) * 0.5,
-                Align::BottomLeft | Align::BottomCenter | Align::BottomRight => rect.position.y + rect.size.y - text_h,
+                Align::MiddleLeft | Align::MiddleCenter | Align::MiddleRight => {
+                    rect.position.y + (rect.size.y - text_h) * 0.5
+                }
+                Align::BottomLeft | Align::BottomCenter | Align::BottomRight => {
+                    rect.position.y + rect.size.y - text_h
+                }
             };
 
             Vec2::new(x, y)
@@ -292,9 +507,22 @@ impl Drop for TextBuilder<'_> {
             self.position
         };
 
+        if self.position_is_baseline {
+            let baseline_offset = buffer
+                .layout_runs()
+                .next()
+                .map(|run| run.line_y)
+                .unwrap_or(line_height);
+            position.y -= baseline_offset;
+        }
+
         self.renderer.entries.push(TextEntry {
             buffer,
+            effect_buffer,
             position,
+            bounds: self.clip,
+            color: self.color.into(),
+            effect: self.effect,
             render_target: self.render_target,
         });
     }
