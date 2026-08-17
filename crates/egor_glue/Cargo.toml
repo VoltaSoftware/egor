@@ -20,7 +20,7 @@ egor_render = { version = "0.10.0", path = "../egor_render" }
 web-time = "1.1.0"
 color = "0.3.3"
 glam = "0.33.1"
-glyphon = "0.11.0"
+glyphon = "0.12.0"
 log = "0.4"
 lyon = { version = "1.0.19" }
 

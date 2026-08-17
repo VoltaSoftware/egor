@@ -6,9 +6,9 @@ pub enum Presentable {
 }
 
 impl Presentable {
-    pub fn present(self) {
+    pub fn present(self, queue: &Queue) {
         match self {
-            Presentable::Surface(st) => st.present(),
+            Presentable::Surface(st) => queue.present(st),
         }
     }
 
@@ -29,7 +29,7 @@ impl Frame {
     pub(crate) fn finish(self, queue: &Queue) {
         queue.submit(Some(self.encoder.finish()));
         if let Some(p) = self.presentable {
-            p.present();
+            p.present(queue);
         }
     }
 
