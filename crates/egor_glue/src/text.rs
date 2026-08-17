@@ -8,6 +8,7 @@ use glyphon::{
 
 use crate::{color::Color, math::Rect};
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 struct TextEntry {
@@ -35,6 +36,7 @@ pub struct TextRenderer {
     viewport: Viewport,
     entries: Vec<TextEntry>,
     buffer_pool: Vec<Buffer>,
+    loaded_fonts: HashMap<(u128, usize), String>,
 }
 
 const MAX_POOLED_BUFFERS: usize = 64;
@@ -56,14 +58,21 @@ impl TextRenderer {
             viewport,
             entries: Vec::new(),
             buffer_pool: Vec::new(),
+            loaded_fonts: HashMap::new(),
         }
     }
 
     pub fn load_font_bytes(&mut self, bytes: &[u8]) -> Option<String> {
+        let fingerprint = (fnv1a_128(bytes), bytes.len());
+        if let Some(family) = self.loaded_fonts.get(&fingerprint) {
+            return Some(family.clone());
+        }
+
         let previous_face_count = self.font_system.db().faces().count();
         self.font_system.db_mut().load_font_data(bytes.to_vec());
         let face = self.font_system.db().faces().nth(previous_face_count)?;
         let family = face.families.first()?.0.clone();
+        self.loaded_fonts.insert(fingerprint, family.clone());
         Some(family)
     }
 
@@ -217,6 +226,15 @@ fn new_font_system(locale: &str) -> FontSystem {
     database.load_font_data(include_bytes!("../inter-v19-latin-regular.ttf").to_vec());
     database.set_sans_serif_family("Inter");
     FontSystem::new_with_locale_and_db(locale.to_owned(), database)
+}
+
+fn fnv1a_128(bytes: &[u8]) -> u128 {
+    let mut hash = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d_u128;
+    for byte in bytes {
+        hash ^= u128::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013b_u128);
+    }
+    hash
 }
 
 /// Alignment of text (for use with and) relative to a rectangle
