@@ -1,9 +1,11 @@
-use egor_render::{Device, Queue, RenderPass, TextureFormat};
+use egor_render::{
+    Device, Queue, RenderPass, Renderer, TextureFormat,
+    wgpu::{CompareFunction, DepthStencilState},
+};
 use glam::Vec2;
 use glyphon::{
-    Attrs, Buffer, Cache, Color as GlyphonColor, Family, FontSystem, Metrics, Resolution, Shaping,
-    Style, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer as GlyphonRenderer, Viewport,
-    Weight, Wrap, fontdb,
+    Attrs, Buffer, Cache, Color as GlyphonColor, Family, FontSystem, Metrics, Resolution, Shaping, Style, SwashCache, TextArea, TextAtlas,
+    TextBounds, TextRenderer as GlyphonRenderer, Viewport, Weight, Wrap, fontdb,
 };
 
 use crate::{color::Color, math::Rect};
@@ -48,7 +50,18 @@ impl TextRenderer {
         let cache = Cache::new(device);
         let viewport = Viewport::new(device, &cache);
         let mut atlas = TextAtlas::new(device, queue, &cache, format);
-        let renderer = GlyphonRenderer::new(&mut atlas, device, Default::default(), None);
+        let renderer = GlyphonRenderer::new(
+            &mut atlas,
+            device,
+            Default::default(),
+            Some(DepthStencilState {
+                format: Renderer::DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(CompareFunction::Always),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+        );
 
         Self {
             font_system,
@@ -96,21 +109,10 @@ impl TextRenderer {
 
     /// Prepare the text renderer for drawing.
     /// Skipping this when `has_entries()` is false avoids glyphon overhead.
-    pub(crate) fn prepare(
-        &mut self,
-        device: &Device,
-        queue: &Queue,
-        width: u32,
-        height: u32,
-        render_target: Option<usize>,
-    ) {
+    pub(crate) fn prepare(&mut self, device: &Device, queue: &Queue, width: u32, height: u32, render_target: Option<usize>) {
         self.viewport.update(queue, Resolution { width, height });
         let mut text_areas = Vec::with_capacity(self.entries.len());
-        for entry in self
-            .entries
-            .iter()
-            .filter(|entry| entry.render_target == render_target)
-        {
+        for entry in self.entries.iter().filter(|entry| entry.render_target == render_target) {
             let bounds = entry.bounds.map_or(
                 TextBounds {
                     left: 0,
@@ -199,9 +201,7 @@ impl TextRenderer {
     }
 
     pub(crate) fn render<'a>(&'a self, pass: &mut RenderPass<'a>) {
-        self.renderer
-            .render(&self.atlas, &self.viewport, pass)
-            .unwrap();
+        self.renderer.render(&self.atlas, &self.viewport, pass).unwrap();
     }
 
     pub(crate) fn resize(&mut self, width: u32, height: u32, queue: &Queue) {
@@ -431,9 +431,7 @@ impl<'a> TextBuilder<'a> {
 impl Drop for TextBuilder<'_> {
     fn drop(&mut self) {
         let line_height = self.line_height.unwrap_or(self.size * 1.2);
-        let mut buffer = self
-            .renderer
-            .take_buffer(Metrics::new(self.size, line_height));
+        let mut buffer = self.renderer.take_buffer(Metrics::new(self.size, line_height));
         buffer.set_size(self.max_width, None);
         buffer.set_wrap(self.wrap);
         let default_attrs = Attrs::new()
@@ -458,10 +456,7 @@ impl Drop for TextBuilder<'_> {
                 if cursor < range.start {
                     spans.push((&self.text[cursor..range.start], default_attrs.clone()));
                 }
-                spans.push((
-                    &self.text[range.clone()],
-                    default_attrs.clone().color((*color).into()),
-                ));
+                spans.push((&self.text[range.clone()], default_attrs.clone().color((*color).into())));
                 cursor = range.end;
             }
             if cursor < self.text.len() {
@@ -472,18 +467,15 @@ impl Drop for TextBuilder<'_> {
 
         // Rich colors override TextArea::default_color. Use a second, plain
         // buffer for shadows/outlines so their requested color stays uniform.
-        let effect_buffer =
-            if !self.color_ranges.is_empty() && !matches!(self.effect, TextEffect::None) {
-                let mut effect_buffer = self
-                    .renderer
-                    .take_buffer(Metrics::new(self.size, line_height));
-                effect_buffer.set_size(self.max_width, None);
-                effect_buffer.set_wrap(self.wrap);
-                effect_buffer.set_text(&self.text, &default_attrs, Shaping::Advanced, None);
-                Some(effect_buffer)
-            } else {
-                None
-            };
+        let effect_buffer = if !self.color_ranges.is_empty() && !matches!(self.effect, TextEffect::None) {
+            let mut effect_buffer = self.renderer.take_buffer(Metrics::new(self.size, line_height));
+            effect_buffer.set_size(self.max_width, None);
+            effect_buffer.set_wrap(self.wrap);
+            effect_buffer.set_text(&self.text, &default_attrs, Shaping::Advanced, None);
+            Some(effect_buffer)
+        } else {
+            None
+        };
 
         let needs_layout = self.rect.is_some() || self.position_is_baseline;
         if needs_layout {
@@ -492,10 +484,7 @@ impl Drop for TextBuilder<'_> {
 
         // Compute final position, applying alignment within rect if set.
         let mut position = if let Some(rect) = self.rect {
-            let text_w = buffer
-                .layout_runs()
-                .map(|r| r.line_w)
-                .fold(0.0_f32, f32::max);
+            let text_w = buffer.layout_runs().map(|r| r.line_w).fold(0.0_f32, f32::max);
             let text_h = buffer
                 .layout_runs()
                 .map(|run| run.line_top + run.line_height)
@@ -503,21 +492,13 @@ impl Drop for TextBuilder<'_> {
 
             let x = match self.align {
                 Align::TopLeft | Align::MiddleLeft | Align::BottomLeft => rect.position.x,
-                Align::TopCenter | Align::MiddleCenter | Align::BottomCenter => {
-                    rect.position.x + (rect.size.x - text_w) * 0.5
-                }
-                Align::TopRight | Align::MiddleRight | Align::BottomRight => {
-                    rect.position.x + rect.size.x - text_w
-                }
+                Align::TopCenter | Align::MiddleCenter | Align::BottomCenter => rect.position.x + (rect.size.x - text_w) * 0.5,
+                Align::TopRight | Align::MiddleRight | Align::BottomRight => rect.position.x + rect.size.x - text_w,
             };
             let y = match self.align {
                 Align::TopLeft | Align::TopCenter | Align::TopRight => rect.position.y,
-                Align::MiddleLeft | Align::MiddleCenter | Align::MiddleRight => {
-                    rect.position.y + (rect.size.y - text_h) * 0.5
-                }
-                Align::BottomLeft | Align::BottomCenter | Align::BottomRight => {
-                    rect.position.y + rect.size.y - text_h
-                }
+                Align::MiddleLeft | Align::MiddleCenter | Align::MiddleRight => rect.position.y + (rect.size.y - text_h) * 0.5,
+                Align::BottomLeft | Align::BottomCenter | Align::BottomRight => rect.position.y + rect.size.y - text_h,
             };
 
             Vec2::new(x, y)
@@ -526,11 +507,7 @@ impl Drop for TextBuilder<'_> {
         };
 
         if self.position_is_baseline {
-            let baseline_offset = buffer
-                .layout_runs()
-                .next()
-                .map(|run| run.line_y)
-                .unwrap_or(line_height);
+            let baseline_offset = buffer.layout_runs().next().map(|run| run.line_y).unwrap_or(line_height);
             position.y -= baseline_offset;
         }
 
