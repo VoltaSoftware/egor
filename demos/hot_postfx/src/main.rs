@@ -26,10 +26,7 @@ fn main() {
 
             let target_size = (size.x as u32, size.y as u32);
 
-            if offscreen_target
-                .as_ref()
-                .is_none_or(|t: &OffscreenTarget| t.size() != target_size)
-            {
+            if offscreen_target.as_ref().is_none_or(|t: &OffscreenTarget| t.size() != target_size) {
                 let mut offscreen = gfx.create_offscreen(target_size.0, target_size.1);
                 texture_id = gfx.offscreen_as_texture(&mut offscreen);
                 offscreen_target = Some(offscreen);
@@ -56,11 +53,7 @@ fn main() {
             });
 
             gfx.with_shader(shader, |gfx| {
-                gfx.rect()
-                    .at(vec2(0., 0.))
-                    .size(size)
-                    .texture(texture_id)
-                    .color(Color::WHITE);
+                gfx.rect().at(vec2(0., 0.)).size(size).texture(texture_id).color(Color::WHITE);
             });
         });
 }

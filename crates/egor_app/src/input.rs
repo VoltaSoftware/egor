@@ -14,10 +14,7 @@ pub enum TextInputEvent {
     /// A character was entered via keyboard.
     Char(char),
     /// IME preedit/composition text with optional cursor range.
-    Preedit {
-        text: String,
-        cursor: Option<(usize, usize)>,
-    },
+    Preedit { text: String, cursor: Option<(usize, usize)> },
     /// IME committed final text.
     Commit(String),
     /// IME was enabled on the window.
@@ -95,10 +92,7 @@ impl Input {
     }
 
     pub fn touch_source(&self, id: u64) -> TouchSource {
-        self.touch_sources
-            .get(&id)
-            .copied()
-            .unwrap_or(TouchSource::RealTouch)
+        self.touch_sources.get(&id).copied().unwrap_or(TouchSource::RealTouch)
     }
 
     /// Update keyboard state from a `winit` KeyEvent
@@ -111,10 +105,7 @@ impl Input {
             }
         }
         if let PhysicalKey::Code(key_code) = event.physical_key {
-            let prev = self
-                .keyboard
-                .get(&key_code)
-                .map_or(ElementState::Released, |(curr, _)| *curr);
+            let prev = self.keyboard.get(&key_code).map_or(ElementState::Released, |(curr, _)| *curr);
             self.keyboard.insert(key_code, (event.state, prev));
         }
     }
@@ -132,10 +123,7 @@ impl Input {
 
     /// Update mouse button state
     pub(crate) fn update_mouse_button(&mut self, button: MouseButton, state: ElementState) {
-        let prev = self
-            .mouse_buttons
-            .get(&button)
-            .map_or(ElementState::Released, |(curr, _)| *curr);
+        let prev = self.mouse_buttons.get(&button).map_or(ElementState::Released, |(curr, _)| *curr);
         self.mouse_buttons.insert(button, (state, prev));
     }
 
@@ -267,10 +255,8 @@ impl Input {
         }
 
         // Drop released keys/buttons to avoid buildup
-        self.keyboard
-            .retain(|_, (curr, _)| *curr != ElementState::Released);
-        self.mouse_buttons
-            .retain(|_, (curr, _)| *curr != ElementState::Released);
+        self.keyboard.retain(|_, (curr, _)| *curr != ElementState::Released);
+        self.mouse_buttons.retain(|_, (curr, _)| *curr != ElementState::Released);
 
         self.mouse_delta = (0.0, 0.0);
         self.mouse_wheel_delta = 0.0;
@@ -350,23 +336,19 @@ impl Input {
 
     /// True if the key went from not pressed last frame to pressed this frame
     pub fn key_pressed(&self, key: KeyCode) -> bool {
-        self.keyboard.get(&key).is_some_and(|(curr, prev)| {
-            *curr == ElementState::Pressed && *prev != ElementState::Pressed
-        })
+        self.keyboard
+            .get(&key)
+            .is_some_and(|(curr, prev)| *curr == ElementState::Pressed && *prev != ElementState::Pressed)
     }
 
     /// True if key is held down (pressed now regardless of last frame)
     pub fn key_held(&self, key: KeyCode) -> bool {
-        self.keyboard
-            .get(&key)
-            .is_some_and(|(curr, _)| *curr == ElementState::Pressed)
+        self.keyboard.get(&key).is_some_and(|(curr, _)| *curr == ElementState::Pressed)
     }
 
     /// True if key was just released this frame
     pub fn key_released(&self, key: KeyCode) -> bool {
-        self.keyboard
-            .get(&key)
-            .is_some_and(|(curr, _)| *curr == ElementState::Released)
+        self.keyboard.get(&key).is_some_and(|(curr, _)| *curr == ElementState::Released)
     }
 
     /// True if any key in slice was just pressed
@@ -401,9 +383,9 @@ impl Input {
 
     /// True if mouse button was just pressed this frame
     pub fn mouse_pressed(&self, button: MouseButton) -> bool {
-        self.mouse_buttons.get(&button).is_some_and(|(curr, prev)| {
-            *curr == ElementState::Pressed && *prev != ElementState::Pressed
-        })
+        self.mouse_buttons
+            .get(&button)
+            .is_some_and(|(curr, prev)| *curr == ElementState::Pressed && *prev != ElementState::Pressed)
     }
 
     /// True if mouse button is held down
@@ -464,18 +446,12 @@ impl Input {
 #[cfg(test)]
 impl Input {
     pub fn inject_key(&mut self, key: KeyCode, state: ElementState) {
-        let prev = self
-            .keyboard
-            .get(&key)
-            .map_or(ElementState::Released, |(curr, _)| *curr);
+        let prev = self.keyboard.get(&key).map_or(ElementState::Released, |(curr, _)| *curr);
         self.keyboard.insert(key, (state, prev));
     }
 
     pub fn inject_mouse_button(&mut self, button: MouseButton, state: ElementState) {
-        let prev = self
-            .mouse_buttons
-            .get(&button)
-            .map_or(ElementState::Released, |(curr, _)| *curr);
+        let prev = self.mouse_buttons.get(&button).map_or(ElementState::Released, |(curr, _)| *curr);
         self.mouse_buttons.insert(button, (state, prev));
     }
 

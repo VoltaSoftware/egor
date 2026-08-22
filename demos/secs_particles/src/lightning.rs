@@ -16,14 +16,7 @@ struct LightningSeg {
     thickness: f32,
 }
 
-pub fn spawn(
-    world: &World,
-    rng: &mut impl Rng,
-    mut start: Vec2,
-    target: Vec2,
-    depth: usize,
-    branch: u8,
-) {
+pub fn spawn(world: &World, rng: &mut impl Rng, mut start: Vec2, target: Vec2, depth: usize, branch: u8) {
     if depth > 4 {
         return;
     }
@@ -60,14 +53,7 @@ pub fn spawn(
                     dir.x * fork_angle.sin() + dir.y * fork_angle.cos(),
                 );
                 let fork_len: f32 = rng.gen_range(40.0..100.0) / (branch as f32 + 1.0);
-                spawn(
-                    world,
-                    rng,
-                    start,
-                    start + fork_dir * fork_len,
-                    depth + 1,
-                    branch + 1,
-                );
+                spawn(world, rng, start, start + fork_dir * fork_len, depth + 1, branch + 1);
             }
         }
 

@@ -1,10 +1,8 @@
 use wgpu::{
-    BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
-    BindGroupLayoutEntry, BindingResource, BindingType, Device, Extent3d, FilterMode, Origin3d,
-    Queue, RenderPass, Sampler, SamplerBindingType, SamplerDescriptor, ShaderStages,
-    TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect, TextureDescriptor,
-    TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureView,
-    TextureViewDimension,
+    BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingResource,
+    BindingType, Device, Extent3d, FilterMode, Origin3d, Queue, RenderPass, Sampler, SamplerBindingType, SamplerDescriptor, ShaderStages,
+    TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect, TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType,
+    TextureUsages, TextureView, TextureViewDimension,
 };
 
 use crate::target::OffscreenTarget;
@@ -28,12 +26,7 @@ pub(crate) struct Texture {
 }
 
 impl Texture {
-    fn create_bind_group(
-        device: &Device,
-        layout: &BindGroupLayout,
-        view: &TextureView,
-        sampler: &Sampler,
-    ) -> BindGroup {
+    fn create_bind_group(device: &Device, layout: &BindGroupLayout, view: &TextureView, sampler: &Sampler) -> BindGroup {
         device.create_bind_group(&BindGroupDescriptor {
             label: None,
             layout,
@@ -82,16 +75,7 @@ impl Texture {
         {
             let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
             let texture_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                Self::from_trusted_bytes(
-                    device,
-                    queue,
-                    layout,
-                    sampler,
-                    data,
-                    width,
-                    height,
-                    Some("Egor Texture"),
-                )
+                Self::from_trusted_bytes(device, queue, layout, sampler, data, width, height, Some("Egor Texture"))
             }));
 
             let texture = match texture_result {
@@ -134,34 +118,18 @@ impl Texture {
 
         #[cfg(target_arch = "wasm32")]
         {
-            Self::from_trusted_bytes(
-                device,
-                queue,
-                layout,
-                sampler,
-                data,
-                width,
-                height,
-                Some("Egor Texture"),
-            )
+            Self::from_trusted_bytes(device, queue, layout, sampler, data, width, height, Some("Egor Texture"))
         }
     }
 
-    fn validate_upload(
-        device: &Device,
-        data: &[u8],
-        width: u32,
-        height: u32,
-    ) -> Result<(), String> {
+    fn validate_upload(device: &Device, data: &[u8], width: u32, height: u32) -> Result<(), String> {
         if width == 0 || height == 0 {
             return Err(format!("zero-sized texture {width}x{height}"));
         }
 
         let max_dimension = device.limits().max_texture_dimension_2d;
         if width > max_dimension || height > max_dimension {
-            return Err(format!(
-                "texture {width}x{height} exceeds max dimension {max_dimension}"
-            ));
+            return Err(format!("texture {width}x{height} exceeds max dimension {max_dimension}"));
         }
 
         let expected_len = (width as usize)
@@ -235,12 +203,7 @@ impl Texture {
     /// This does not allocate or upload image data.
     /// It wraps a view produced elsewhere (an offscreen render target)
     /// and builds the bind group required for sampling in shaders
-    fn from_view(
-        view: &TextureView,
-        device: &Device,
-        layout: &BindGroupLayout,
-        sampler: &Sampler,
-    ) -> Self {
+    fn from_view(view: &TextureView, device: &Device, layout: &BindGroupLayout, sampler: &Sampler) -> Self {
         Self {
             bind_group: Self::create_bind_group(device, layout, view, sampler),
         }
@@ -249,21 +212,8 @@ impl Texture {
     /// Creates a 1×1 white fallback texture
     ///
     /// Used when no valid texture is provided for a draw call
-    fn create_default(
-        device: &Device,
-        queue: &Queue,
-        layout: &BindGroupLayout,
-        sampler: &Sampler,
-    ) -> Self {
-        Self::from_bytes(
-            device,
-            queue,
-            layout,
-            sampler,
-            &[255u8, 255, 255, 255],
-            1,
-            1,
-        )
+    fn create_default(device: &Device, queue: &Queue, layout: &BindGroupLayout, sampler: &Sampler) -> Self {
+        Self::from_bytes(device, queue, layout, sampler, &[255u8, 255, 255, 255], 1, 1)
     }
 
     /// Binds this texture at the given index in the render pass
@@ -336,8 +286,7 @@ impl Textures {
     }
 
     pub fn get(&self, id: Option<usize>) -> &Texture {
-        id.and_then(|i| self.store.get(i))
-            .unwrap_or(&self.default_texture)
+        id.and_then(|i| self.store.get(i)).unwrap_or(&self.default_texture)
     }
 
     pub fn insert(&mut self, device: &Device, queue: &Queue, data: &[u8]) -> usize {
@@ -345,45 +294,17 @@ impl Textures {
         self.insert_raw(device, queue, w, h, &img)
     }
 
-    pub fn insert_raw(
-        &mut self,
-        device: &Device,
-        queue: &Queue,
-        w: u32,
-        h: u32,
-        data: &[u8],
-    ) -> usize {
+    pub fn insert_raw(&mut self, device: &Device, queue: &Queue, w: u32, h: u32, data: &[u8]) -> usize {
         let id = self.store.len();
-        self.store.push(Texture::from_bytes(
-            device,
-            queue,
-            &self.layout,
-            &self.default_sampler,
-            data,
-            w,
-            h,
-        ));
+        self.store
+            .push(Texture::from_bytes(device, queue, &self.layout, &self.default_sampler, data, w, h));
         id
     }
 
-    pub fn insert_raw_nearest(
-        &mut self,
-        device: &Device,
-        queue: &Queue,
-        w: u32,
-        h: u32,
-        data: &[u8],
-    ) -> usize {
+    pub fn insert_raw_nearest(&mut self, device: &Device, queue: &Queue, w: u32, h: u32, data: &[u8]) -> usize {
         let id = self.store.len();
-        self.store.push(Texture::from_bytes(
-            device,
-            queue,
-            &self.layout,
-            &self.nearest_sampler,
-            data,
-            w,
-            h,
-        ));
+        self.store
+            .push(Texture::from_bytes(device, queue, &self.layout, &self.nearest_sampler, data, w, h));
         id
     }
 
@@ -392,49 +313,22 @@ impl Textures {
         self.replace_raw(device, queue, id, w, h, &img);
     }
 
-    pub fn replace_raw(
-        &mut self,
-        device: &Device,
-        queue: &Queue,
-        id: usize,
-        w: u32,
-        h: u32,
-        data: &[u8],
-    ) {
-        self.store[id] = Texture::from_bytes(
-            device,
-            queue,
-            &self.layout,
-            &self.default_sampler,
-            data,
-            w,
-            h,
-        );
+    pub fn replace_raw(&mut self, device: &Device, queue: &Queue, id: usize, w: u32, h: u32, data: &[u8]) {
+        self.store[id] = Texture::from_bytes(device, queue, &self.layout, &self.default_sampler, data, w, h);
     }
 
     pub fn insert_nearest(&mut self, device: &Device, queue: &Queue, data: &[u8]) -> usize {
         let (w, h, img) = Self::decode_rgba(data);
         let id = self.store.len();
-        self.store.push(Texture::from_bytes(
-            device,
-            queue,
-            &self.layout,
-            &self.nearest_sampler,
-            &img,
-            w,
-            h,
-        ));
+        self.store
+            .push(Texture::from_bytes(device, queue, &self.layout, &self.nearest_sampler, &img, w, h));
         id
     }
 
     pub fn insert_offscreen(&mut self, device: &Device, offscreen: &OffscreenTarget) -> usize {
         let id = self.store.len();
-        self.store.push(Texture::from_view(
-            offscreen.view(),
-            device,
-            &self.layout,
-            &self.default_sampler,
-        ));
+        self.store
+            .push(Texture::from_view(offscreen.view(), device, &self.layout, &self.default_sampler));
         id
     }
 }

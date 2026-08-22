@@ -45,10 +45,7 @@ fn install_web_page_lifecycle_reset_hook() {
             let visibility_callback = Closure::<dyn FnMut(web_sys::Event)>::wrap(Box::new(|_| {
                 request_web_page_lifecycle_reset();
             }));
-            let _ = document.add_event_listener_with_callback(
-                "visibilitychange",
-                visibility_callback.as_ref().unchecked_ref(),
-            );
+            let _ = document.add_event_listener_with_callback("visibilitychange", visibility_callback.as_ref().unchecked_ref());
             visibility_callback.forget();
         }
 
@@ -56,8 +53,7 @@ fn install_web_page_lifecycle_reset_hook() {
             let callback = Closure::<dyn FnMut(web_sys::Event)>::wrap(Box::new(|_| {
                 request_web_page_lifecycle_reset();
             }));
-            let _ = window
-                .add_event_listener_with_callback(event_name, callback.as_ref().unchecked_ref());
+            let _ = window.add_event_listener_with_callback(event_name, callback.as_ref().unchecked_ref());
             callback.forget();
         }
     });
@@ -126,8 +122,7 @@ impl FrameTimer {
             self.delta = if reset {
                 0.0
             } else {
-                now.saturating_duration_since(self.last_frame_at)
-                    .as_secs_f32()
+                now.saturating_duration_since(self.last_frame_at).as_secs_f32()
             };
             self.last_frame_at = now;
         }
@@ -135,11 +130,7 @@ impl FrameTimer {
         #[cfg(target_arch = "wasm32")]
         {
             let now = now();
-            self.delta = if reset {
-                0.0
-            } else {
-                (now - self.last_frame_at).max(0.0) as f32
-            };
+            self.delta = if reset { 0.0 } else { (now - self.last_frame_at).max(0.0) as f32 };
             self.last_frame_at = now;
         };
 

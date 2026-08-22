@@ -13,10 +13,7 @@ struct Crab {
 
 fn spawn_crab(rng: &mut ThreadRng, bounds: Vec2) -> Crab {
     let angle = rng.gen_range(0.0..std::f32::consts::TAU);
-    let pos = vec2(
-        rng.gen_range(0.0..bounds.x * 0.33),
-        rng.gen_range(0.0..bounds.y * 0.33),
-    );
+    let pos = vec2(rng.gen_range(0.0..bounds.x * 0.33), rng.gen_range(0.0..bounds.y * 0.33));
     Crab {
         pos,
         vel: vec2(angle.cos(), angle.sin()) * CRAB_SPEED,
@@ -42,10 +39,9 @@ fn main() {
     let mut ferris_tex = 0;
     let mut rng = rand::thread_rng();
 
-    App::new().title("Egor Ferrismark Demo").run(
-        move |FrameContext {
-                  gfx, timer, input, ..
-              }| {
+    App::new()
+        .title("Egor Ferrismark Demo")
+        .run(move |FrameContext { gfx, timer, input, .. }| {
             let size = gfx.screen_size();
 
             if timer.frame == 0 {
@@ -60,10 +56,7 @@ fn main() {
             for c in &mut crabs {
                 c.pos += c.vel * timer.delta;
                 bounce(&mut c.pos, &mut c.vel, size, CRAB_SIZE);
-                gfx.rect()
-                    .at(c.pos)
-                    .size(Vec2::splat(CRAB_SIZE))
-                    .texture(ferris_tex);
+                gfx.rect().at(c.pos).size(Vec2::splat(CRAB_SIZE)).texture(ferris_tex);
             }
 
             gfx.text("Egor Ferrismark")
@@ -73,9 +66,6 @@ fn main() {
             gfx.text(&format!("Crabs: {}", crabs.len()))
                 .at(vec2(10.0, 10.0))
                 .color(Color::WHITE);
-            gfx.text(&format!("FPS: {}", timer.fps))
-                .at(vec2(10.0, 28.0))
-                .color(Color::WHITE);
-        },
-    );
+            gfx.text(&format!("FPS: {}", timer.fps)).at(vec2(10.0, 28.0)).color(Color::WHITE);
+        });
 }

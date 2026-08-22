@@ -157,8 +157,7 @@ pub fn main() {
                     f.trail_timer = 0.0;
                     particle_spawns.push(Particle {
                         pos: f.pos + vec2(rng.gen_range(-4.0..4.0), rng.gen_range(-4.0..4.0)),
-                        vel: -f.vel * 0.3
-                            + vec2(rng.gen_range(-40.0..40.0), rng.gen_range(-40.0..40.0)),
+                        vel: -f.vel * 0.3 + vec2(rng.gen_range(-40.0..40.0), rng.gen_range(-40.0..40.0)),
                         life: 0.5,
                         max_life: 0.5,
                         size: f.size * 0.5,
@@ -202,11 +201,7 @@ pub fn main() {
                     }
 
                     if ice.depth < 6 {
-                        let split_count = if ice.depth == 0 {
-                            rng.gen_range(3..5)
-                        } else {
-                            rng.gen_range(2..4)
-                        };
+                        let split_count = if ice.depth == 0 { rng.gen_range(3..5) } else { rng.gen_range(2..4) };
                         for _ in 0..split_count {
                             let a = rng.gen_range(0.0..TAU);
                             ice_spawns.push(IceCube {
@@ -274,11 +269,12 @@ pub fn main() {
 
                 match p.particle_type {
                     ParticleType::Fire => {
-                        gfx.polygon()
-                            .segments(6)
-                            .at(p.pos)
-                            .radius(p.size * t)
-                            .color(Color::new([p.color[0], p.color[1], p.color[2], t * 0.8]));
+                        gfx.polygon().segments(6).at(p.pos).radius(p.size * t).color(Color::new([
+                            p.color[0],
+                            p.color[1],
+                            p.color[2],
+                            t * 0.8,
+                        ]));
                     }
                     ParticleType::Ice => {
                         gfx.rect()
