@@ -52,3 +52,4 @@ wasm-bindgen = "0.2.122"
 [dev-dependencies]
 winit = { git = "https://github.com/VoltaSoftware/winit", branch = "lot" }
 pollster = "0.4.0"
+wgpu = { version = "30.0.0", default-features = false, features = ["noop", "wgsl"] }

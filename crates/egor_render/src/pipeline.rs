@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::HashMap};
 
 use wgpu::{
     BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType, BlendState, BufferBindingType, ColorTargetState,
@@ -222,10 +222,24 @@ fn fs_main("#,
     Some(Cow::Owned(wrapped))
 }
 
-pub(crate) struct CustomPipeline {
+struct CompiledCustomPipeline {
     pipeline: RenderPipeline,
     watch_pipeline: Option<RenderPipeline>,
+}
+
+/// One logical custom material. Its compiled pipeline may be shared with other
+/// materials while its uniform bindings remain independent.
+struct CustomPipelineBinding {
+    compiled_pipeline_id: usize,
     uniform_ids: Vec<usize>,
+}
+
+/// Every input that can affect custom pipeline compilation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CustomPipelineKey {
+    wgsl_source: String,
+    surface_format: TextureFormat,
+    uniform_layouts: Vec<BindGroupLayout>,
 }
 
 /// Contains all render pipelines and bind group layouts for [`crate::Renderer`]
@@ -239,7 +253,9 @@ pub(crate) struct Pipelines {
     primitive_replace: RenderPipeline,
     primitive_watch: Option<RenderPipeline>,
     primitive_replace_watch: Option<RenderPipeline>,
-    custom: Vec<CustomPipeline>,
+    custom: Vec<CustomPipelineBinding>,
+    compiled_custom: Vec<CompiledCustomPipeline>,
+    custom_cache: HashMap<CustomPipelineKey, usize>,
     texture_layout: BindGroupLayout,
     pub camera_layout: BindGroupLayout,
     watch_overlay_supported: bool,
@@ -284,6 +300,8 @@ impl Pipelines {
             primitive_watch,
             primitive_replace_watch,
             custom: Vec::new(),
+            compiled_custom: Vec::new(),
+            custom_cache: HashMap::new(),
             texture_layout,
             camera_layout,
             watch_overlay_supported,
@@ -299,30 +317,55 @@ impl Pipelines {
         uniform_layouts: &[&BindGroupLayout],
         uniform_ids: &[usize],
     ) -> usize {
-        let pipeline = create_custom_pipeline(
-            device,
-            surface_format,
-            &self.texture_layout,
-            &self.camera_layout,
-            uniform_layouts,
-            wgsl_source,
+        assert_eq!(
+            uniform_layouts.len(),
+            uniform_ids.len(),
+            "custom shader uniform layouts and bindings must have the same length"
         );
-        let watch_pipeline = if self.watch_overlay_supported {
-            create_custom_watch_pipeline(
+
+        let cache_key = CustomPipelineKey {
+            wgsl_source: wgsl_source.to_owned(),
+            surface_format,
+            uniform_layouts: uniform_layouts
+                .iter()
+                .map(|layout| (*layout).clone())
+                .collect(),
+        };
+        let compiled_pipeline_id = if let Some(&id) = self.custom_cache.get(&cache_key) {
+            id
+        } else {
+            let pipeline = create_custom_pipeline(
                 device,
                 surface_format,
                 &self.texture_layout,
                 &self.camera_layout,
                 uniform_layouts,
                 wgsl_source,
-            )
-        } else {
-            None
+            );
+            let watch_pipeline = if self.watch_overlay_supported {
+                create_custom_watch_pipeline(
+                    device,
+                    surface_format,
+                    &self.texture_layout,
+                    &self.camera_layout,
+                    uniform_layouts,
+                    wgsl_source,
+                )
+            } else {
+                None
+            };
+
+            let id = self.compiled_custom.len();
+            self.compiled_custom.push(CompiledCustomPipeline {
+                pipeline,
+                watch_pipeline,
+            });
+            self.custom_cache.insert(cache_key, id);
+            id
         };
 
-        self.custom.push(CustomPipeline {
-            pipeline,
-            watch_pipeline,
+        self.custom.push(CustomPipelineBinding {
+            compiled_pipeline_id,
             uniform_ids: uniform_ids.to_vec(),
         });
         self.custom.len() - 1
@@ -345,13 +388,14 @@ impl Pipelines {
             ));
         }
         if let Some(custom) = shader_id.and_then(|id| self.custom.get(id)) {
+            let compiled = self.compiled_custom.get(custom.compiled_pipeline_id)?;
             if watch_overlay {
-                custom
+                compiled
                     .watch_pipeline
                     .as_ref()
                     .map(|pipeline| (pipeline, custom.uniform_ids.as_slice()))
             } else {
-                Some((&custom.pipeline, &custom.uniform_ids))
+                Some((&compiled.pipeline, &custom.uniform_ids))
             }
         } else if watch_overlay {
             Some((self.primitive_watch.as_ref()?, &[]))
@@ -363,7 +407,11 @@ impl Pipelines {
     pub fn supports_watch_overlay(&self, shader_id: Option<usize>) -> bool {
         self.watch_overlay_supported
             && match shader_id {
-                Some(id) => self.custom.get(id).is_some_and(|custom| custom.watch_pipeline.is_some()),
+                Some(id) => self
+                    .custom
+                    .get(id)
+                    .and_then(|custom| self.compiled_custom.get(custom.compiled_pipeline_id))
+                    .is_some_and(|compiled| compiled.watch_pipeline.is_some()),
                 None => self.primitive_watch.is_some() && self.primitive_replace_watch.is_some(),
             }
     }
@@ -697,5 +745,82 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
         assert!(wrapped.contains("@location(1) overlay: vec4<f32>"));
         assert!(wrapped.contains("input.watch_overlay"));
+    }
+
+    #[test]
+    fn custom_pipeline_programs_are_reused_across_uniform_bindings() {
+        let (device, _queue) = Device::noop(&wgpu::DeviceDescriptor::default());
+        let surface_format = TextureFormat::Rgba8Unorm;
+        let mut pipelines = Pipelines::new(&device, surface_format, true);
+        let uniform_layout = create_camera_bind_group_layout(&device);
+
+        let first = pipelines.add_custom(
+            &device,
+            surface_format,
+            CUSTOM_SHADER_WITH_OVERLAY,
+            &[&uniform_layout],
+            &[4],
+        );
+        let second = pipelines.add_custom(
+            &device,
+            surface_format,
+            CUSTOM_SHADER_WITH_OVERLAY,
+            &[&uniform_layout],
+            &[9],
+        );
+
+        assert_eq!(pipelines.compiled_custom.len(), 1);
+        assert_eq!(pipelines.custom.len(), 2);
+
+        let (first_pipeline, first_uniforms) = pipelines
+            .resolve_with_replace(Some(first), false, false)
+            .expect("first custom pipeline should resolve");
+        let (second_pipeline, second_uniforms) = pipelines
+            .resolve_with_replace(Some(second), false, false)
+            .expect("second custom pipeline should resolve");
+        assert_eq!(first_pipeline, second_pipeline);
+        assert_eq!(first_uniforms, &[4]);
+        assert_eq!(second_uniforms, &[9]);
+
+        let (first_watch_pipeline, _) = pipelines
+            .resolve_with_replace(Some(first), false, true)
+            .expect("first custom watch pipeline should resolve");
+        let (second_watch_pipeline, _) = pipelines
+            .resolve_with_replace(Some(second), false, true)
+            .expect("second custom watch pipeline should resolve");
+        assert_eq!(first_watch_pipeline, second_watch_pipeline);
+    }
+
+    #[test]
+    fn custom_pipeline_cache_keeps_compilation_inputs_separate() {
+        let (device, _queue) = Device::noop(&wgpu::DeviceDescriptor::default());
+        let surface_format = TextureFormat::Rgba8Unorm;
+        let mut pipelines = Pipelines::new(&device, surface_format, false);
+        let first_layout = create_camera_bind_group_layout(&device);
+        let second_layout = create_camera_bind_group_layout(&device);
+
+        pipelines.add_custom(
+            &device,
+            surface_format,
+            CUSTOM_SHADER_WITH_OVERLAY,
+            &[&first_layout],
+            &[4],
+        );
+        pipelines.add_custom(
+            &device,
+            surface_format,
+            CUSTOM_SHADER_WITH_OVERLAY,
+            &[&second_layout],
+            &[9],
+        );
+        pipelines.add_custom(
+            &device,
+            TextureFormat::Rgba8UnormSrgb,
+            CUSTOM_SHADER_WITH_OVERLAY,
+            &[&first_layout],
+            &[12],
+        );
+
+        assert_eq!(pipelines.compiled_custom.len(), 3);
     }
 }
