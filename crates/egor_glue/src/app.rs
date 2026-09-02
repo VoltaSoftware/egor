@@ -284,6 +284,7 @@ pub struct AppControl<'a> {
     requested_fps_limit: Option<Option<u16>>,
     native_refresh_rate_fps: Option<u16>,
     requested_native_refresh_rate_fps: Option<Option<u16>>,
+    requested_renderer_backend: Option<RendererBackendPreference>,
     gpu_device_recreated: bool,
 }
 
@@ -332,6 +333,11 @@ impl<'a> AppControl<'a> {
     /// Clear the explicit FPS limit and leave redraw pacing to the platform.
     pub fn clear_fps_limit(&mut self) {
         self.requested_fps_limit = Some(None);
+    }
+
+    /// Recreate the GPU renderer with the requested backend after this frame is presented.
+    pub fn set_renderer_backend(&mut self, backend: RendererBackendPreference) {
+        self.requested_renderer_backend = Some(backend);
     }
 
     /// Override the detected native refresh rate for platforms whose winit
@@ -433,6 +439,7 @@ pub struct App {
     app_suspended: bool,
     frame_timer_reset_requested: bool,
     renderer_recreate_requested: bool,
+    renderer_recreate_window_requested: bool,
     renderer_recreate_in_progress: bool,
     gpu_device_recreated_pending_frame: bool,
     last_frame_stats: FrameStats,
@@ -479,6 +486,7 @@ impl App {
             app_suspended: false,
             frame_timer_reset_requested: true,
             renderer_recreate_requested: false,
+            renderer_recreate_window_requested: false,
             renderer_recreate_in_progress: false,
             gpu_device_recreated_pending_frame: false,
             last_frame_stats: FrameStats::default(),
@@ -767,6 +775,23 @@ impl App {
         self.drop_renderer_owned_resources();
     }
 
+    fn request_renderer_backend_change(&mut self, backend: RendererBackendPreference) {
+        if self.renderer_backend == backend {
+            return;
+        }
+
+        log::info!(
+            "[egor] changing renderer backend from {:?} to {:?}",
+            self.renderer_backend,
+            backend
+        );
+        self.renderer_backend = backend;
+        self.renderer_recreate_requested = true;
+        self.frame_timer_reset_requested = true;
+        self.renderer_recreate_window_requested = cfg!(target_arch = "wasm32");
+        self.drop_renderer_owned_resources();
+    }
+
     async fn create_renderer_with_retry(&self, window: Arc<Window>) -> Renderer {
         loop {
             match Renderer::try_new_with_backend(window.clone(), &self.memory_hints, self.renderer_backend).await {
@@ -834,12 +859,20 @@ impl AppHandler<Renderer> for App {
         self.renderer_recreate_requested
     }
 
+    fn window_recreate_requested(&self) -> bool {
+        self.renderer_recreate_window_requested
+    }
+
     fn frame_timer_reset_requested(&self) -> bool {
         self.frame_timer_reset_requested
     }
 
     fn before_resource_recreate(&mut self) {
         self.renderer_recreate_requested = false;
+        if self.renderer_recreate_window_requested {
+            self.window = None;
+        }
+        self.renderer_recreate_window_requested = false;
         self.renderer_recreate_in_progress = true;
         self.drop_renderer_owned_resources();
     }
@@ -1053,7 +1086,7 @@ impl AppHandler<Renderer> for App {
         self.events_drained.clear();
         std::mem::swap(&mut self.events, &mut self.events_drained);
 
-        let (requested_size, requested_vsync, requested_fps_limit, requested_native_refresh_rate_fps) = {
+        let (requested_size, requested_vsync, requested_fps_limit, requested_native_refresh_rate_fps, requested_renderer_backend) = {
             let mut ctx = FrameContext {
                 events: std::mem::take(&mut self.events_drained),
                 app: AppControl {
@@ -1063,6 +1096,7 @@ impl AppHandler<Renderer> for App {
                     requested_fps_limit: None,
                     native_refresh_rate_fps: self.native_refresh_rate_fps,
                     requested_native_refresh_rate_fps: None,
+                    requested_renderer_backend: None,
                     gpu_device_recreated,
                 },
                 gfx: Graphics::new(
@@ -1116,6 +1150,7 @@ impl AppHandler<Renderer> for App {
             let requested_vsync = ctx.app.requested_vsync;
             let requested_fps_limit = ctx.app.requested_fps_limit;
             let requested_native_refresh_rate_fps = ctx.app.requested_native_refresh_rate_fps;
+            let requested_renderer_backend = ctx.app.requested_renderer_backend;
             if let Some((pw, ph)) = requested_size {
                 ctx.gfx.set_target_size(pw, ph);
             }
@@ -1127,6 +1162,7 @@ impl AppHandler<Renderer> for App {
                 requested_vsync,
                 requested_fps_limit,
                 requested_native_refresh_rate_fps,
+                requested_renderer_backend,
             )
         };
 
@@ -1705,6 +1741,9 @@ impl AppHandler<Renderer> for App {
                 backbuffer.set_vsync(&device, hardware_vsync_enabled(self.vsync, self.fps_limit));
             }
         }
+        if let Some(renderer_backend) = requested_renderer_backend {
+            self.request_renderer_backend_change(renderer_backend);
+        }
         frame_stats.post_present_time = post_present_started_at.elapsed();
         self.finish_frame_stats(frame_stats, egor_frame_started_at);
     }
@@ -1826,6 +1865,28 @@ mod tests {
         assert!(app.offscreen_batches.is_empty());
         assert!(app.instance_byte_offsets.is_empty());
         assert_eq!(app.surface_acquire_retry_interval, Some(Duration::from_millis(1000)));
+    }
+
+    #[test]
+    fn renderer_backend_change_requests_recreation() {
+        let mut app = App::new();
+
+        app.request_renderer_backend_change(RendererBackendPreference::vulkan());
+
+        assert_eq!(app.renderer_backend, RendererBackendPreference::vulkan());
+        assert!(app.renderer_recreate_requested);
+        assert_eq!(app.renderer_recreate_window_requested, cfg!(target_arch = "wasm32"));
+        assert!(app.frame_timer_reset_requested);
+    }
+
+    #[test]
+    fn unchanged_renderer_backend_does_not_request_recreation() {
+        let mut app = App::new();
+
+        app.request_renderer_backend_change(RendererBackendPreference::Auto);
+
+        assert!(!app.renderer_recreate_requested);
+        assert!(!app.renderer_recreate_window_requested);
     }
 
     #[test]

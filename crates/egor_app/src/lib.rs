@@ -154,6 +154,13 @@ pub trait AppHandler<R> {
     fn resource_recreate_requested(&self) -> bool {
         false
     }
+    /// Return true when the window must also be dropped and recreated with the resource.
+    ///
+    /// This is primarily useful on the web, where a canvas cannot switch between
+    /// WebGPU and WebGL contexts after one context type has been created.
+    fn window_recreate_requested(&self) -> bool {
+        false
+    }
     /// Return true when the next rendered frame should discard elapsed
     /// wall-clock time, usually because the current frame did not run visual
     /// simulation due to lifecycle or surface state.
@@ -313,12 +320,18 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
                 let frame_started_at = Instant::now();
                 self.timer.update();
                 handler.frame(window, resource, &mut self.input, &self.timer);
+                let recreate_window = handler.window_recreate_requested();
                 let recreate_resource = handler.resource_recreate_requested();
                 let reset_frame_timer = handler.frame_timer_reset_requested();
                 self.input.end_frame();
 
                 if reset_frame_timer {
                     self.timer.reset_next_update();
+                }
+
+                if recreate_window {
+                    self.recreate_window(event_loop);
+                    return;
                 }
 
                 if recreate_resource {
@@ -376,7 +389,7 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
         }
     }
 
-    fn user_event(&mut self, _: &ActiveEventLoop, (mut resource, mut handler): (R, H)) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, (mut resource, mut handler): (R, H)) {
         let Some(window) = &self.window else { return };
 
         handler.on_ready(window, &mut resource);
@@ -384,9 +397,17 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
         let frame_started_at = Instant::now();
         #[cfg(not(target_os = "android"))]
         handler.frame(window, &mut resource, &mut self.input, &self.timer);
+        let recreate_window = handler.window_recreate_requested();
         let recreate_resource = handler.resource_recreate_requested();
 
         window.set_visible(true);
+        if recreate_window {
+            self.resource = Some(resource);
+            self.handler = Some(handler);
+            self.recreate_window(event_loop);
+            return;
+        }
+
         if recreate_resource {
             self.resource = Some(resource);
             self.handler = Some(handler);
@@ -540,6 +561,26 @@ impl<R, H: AppHandler<R> + 'static> AppRunner<R, H> {
 
         self.handler = Some(handler);
         self.dispatch_resource_creation(proxy, window);
+    }
+
+    fn recreate_window(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(handler) = self.prepare_resource_recreate() else {
+            return;
+        };
+
+        self.input.force_release_all_input_state();
+        self.timer.reset_next_update();
+        let _old_window = self.window.take();
+        #[cfg(target_arch = "wasm32")]
+        if let Some(window) = _old_window {
+            use winit::platform::web::WindowExtWebSys;
+            if let Some(canvas) = window.canvas() {
+                canvas.remove();
+            }
+        }
+
+        self.handler = Some(handler);
+        self.resumed(event_loop);
     }
 
     fn prepare_resource_recreate(&mut self) -> Option<H> {
