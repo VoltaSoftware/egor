@@ -156,8 +156,9 @@ pub trait AppHandler<R> {
     }
     /// Return true when the window must also be dropped and recreated with the resource.
     ///
-    /// This is primarily useful on the web, where a canvas cannot switch between
-    /// WebGPU and WebGL contexts after one context type has been created.
+    /// This is useful on the web, where a canvas cannot switch between WebGPU and
+    /// WebGL contexts, and on Windows, where OpenGL permanently sets the HWND's
+    /// pixel format.
     fn window_recreate_requested(&self) -> bool {
         false
     }
@@ -237,7 +238,7 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
             .with_resizable(self.config.resizable)
             .with_maximized(self.config.maximized)
             .with_fullscreen(fullscreen)
-            .with_window_icon(self.config.icon.take())
+            .with_window_icon(self.config.icon.clone())
             .with_decorations(self.config.decorations);
 
         if let (Some(w), Some(h)) = (self.config.width, self.config.height) {

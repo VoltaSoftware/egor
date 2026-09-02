@@ -788,7 +788,9 @@ impl App {
         self.renderer_backend = backend;
         self.renderer_recreate_requested = true;
         self.frame_timer_reset_requested = true;
-        self.renderer_recreate_window_requested = cfg!(target_arch = "wasm32");
+        // WGL permanently sets a Win32 window's pixel format. A fresh HWND is
+        // required before another API (notably DX12) can create its swapchain.
+        self.renderer_recreate_window_requested = cfg!(any(target_arch = "wasm32", target_os = "windows"));
         self.drop_renderer_owned_resources();
     }
 
@@ -1875,7 +1877,10 @@ mod tests {
 
         assert_eq!(app.renderer_backend, RendererBackendPreference::vulkan());
         assert!(app.renderer_recreate_requested);
-        assert_eq!(app.renderer_recreate_window_requested, cfg!(target_arch = "wasm32"));
+        assert_eq!(
+            app.renderer_recreate_window_requested,
+            cfg!(any(target_arch = "wasm32", target_os = "windows"))
+        );
         assert!(app.frame_timer_reset_requested);
     }
 
