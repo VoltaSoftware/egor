@@ -16,40 +16,40 @@ gles = ["wgpu/gles"]
 vulkan = ["wgpu/vulkan"]
 
 [dependencies]
-bytemuck = "1.25.0"
+bytemuck = "1.25.2"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 log = "0.4"
 
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
-wgpu = { version = "30.0.0", default-features = false, features = [
+wgpu = { version = "30.0.1", default-features = false, features = [
     "wgsl",
     "vulkan",
     "gles",
 ] }
 [target.'cfg(target_os = "windows")'.dependencies]
-wgpu = { version = "30.0.0", default-features = false, features = [
+wgpu = { version = "30.0.1", default-features = false, features = [
     "wgsl",
     "dx12",
     "vulkan"
 ] }
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
-wgpu = { version = "30.0.0", default-features = false, features = [
+wgpu = { version = "30.0.1", default-features = false, features = [
     "wgsl",
     "metal",
 ] }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-pollster = "0.4.0"
+pollster = "1.0.1"
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-wgpu = { version = "30.0.0", default-features = false, features = [
+wgpu = { version = "30.0.1", default-features = false, features = [
     "wgsl",
     "webgpu",
     "webgl",
 ] }
-web-sys = { version = "0.3.99", features = ["Window", "Document", "Element", "HtmlCanvasElement"] }
-wasm-bindgen = "0.2.122"
+web-sys = { version = "0.3.104", features = ["Window", "Document", "Element", "HtmlCanvasElement"] }
+wasm-bindgen = "0.2.127"
 
 [dev-dependencies]
 winit = { git = "https://github.com/VoltaSoftware/winit", branch = "lot" }
-pollster = "0.4.0"
-wgpu = { version = "30.0.0", default-features = false, features = ["noop", "wgsl"] }
+pollster = "1.0.1"
+wgpu = { version = "30.0.1", default-features = false, features = ["noop", "wgsl"] }
