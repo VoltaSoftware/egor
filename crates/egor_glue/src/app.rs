@@ -503,7 +503,6 @@ impl App {
         self
     }
 
-    /// Set window icon
     /// Render in an invisible, inactive desktop window for GPU tests.
     #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios")))]
     pub fn hidden(mut self) -> Self {

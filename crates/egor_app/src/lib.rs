@@ -441,6 +441,20 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Invisible Win32 windows do not receive WM_PAINT. Drive the same
+        // paced frame path explicitly without ever showing/activating them.
+        if !self.config.visible
+            && self.config.control_flow == ControlFlow::Poll
+            && self.resource.is_some()
+            && let Some(window_id) = self.window.as_ref().map(|window| window.id())
+        {
+            self.window_event(event_loop, window_id, WindowEvent::RedrawRequested);
+            event_loop.set_control_flow(self.queued_poll_redraw_at.map(ControlFlow::WaitUntil).unwrap_or(ControlFlow::Poll));
+            if let Some(handler) = self.handler.as_mut() {
+                handler.about_to_wait();
+            }
+            return;
+        }
         if self.config.control_flow == ControlFlow::Poll
             && self.queued_poll_redraw
             && let Some(window) = &self.window
