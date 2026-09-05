@@ -780,11 +780,7 @@ impl App {
             return;
         }
 
-        log::info!(
-            "[egor] changing renderer backend from {:?} to {:?}",
-            self.renderer_backend,
-            backend
-        );
+        log::info!("[egor] changing renderer backend from {:?} to {:?}", self.renderer_backend, backend);
         self.renderer_backend = backend;
         self.renderer_recreate_requested = true;
         self.frame_timer_reset_requested = true;

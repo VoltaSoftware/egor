@@ -100,6 +100,7 @@ struct PreparedCapture {
     cap_h: u32,
     grayscale: bool,
     alpha_mask: bool,
+    rgba8: bool,
     metadata: Option<[f32; 10]>,
     dirty_rects: Option<Vec<[u16; 4]>>,
     frame_tag: Option<[u64; 4]>,
@@ -681,8 +682,11 @@ fn unpremultiply_channel(channel: u8, alpha: u8) -> u8 {
     }
 }
 
-fn readback_output_len(cap_w: u32, cap_h: u32, grayscale: bool, alpha_mask: bool) -> usize {
+fn readback_output_len(cap_w: u32, cap_h: u32, grayscale: bool, alpha_mask: bool, rgba8: bool) -> usize {
     let pixel_count = cap_w as usize * cap_h as usize;
+    if rgba8 {
+        return pixel_count * 4;
+    }
     match (grayscale, alpha_mask) {
         (true, false) => pixel_count,
         (true, true) => pixel_count * 2,
@@ -691,19 +695,55 @@ fn readback_output_len(cap_w: u32, cap_h: u32, grayscale: bool, alpha_mask: bool
     }
 }
 
-fn decode_readback_into(buffer: &Buffer, dst: &mut Vec<u8>, cap_w: u32, cap_h: u32, row_pitch: usize, grayscale: bool, alpha_mask: bool) {
-    let w = cap_w as usize;
-    let h = cap_h as usize;
-    let pixel_count = w * h;
-    let out_len = readback_output_len(cap_w, cap_h, grayscale, alpha_mask);
-
-    dst.reserve(out_len.saturating_sub(dst.len()));
-    unsafe { dst.set_len(out_len) };
-
+fn decode_readback_into(
+    buffer: &Buffer,
+    dst: &mut Vec<u8>,
+    cap_w: u32,
+    cap_h: u32,
+    row_pitch: usize,
+    grayscale: bool,
+    alpha_mask: bool,
+    rgba8: bool,
+) {
     let data = buffer
         .slice(..)
         .get_mapped_range()
         .expect("readback buffer range must remain mapped after map_async succeeds");
+    decode_readback_bytes(&data, dst, cap_w, cap_h, row_pitch, grayscale, alpha_mask, rgba8);
+}
+
+fn decode_readback_bytes(
+    data: &[u8],
+    dst: &mut Vec<u8>,
+    cap_w: u32,
+    cap_h: u32,
+    row_pitch: usize,
+    grayscale: bool,
+    alpha_mask: bool,
+    rgba8: bool,
+) {
+    let w = cap_w as usize;
+    let h = cap_h as usize;
+    let pixel_count = w * h;
+    let out_len = readback_output_len(cap_w, cap_h, grayscale, alpha_mask, rgba8);
+
+    // Preserve the actual RGBA8 bytes for screenshots, including low color bits.
+    // Network/watch captures continue to use the existing compact formats.
+    if rgba8 {
+        let row_bytes = w * 4;
+        dst.clear();
+        dst.reserve(out_len);
+        for y in 0..h {
+            dst.extend_from_slice(&data[y * row_pitch..y * row_pitch + row_bytes]);
+        }
+        return;
+    }
+
+    let input_channels = if grayscale { if alpha_mask { 2 } else { 1 } } else { 4 };
+    assert!(row_pitch >= w * input_channels);
+    assert!(data.len() >= h * row_pitch);
+    dst.reserve(out_len.saturating_sub(dst.len()));
+    unsafe { dst.set_len(out_len) };
     let src = data.as_ptr();
 
     if alpha_mask {
@@ -769,6 +809,7 @@ struct StagingSlot {
     cap_h: u32,
     grayscale: bool,
     alpha_mask: bool,
+    rgba8: bool,
     metadata: Option<[f32; 10]>,
     dirty_rects: Option<WatchCaptureDirtyRects>,
     frame_tag: Option<WatchCaptureFrameTag>,
@@ -786,6 +827,7 @@ impl StagingSlot {
             cap_h: 0,
             grayscale: false,
             alpha_mask: false,
+            rgba8: false,
             metadata: None,
             dirty_rects: None,
             frame_tag: None,
@@ -805,6 +847,7 @@ struct ReadbackJob {
     cap_h: u32,
     grayscale: bool,
     alpha_mask: bool,
+    rgba8: bool,
     metadata: Option<[f32; 10]>,
     dirty_rects: Option<WatchCaptureDirtyRects>,
     frame_tag: Option<WatchCaptureFrameTag>,
@@ -852,6 +895,7 @@ impl ReadbackWorker {
                         job.row_pitch,
                         job.grayscale,
                         job.alpha_mask,
+                        job.rgba8,
                     );
                     job.buffer.unmap();
                     let complete_us = complete_start.elapsed().as_micros();
@@ -945,6 +989,7 @@ pub struct ScreenCaptureState {
     capture_h: u32,
     pub grayscale: bool,
     pub alpha_mask: bool,
+    rgba8: bool,
     source_render_target: Option<usize>,
     watch_overlay_capture: bool,
     final_frame_logical_w: u32,
@@ -1008,6 +1053,7 @@ impl ScreenCaptureState {
             capture_h: 0,
             grayscale: false,
             alpha_mask: false,
+            rgba8: false,
             source_render_target: None,
             watch_overlay_capture: false,
             final_frame_logical_w: 0,
@@ -1055,11 +1101,19 @@ impl ScreenCaptureState {
         self.capture_h = h;
         self.grayscale = grayscale;
         self.alpha_mask = false;
+        self.rgba8 = false;
         self.source_render_target = None;
         self.watch_overlay_capture = false;
         self.request_metadata = None;
         self.request_dirty_rects = None;
         self.request_frame_tag = None;
+    }
+
+    /// Request full RGBA8 screenshot bytes instead of the compact RGB565 format.
+    /// Read the completed buffer through `rgb_buf()` after polling completion.
+    pub fn request_rgba8(&mut self, w: u32, h: u32) {
+        self.request(w, h, false);
+        self.rgba8 = true;
     }
 
     pub fn request_with_alpha_mask(&mut self, w: u32, h: u32, grayscale: bool, source_render_target: usize, metadata: Option<[f32; 10]>) {
@@ -1068,6 +1122,7 @@ impl ScreenCaptureState {
         self.capture_h = h;
         self.grayscale = grayscale;
         self.alpha_mask = true;
+        self.rgba8 = false;
         self.source_render_target = Some(source_render_target);
         self.watch_overlay_capture = false;
         self.request_metadata = metadata;
@@ -1092,6 +1147,7 @@ impl ScreenCaptureState {
         self.capture_h = h;
         self.grayscale = grayscale;
         self.alpha_mask = true;
+        self.rgba8 = false;
         self.source_render_target = None;
         self.watch_overlay_capture = true;
         self.final_frame_logical_w = logical_w.max(1);
@@ -1355,6 +1411,7 @@ impl ScreenCaptureState {
         let cap_h = self.capture_h.max(1);
         let grayscale = self.grayscale;
         let alpha_mask = self.alpha_mask;
+        let rgba8 = self.rgba8;
         self.source_render_target = None;
 
         // -- Ring-buffer slot availability check --------------------------
@@ -1381,6 +1438,7 @@ impl ScreenCaptureState {
             cap_h,
             grayscale,
             alpha_mask,
+            rgba8,
             metadata: self.request_metadata.take(),
             dirty_rects: self.request_dirty_rects.take(),
             frame_tag: self.request_frame_tag.take(),
@@ -1557,6 +1615,7 @@ impl ScreenCaptureState {
             cap_h,
             grayscale,
             alpha_mask,
+            rgba8,
             metadata,
             dirty_rects,
             frame_tag,
@@ -1656,6 +1715,7 @@ impl ScreenCaptureState {
         slot.cap_h = cap_h;
         slot.grayscale = grayscale;
         slot.alpha_mask = alpha_mask;
+        slot.rgba8 = rgba8;
         slot.metadata = metadata;
         slot.dirty_rects = dirty_rects;
         slot.frame_tag = frame_tag;
@@ -1749,6 +1809,7 @@ impl ScreenCaptureState {
             cap_h,
             grayscale,
             alpha_mask,
+            rgba8,
             metadata,
             dirty_rects,
             frame_tag,
@@ -1850,6 +1911,7 @@ impl ScreenCaptureState {
         slot.cap_h = cap_h;
         slot.grayscale = grayscale;
         slot.alpha_mask = alpha_mask;
+        slot.rgba8 = rgba8;
         slot.metadata = metadata;
         slot.dirty_rects = dirty_rects;
         slot.frame_tag = frame_tag;
@@ -2073,6 +2135,7 @@ impl ScreenCaptureState {
         let row_pitch = self.slots[idx].row_pitch as usize;
         let grayscale = self.slots[idx].grayscale;
         let alpha_mask = self.slots[idx].alpha_mask;
+        let rgba8 = self.slots[idx].rgba8;
 
         let buffer = match self.slots[idx].buffer.take() {
             Some(b) => b,
@@ -2082,7 +2145,7 @@ impl ScreenCaptureState {
             }
         };
 
-        decode_readback_into(&buffer, &mut self.rgb_buf, cap_w, cap_h, row_pitch, grayscale, alpha_mask);
+        decode_readback_into(&buffer, &mut self.rgb_buf, cap_w, cap_h, row_pitch, grayscale, alpha_mask, rgba8);
         buffer.unmap();
 
         self.slots[idx].buffer = Some(buffer);
@@ -2125,6 +2188,7 @@ impl ScreenCaptureState {
                 cap_h: slot.cap_h,
                 grayscale: slot.grayscale,
                 alpha_mask: slot.alpha_mask,
+                rgba8: slot.rgba8,
                 metadata: slot.metadata.take(),
                 dirty_rects: slot.dirty_rects.take(),
                 frame_tag: slot.frame_tag.take(),
@@ -2143,9 +2207,19 @@ impl ScreenCaptureState {
                 let cap_h = job.cap_h;
                 let grayscale = job.grayscale;
                 let alpha_mask = job.alpha_mask;
+                let rgba8 = job.rgba8;
                 let row_pitch = job.row_pitch;
                 let metadata = job.metadata;
-                decode_readback_into(&job.buffer, &mut self.rgb_buf, cap_w, cap_h, row_pitch, grayscale, alpha_mask);
+                decode_readback_into(
+                    &job.buffer,
+                    &mut self.rgb_buf,
+                    cap_w,
+                    cap_h,
+                    row_pitch,
+                    grayscale,
+                    alpha_mask,
+                    rgba8,
+                );
                 job.buffer.unmap();
                 self.slots[idx].buffer = Some(job.buffer);
                 self.slots[idx].pending = false;
@@ -2759,6 +2833,11 @@ impl<'a> Graphics<'a> {
         self.screen_capture.request(w, h, grayscale);
     }
 
+    /// Capture lossless RGBA8 pixels; existing network captures remain RGB565.
+    pub fn request_screen_capture_rgba8(&mut self, w: u32, h: u32) {
+        self.screen_capture.request_rgba8(w, h);
+    }
+
     pub fn request_screen_capture_with_alpha_mask(
         &mut self,
         w: u32,
@@ -2821,5 +2900,35 @@ impl<'a> Graphics<'a> {
     /// Access the completed screen capture RGB buffer.
     pub fn screen_capture_rgb_buf(&self) -> &[u8] {
         self.screen_capture.rgb_buf()
+    }
+}
+
+#[cfg(test)]
+mod capture_format_tests {
+    use super::*;
+
+    #[test]
+    fn screenshot_readback_preserves_low_bits_alpha_and_strips_row_padding() {
+        let data = [
+            9, 17, 25, 253, 10, 18, 26, 254, 0xee, 0xee, 0xee, 0xee, 11, 19, 27, 255, 12, 20, 28, 0, 0xee, 0xee, 0xee, 0xee,
+        ];
+        let mut output = Vec::new();
+        decode_readback_bytes(&data, &mut output, 2, 2, 12, false, false, true);
+        assert_eq!(output, [9, 17, 25, 253, 10, 18, 26, 254, 11, 19, 27, 255, 12, 20, 28, 0]);
+
+        // The same input still uses the original RGB565 format for watch capture.
+        decode_readback_bytes(&data, &mut output, 2, 2, 12, false, false, false);
+        assert_eq!(output, [0x83, 0x08, 0x83, 0x08, 0x83, 0x08, 0xa3, 0x08]);
+    }
+
+    #[test]
+    fn queued_capture_keeps_its_format_when_the_next_request_changes_mode() {
+        let mut capture = ScreenCaptureState::new();
+        capture.request_rgba8(8, 8);
+        let screenshot = capture.prepare_capture().unwrap();
+        capture.request(8, 8, false);
+        let network = capture.prepare_capture().unwrap();
+        assert!(screenshot.rgba8);
+        assert!(!network.rgba8);
     }
 }
