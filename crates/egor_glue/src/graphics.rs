@@ -1270,9 +1270,12 @@ impl ScreenCaptureState {
         metrics
     }
 
-    /// Returns `true` if any ring-buffer slot has a GPU readback in flight.
+    /// Returns `true` while a slot still needs a GPU mapping callback.
+    /// Ready mappings and CPU worker jobs do not need device polling.
     pub fn readback_in_flight(&self) -> bool {
-        self.slots.iter().any(|s| s.pending)
+        self.slots
+            .iter()
+            .any(|s| s.pending && s.buffer.is_some() && s.map_signal.load(Ordering::Acquire) == MAP_PENDING)
     }
 
     // -- pipeline / resource setup (lazy) --------------------------------
