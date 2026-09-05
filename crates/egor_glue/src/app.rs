@@ -408,6 +408,7 @@ pub struct App {
     screen_capture: ScreenCaptureState,
     prewarm_watch_capture: bool,
     watch_presentation_needs_warmup: bool,
+    watch_readback_warmup_started: Option<Instant>,
     fps_limit: Option<u16>,
     native_refresh_rate_fps: Option<u16>,
     capture_frame_target: Option<CaptureFrameTarget>,
@@ -458,6 +459,7 @@ impl App {
             screen_capture: ScreenCaptureState::new(),
             prewarm_watch_capture: false,
             watch_presentation_needs_warmup: false,
+            watch_readback_warmup_started: None,
             fps_limit: None,
             native_refresh_rate_fps: None,
             capture_frame_target: None,
@@ -562,13 +564,37 @@ impl App {
         }
         self.screen_capture
             .present_sampled_view(&device, &mut encoder, &target.color_view, &presented.view, format);
-        if let Err(error) = renderer.try_submit_commands(encoder.finish()) {
-            log::warn!("[egor] watch pipeline warmup submission failed: {error:?}");
+        let warm_native_gl = cfg!(target_os = "windows") && renderer.adapter_info().backend == egor_render::wgpu::Backend::Gl;
+        if warm_native_gl {
+            // Exercise native mapping as well as drawing before gameplay.
+            // Discard the earlier private requests; only this map is polled.
+            self.screen_capture.release_buffers();
+            self.screen_capture
+                .request_watch_overlay_capture(width.min(640), height.min(360), width, height, 1, false, None, None, None);
+            self.screen_capture.capture_from_watch_overlay(
+                &device,
+                &queue,
+                &mut encoder,
+                &target.overlay_view,
+                width,
+                height,
+                format.is_srgb(),
+            );
         }
-        self.screen_capture.release_buffers();
+        match renderer.try_submit_commands(encoder.finish()) {
+            Ok(()) if warm_native_gl => {
+                self.screen_capture.begin_readback_map();
+                self.watch_readback_warmup_started = Some(Instant::now());
+            }
+            result => {
+                if let Err(error) = result {
+                    log::warn!("[egor] watch pipeline warmup submission failed: {error:?}");
+                }
+                self.screen_capture.release_buffers();
+            }
+        }
         self.watch_frame_target = Some(target);
-        self.watch_presentation_needs_warmup =
-            cfg!(target_os = "windows") && renderer.adapter_info().backend == egor_render::wgpu::Backend::Gl;
+        self.watch_presentation_needs_warmup = warm_native_gl;
     }
 
     /// Set window icon
@@ -831,6 +857,7 @@ impl App {
         self.capture_frame_target = None;
         self.watch_frame_target = None;
         self.watch_presentation_needs_warmup = false;
+        self.watch_readback_warmup_started = None;
         self.watch_overlay_capture_unsupported_logged = false;
         self.primitive_batch.drop_gpu_resources();
         self.offscreen_batches.clear();
@@ -1100,6 +1127,19 @@ impl AppHandler<Renderer> for App {
             let poll_started = Instant::now();
             let _ = renderer.device().poll(egor_render::wgpu::PollType::Poll);
             frame_stats.readback_poll_time = poll_started.elapsed();
+        }
+        if let Some(started) = self.watch_readback_warmup_started {
+            let complete = self.screen_capture.try_complete().is_some();
+            if complete || started.elapsed() >= Duration::from_secs(1) {
+                if !complete {
+                    log::warn!("[egor] private watch readback warmup timed out");
+                }
+                self.screen_capture.release_buffers();
+                self.watch_readback_warmup_started = None;
+            } else {
+                self.finish_frame_stats(frame_stats, egor_frame_started_at);
+                return;
+            }
         }
 
         if self.backbuffer.is_none() && should_wait_for_surface_restore(false, window_surface_size(_window)) {
