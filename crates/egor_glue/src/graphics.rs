@@ -83,7 +83,7 @@ const MAP_FAILED: u8 = 2;
 const MAP_CANCELLED: u8 = 3;
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct WatchCaptureUniform {
     source_w: u32,
     source_h: u32,
@@ -998,6 +998,8 @@ pub struct ScreenCaptureState {
     blit_bind_group_layout: Option<egor_render::wgpu::BindGroupLayout>,
     watch_capture_bind_group_layout: Option<egor_render::wgpu::BindGroupLayout>,
     watch_capture_uniform: Option<Buffer>,
+    last_watch_capture_uniform: Option<WatchCaptureUniform>,
+    watch_capture_binding: Option<(egor_render::wgpu::TextureView, egor_render::wgpu::BindGroup)>,
     present_pipeline: Option<egor_render::wgpu::RenderPipeline>,
     present_pipeline_format: Option<TextureFormat>,
     composite_pipeline: Option<egor_render::wgpu::RenderPipeline>,
@@ -1069,6 +1071,8 @@ impl ScreenCaptureState {
             blit_bind_group_layout: None,
             watch_capture_bind_group_layout: None,
             watch_capture_uniform: None,
+            last_watch_capture_uniform: None,
+            watch_capture_binding: None,
             present_pipeline: None,
             present_pipeline_format: None,
             composite_pipeline: None,
@@ -1230,6 +1234,8 @@ impl ScreenCaptureState {
         self.source_copy_w = 0;
         self.source_copy_h = 0;
         self.watch_capture_uniform = None;
+        self.last_watch_capture_uniform = None;
+        self.watch_capture_binding = None;
         self.rgb_buf = Vec::new();
         for slot in &mut self.slots {
             if slot.pending && slot.buffer.is_none() {
@@ -1671,10 +1677,18 @@ impl ScreenCaptureState {
             }));
         }
         let uniform_buffer = self.watch_capture_uniform.as_ref().expect("watch capture uniform");
-        queue.write_buffer(uniform_buffer, 0, uniform.bytes());
+        if self.last_watch_capture_uniform != Some(uniform) {
+            queue.write_buffer(uniform_buffer, 0, uniform.bytes());
+            self.last_watch_capture_uniform = Some(uniform);
+        }
+        if let Some((view, binding)) = &self.watch_capture_binding {
+            if view == overlay_view {
+                return binding.clone();
+            }
+        }
         let layout = self.watch_capture_bind_group_layout.as_ref().expect("watch capture layout");
 
-        device.create_bind_group(&egor_render::wgpu::BindGroupDescriptor {
+        let binding = device.create_bind_group(&egor_render::wgpu::BindGroupDescriptor {
             label: Some("Watch Capture Bind Group"),
             layout,
             entries: &[
@@ -1687,7 +1701,9 @@ impl ScreenCaptureState {
                     resource: uniform_buffer.as_entire_binding(),
                 },
             ],
-        })
+        });
+        self.watch_capture_binding = Some((overlay_view.clone(), binding.clone()));
+        binding
     }
 
     fn capture_prepared_bind_group(
