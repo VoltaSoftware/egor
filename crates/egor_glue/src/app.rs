@@ -497,23 +497,26 @@ impl App {
         self
     }
 
-    /// Prepare watch shaders during renderer initialization, before gameplay
-    /// frames begin. Capture textures and staging buffers remain on demand.
+    /// Prepare watch shaders and reserve the full-size watch attachments
+    /// during initialization, so starting/stopping watch does not allocate
+    /// them during gameplay. Downsample/readback buffers remain on demand.
     pub fn prewarm_watch_capture(mut self) -> Self {
         self.prewarm_watch_capture = true;
         self
     }
 
-    fn prepare_watch_renderer(&mut self, renderer: &mut Renderer, format: TextureFormat) {
+    fn prepare_watch_renderer(&mut self, renderer: &mut Renderer, format: TextureFormat, width: u32, height: u32) {
         let (device, queue) = (renderer.device().clone(), renderer.queue().clone());
         self.screen_capture.prewarm_watch_pipelines(&device, format);
 
         // Some GL drivers defer compilation until the first draw. Exercise
-        // the built-in watch and downsample pipelines on tiny private targets
-        // during initialization; no surface, readback map, or GPU wait is used.
-        let target = WatchFrameTarget::new(&device, 8, 8, format);
-        let presented = CaptureFrameTarget::new(&device, 8, 8, format);
-        let (_depth, depth_view) = Renderer::create_depth_texture(&device, 8, 8);
+        // the built-in watch and downsample pipelines during initialization.
+        // Keep the full-size attachments initialized: Adreno also defers their
+        // allocation/clear until submission. No surface or GPU wait is used.
+        let target = WatchFrameTarget::new(&device, width, height, format);
+        let presented = CaptureFrameTarget::new(&device, width, height, format);
+        renderer.ensure_depth_size(width, height);
+        let depth_view = renderer.depth_view().clone();
         let mut encoder = device.create_command_encoder(&Default::default());
         let mut batch = egor_render::batch::GeometryBatch::new(4, 6);
         renderer.upload_camera_matrix(glam::Mat4::IDENTITY.to_cols_array_2d());
@@ -561,6 +564,7 @@ impl App {
             log::warn!("[egor] watch pipeline warmup submission failed: {error:?}");
         }
         self.screen_capture.release_buffers();
+        self.watch_frame_target = Some(target);
     }
 
     /// Set window icon
@@ -996,7 +1000,8 @@ impl AppHandler<Renderer> for App {
         }
         self.text_renderer = Some(TextRenderer::new(device, renderer.queue(), format));
         if self.prewarm_watch_capture && renderer.supports_watch_overlay_capture() {
-            self.prepare_watch_renderer(renderer, format);
+            let size = window_surface_size(window);
+            self.prepare_watch_renderer(renderer, format, size.width.max(1), size.height.max(1));
         }
         if let Some(fps_limit) = self.fps_limit {
             set_native_preferred_fps(window, fps_limit);
@@ -1233,7 +1238,9 @@ impl AppHandler<Renderer> for App {
 
         let prep_started_at = Instant::now();
         if self.screen_capture.take_buffers_released() {
-            self.watch_frame_target = None;
+            if !self.prewarm_watch_capture {
+                self.watch_frame_target = None;
+            }
             self.capture_frame_target = None;
         }
 

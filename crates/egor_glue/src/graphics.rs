@@ -918,7 +918,6 @@ impl ReadbackWorker {
                         cache_mapped_color,
                     );
                     let conversion_us = complete_start.elapsed().as_micros();
-                    job.buffer.unmap();
                     let complete_us = complete_start.elapsed().as_micros();
                     let result = ReadbackResult {
                         slot_idx: job.slot_idx,
@@ -2358,6 +2357,13 @@ impl ScreenCaptureState {
             return;
         };
 
+        // Unmapping GL buffers acquires the rendering context. Keep that on
+        // the render thread so a CPU conversion worker cannot steal/hold the
+        // context while the frame thread is polling, submitting, or presenting.
+        let unmap_started = Instant::now();
+        result.buffer.unmap();
+        let unmap_us = unmap_started.elapsed().as_micros() as u64;
+
         if let Some(slot) = self.slots.get_mut(result.slot_idx)
             && slot.pending
             && slot.buffer.is_none()
@@ -2372,9 +2378,9 @@ impl ScreenCaptureState {
         self.metrics.worker_jobs -= 1;
         self.metrics.worker_bytes -= result.buf_size;
         self.metrics.completed_frames += 1;
-        self.metrics.decode_us += result.complete_us as u64;
+        self.metrics.decode_us += result.complete_us as u64 + unmap_us;
         self.metrics.conversion_us += result.conversion_us as u64;
-        self.metrics.unmap_us += (result.complete_us - result.conversion_us) as u64;
+        self.metrics.unmap_us += unmap_us;
         self.result_ready = true;
         self.result_w = result.cap_w as u16;
         self.result_h = result.cap_h as u16;
