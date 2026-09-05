@@ -567,7 +567,8 @@ impl App {
         }
         self.screen_capture.release_buffers();
         self.watch_frame_target = Some(target);
-        self.watch_presentation_needs_warmup = true;
+        self.watch_presentation_needs_warmup =
+            cfg!(target_os = "windows") && renderer.adapter_info().backend == egor_render::wgpu::Backend::Gl;
     }
 
     /// Set window icon
@@ -1322,7 +1323,7 @@ impl AppHandler<Renderer> for App {
 
         let mut capture_active = self.screen_capture.is_requested();
         let mut capture_source_render_target = self.screen_capture.requested_source_render_target();
-        // Private warmup targets do not exercise a GL window's presentation
+        // Private warmup targets do not exercise a Windows GL presentation
         // path. Render the first compatible startup frame through the watch
         // attachments too, without requesting or delivering a readback.
         let warm_watch_presentation = self.watch_presentation_needs_warmup
