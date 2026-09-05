@@ -947,6 +947,7 @@ impl ReadbackWorker {
 pub struct ScreenCaptureState {
     metrics: ScreenCaptureMetrics,
     buffers_released: bool,
+    full_dirty_after_skip: bool,
     // -- GPU blit resources (lazily initialised) --
     blit_pipeline: Option<egor_render::wgpu::RenderPipeline>,
     blit_gray_pipeline: Option<egor_render::wgpu::RenderPipeline>,
@@ -1018,6 +1019,7 @@ impl ScreenCaptureState {
         Self {
             metrics: ScreenCaptureMetrics::default(),
             buffers_released: false,
+            full_dirty_after_skip: false,
             blit_pipeline: None,
             blit_gray_pipeline: None,
             blit_gray_alpha_pipeline: None,
@@ -1208,6 +1210,7 @@ impl ScreenCaptureState {
         self.metrics.worker_jobs = 0;
         self.metrics.worker_bytes = 0;
         self.buffers_released = true;
+        self.full_dirty_after_skip = false;
     }
 
     pub(crate) fn take_buffers_released(&mut self) -> bool {
@@ -1447,6 +1450,7 @@ impl ScreenCaptureState {
             let status = self.slots[idx].map_signal.load(Ordering::Acquire);
             if status == MAP_READY {
                 self.metrics.skipped_requests += 1;
+                self.full_dirty_after_skip = true;
                 // Capture submission runs on the frame path. Do not consume
                 // mapped readbacks here; the poll path/worker owns that work.
                 return None;
@@ -1456,10 +1460,19 @@ impl ScreenCaptureState {
                 // Ring full — GPU hasn't finished this slot yet.
                 // Skip capture entirely; no blit, no copy, no allocation.
                 self.metrics.skipped_requests += 1;
+                self.full_dirty_after_skip = true;
                 return None;
             }
         }
 
+        let dirty_rects = self.request_dirty_rects.take();
+        // Hints may describe only the last requested frame. After a skipped
+        // capture, scan the next complete image to include every missed change.
+        let dirty_rects = if std::mem::take(&mut self.full_dirty_after_skip) {
+            None
+        } else {
+            dirty_rects
+        };
         Some(PreparedCapture {
             slot_idx: idx,
             cap_w,
@@ -1467,7 +1480,7 @@ impl ScreenCaptureState {
             grayscale,
             alpha_mask,
             metadata: self.request_metadata.take(),
-            dirty_rects: self.request_dirty_rects.take(),
+            dirty_rects,
             frame_tag: self.request_frame_tag.take(),
         })
     }
