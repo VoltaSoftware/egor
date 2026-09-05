@@ -363,6 +363,8 @@ pub struct FrameStats {
     pub egor_frame_time: Duration,
     /// Time spent in the user update callback.
     pub user_callback_time: Duration,
+    /// Time spent driving asynchronous GPU mapping callbacks before update.
+    pub readback_poll_time: Duration,
     /// Egor work between the user callback and surface acquisition.
     pub prep_time: Duration,
     /// Time spent acquiring the current surface texture.
@@ -500,6 +502,65 @@ impl App {
     pub fn prewarm_watch_capture(mut self) -> Self {
         self.prewarm_watch_capture = true;
         self
+    }
+
+    fn prepare_watch_renderer(&mut self, renderer: &mut Renderer, format: TextureFormat) {
+        let (device, queue) = (renderer.device().clone(), renderer.queue().clone());
+        self.screen_capture.prewarm_watch_pipelines(&device, format);
+
+        // Some GL drivers defer compilation until the first draw. Exercise
+        // the built-in watch and downsample pipelines on tiny private targets
+        // during initialization; no surface, readback map, or GPU wait is used.
+        let target = WatchFrameTarget::new(&device, 8, 8, format);
+        let presented = CaptureFrameTarget::new(&device, 8, 8, format);
+        let (_depth, depth_view) = Renderer::create_depth_texture(&device, 8, 8);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        let mut batch = egor_render::batch::GeometryBatch::new(4, 6);
+        renderer.upload_camera_matrix(glam::Mat4::IDENTITY.to_cols_array_2d());
+        for replace_blend in [false, true] {
+            batch.push_instance(Instance::new(
+                [2.0, 0.0, 0.0, 2.0],
+                [-1.0, -1.0, 0.0],
+                [1.0; 4],
+                [0.0, 0.0, 1.0, 1.0],
+            ));
+            let mut pass = renderer.begin_render_pass_with_watch_overlay_depth_clear_color(
+                &mut encoder,
+                &target.color_view,
+                &target.overlay_view,
+                &depth_view,
+                egor_render::wgpu::Color::TRANSPARENT,
+                true,
+            );
+            renderer.bind_pass_state_with_watch_overlay(&mut pass, None, None, replace_blend, true);
+            let (mut texture, mut shader, mut blend, mut camera, mut quad_bound) = (None, None, replace_blend, u32::MAX, true);
+            renderer.draw_batch_with_watch_overlay(
+                &mut pass,
+                &mut batch,
+                None,
+                None,
+                replace_blend,
+                0,
+                &mut texture,
+                &mut shader,
+                &mut blend,
+                &mut camera,
+                &mut quad_bound,
+                true,
+            );
+        }
+        for grayscale in [false, true] {
+            self.screen_capture
+                .request_watch_overlay_capture(8, 8, 8, 8, 1, grayscale, None, None, None);
+            self.screen_capture
+                .capture_from_watch_overlay(&device, &queue, &mut encoder, &target.overlay_view, 8, 8, format.is_srgb());
+        }
+        self.screen_capture
+            .present_sampled_view(&device, &mut encoder, &target.color_view, &presented.view, format);
+        if let Err(error) = renderer.try_submit_commands(encoder.finish()) {
+            log::warn!("[egor] watch pipeline warmup submission failed: {error:?}");
+        }
+        self.screen_capture.release_buffers();
     }
 
     /// Set window icon
@@ -935,7 +996,7 @@ impl AppHandler<Renderer> for App {
         }
         self.text_renderer = Some(TextRenderer::new(device, renderer.queue(), format));
         if self.prewarm_watch_capture && renderer.supports_watch_overlay_capture() {
-            self.screen_capture.prewarm_watch_pipelines(device, format);
+            self.prepare_watch_renderer(renderer, format);
         }
         if let Some(fps_limit) = self.fps_limit {
             set_native_preferred_fps(window, fps_limit);
@@ -1023,11 +1084,12 @@ impl AppHandler<Renderer> for App {
         }
 
         // Drive wgpu map_async callbacks at the START of the frame.
-        // By polling here (not at end-of-frame), the GPU has had a full
-        // frame since begin_readback_map — virtually guaranteeing the
-        // oldest ring-buffer slot is complete, eliminating stalls.
+        // Poll never requests a GPU wait. Backend mapping and context locking
+        // can still take CPU time, so measure it separately from the callback.
         if self.screen_capture.readback_in_flight() {
+            let poll_started = Instant::now();
             let _ = renderer.device().poll(egor_render::wgpu::PollType::Poll);
+            frame_stats.readback_poll_time = poll_started.elapsed();
         }
 
         if self.backbuffer.is_none() && should_wait_for_surface_restore(false, window_surface_size(_window)) {

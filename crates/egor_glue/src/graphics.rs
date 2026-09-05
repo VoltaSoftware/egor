@@ -117,6 +117,8 @@ pub struct ScreenCaptureMetrics {
     pub skipped_requests: u64,
     pub completed_frames: u64,
     pub decode_us: u64,
+    pub conversion_us: u64,
+    pub unmap_us: u64,
     pub worker_jobs: u64,
     pub worker_bytes: u64,
     pub gpu_bytes: u64,
@@ -882,6 +884,7 @@ struct ReadbackResult {
     frame_tag: Option<WatchCaptureFrameTag>,
     rgb_buf: Vec<u8>,
     complete_us: u128,
+    conversion_us: u128,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -914,6 +917,7 @@ impl ReadbackWorker {
                         #[cfg(target_os = "android")]
                         cache_mapped_color,
                     );
+                    let conversion_us = complete_start.elapsed().as_micros();
                     job.buffer.unmap();
                     let complete_us = complete_start.elapsed().as_micros();
                     let result = ReadbackResult {
@@ -930,6 +934,7 @@ impl ReadbackWorker {
                         frame_tag: job.frame_tag,
                         rgb_buf,
                         complete_us,
+                        conversion_us,
                     };
                     if result_tx.send(result).is_err() {
                         break;
@@ -2223,9 +2228,13 @@ impl ScreenCaptureState {
             alpha_mask,
             &mut Vec::new(),
         );
+        let conversion_us = complete_start.elapsed().as_micros() as u64;
         buffer.unmap();
+        let complete_us = complete_start.elapsed().as_micros() as u64;
         self.metrics.completed_frames += 1;
-        self.metrics.decode_us += complete_start.elapsed().as_micros() as u64;
+        self.metrics.decode_us += complete_us;
+        self.metrics.conversion_us += conversion_us;
+        self.metrics.unmap_us += complete_us - conversion_us;
 
         self.slots[idx].buffer = Some(buffer);
         self.slots[idx].pending = false;
@@ -2364,6 +2373,8 @@ impl ScreenCaptureState {
         self.metrics.worker_bytes -= result.buf_size;
         self.metrics.completed_frames += 1;
         self.metrics.decode_us += result.complete_us as u64;
+        self.metrics.conversion_us += result.conversion_us as u64;
+        self.metrics.unmap_us += (result.complete_us - result.conversion_us) as u64;
         self.result_ready = true;
         self.result_w = result.cap_w as u16;
         self.result_h = result.cap_h as u16;
