@@ -85,6 +85,7 @@ impl RendererBackendPreference {
 
 fn renderer_instance_descriptor() -> InstanceDescriptor {
     let mut desc = InstanceDescriptor::new_without_display_handle();
+    desc.flags = desc.flags.with_env();
     configure_renderer_instance_flags(&mut desc);
     desc
 }
