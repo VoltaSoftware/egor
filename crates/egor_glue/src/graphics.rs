@@ -2623,6 +2623,11 @@ impl<'a> Graphics<'a> {
         self.renderer.adapter_info()
     }
 
+    /// Flags used when creating this renderer's wgpu instance.
+    pub fn instance_flags(&self) -> egor_render::wgpu::InstanceFlags {
+        self.renderer.instance_flags()
+    }
+
     /// Render to an offscreen target
     pub fn render_offscreen(&mut self, target: &mut OffscreenTarget, render_fn: impl FnMut(&mut Graphics)) {
         self.render_offscreen_with_limits(

@@ -204,6 +204,7 @@ fn watch_overlay_capture_supported(adapter: &Adapter, device: &Device, surface_f
 /// Handles rendering pipelines, surface configuration, resources (textures, buffers), & drawing
 pub struct Renderer {
     gpu: Gpu,
+    instance_flags: wgpu::InstanceFlags,
     pipelines: Pipelines,
     quad_vertex_buffer: Buffer,
     quad_index_buffer: Buffer,
@@ -268,6 +269,7 @@ impl Renderer {
             }
         }
         log::info!("[egor] renderer init: instance flags: {:?}", desc.flags);
+        let instance_flags = desc.flags;
         let instance = new_instance_with_webgpu_detection(desc).await;
         #[cfg(not(target_os = "android"))]
         log::info!("[egor] renderer init: creating adapter selection surface");
@@ -431,6 +433,7 @@ impl Renderer {
         log::info!("[egor] renderer init: complete");
 
         Ok(Renderer {
+            instance_flags,
             gpu: Gpu {
                 instance,
                 adapter,
@@ -505,6 +508,10 @@ impl Renderer {
         &self.gpu.adapter
     }
     /// Returns information about the active GPU adapter/backend.
+    pub fn instance_flags(&self) -> wgpu::InstanceFlags {
+        self.instance_flags
+    }
+
     pub fn adapter_info(&self) -> AdapterInfo {
         self.gpu.adapter.get_info()
     }
