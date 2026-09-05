@@ -80,6 +80,7 @@ const SLOT_COUNT: usize = 3;
 const MAP_PENDING: u8 = 0;
 const MAP_READY: u8 = 1;
 const MAP_FAILED: u8 = 2;
+const MAP_CANCELLED: u8 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -855,6 +856,7 @@ impl StagingSlot {
 #[cfg(not(target_arch = "wasm32"))]
 struct ReadbackJob {
     slot_idx: usize,
+    map_signal: Arc<AtomicU8>,
     rgb_buf: Vec<u8>,
     buffer: Buffer,
     buf_size: u64,
@@ -901,19 +903,31 @@ impl ReadbackWorker {
             .name("egor-readback".to_owned())
             .spawn(move || {
                 let mut source_cache = Vec::new();
-                while let Ok(job) = job_rx.recv() {
+                loop {
+                    let job = match job_rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                        Ok(job) => job,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            // Keep the initialized thread, but release Android's
+                            // mapped-memory cache when capture becomes idle.
+                            source_cache = Vec::new();
+                            continue;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
                     let complete_start = Instant::now();
                     let mut rgb_buf = job.rgb_buf;
-                    decode_readback_into(
-                        &job.buffer,
-                        &mut rgb_buf,
-                        job.cap_w,
-                        job.cap_h,
-                        job.row_pitch,
-                        job.grayscale,
-                        job.alpha_mask,
-                        &mut source_cache,
-                    );
+                    if job.map_signal.load(Ordering::Acquire) != MAP_CANCELLED {
+                        decode_readback_into(
+                            &job.buffer,
+                            &mut rgb_buf,
+                            job.cap_w,
+                            job.cap_h,
+                            job.row_pitch,
+                            job.grayscale,
+                            job.alpha_mask,
+                            &mut source_cache,
+                        );
+                    }
                     let conversion_us = complete_start.elapsed().as_micros();
                     let complete_us = complete_start.elapsed().as_micros();
                     let result = ReadbackResult {
@@ -1215,31 +1229,23 @@ impl ScreenCaptureState {
         self.source_copy_h = 0;
         self.watch_capture_uniform = None;
         self.rgb_buf = Vec::new();
-        self.slots = std::array::from_fn(|_| StagingSlot::new());
+        for slot in &mut self.slots {
+            if slot.pending && slot.buffer.is_none() {
+                // A worker still owns this mapping. Keep the slot occupied
+                // until it returns, including across an immediate restart.
+                slot.map_signal.store(MAP_CANCELLED, Ordering::Release);
+            } else {
+                *slot = StagingSlot::new();
+            }
+        }
         self.write_idx = 0;
         self.needs_map = None;
         self.result_ready = false;
         self.result_metadata = None;
         self.result_dirty_rects = None;
         self.result_frame_tag = None;
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.readback_worker = None;
-        }
-        self.metrics.worker_jobs = 0;
-        self.metrics.worker_bytes = 0;
         self.buffers_released = true;
         self.full_dirty_after_skip = false;
-    }
-
-    pub(crate) fn finish_private_warmup(&mut self) {
-        #[cfg(not(target_arch = "wasm32"))]
-        let worker = self.readback_worker.take();
-        self.release_buffers();
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.readback_worker = worker;
-        }
     }
 
     pub(crate) fn take_buffers_released(&mut self) -> bool {
@@ -1284,6 +1290,10 @@ impl ScreenCaptureState {
     // -- pipeline / resource setup (lazy) --------------------------------
 
     pub(crate) fn prewarm_watch_pipelines(&mut self, device: &Device, format: TextureFormat) {
+        // Thread creation can stall native presentation. Pay that cost during
+        // renderer initialization and keep the worker across watch stop/start.
+        #[cfg(not(target_arch = "wasm32"))]
+        self.readback_worker.get_or_insert_with(ReadbackWorker::new);
         self.ensure_watch_capture_pipeline(device);
         self.ensure_present_pipeline(device, format);
     }
@@ -2274,6 +2284,7 @@ impl ScreenCaptureState {
 
             ReadbackJob {
                 slot_idx: idx,
+                map_signal: Arc::clone(&slot.map_signal),
                 rgb_buf: std::mem::take(&mut slot.rgb_buf),
                 buffer,
                 buf_size: slot.buf_size,
@@ -2361,19 +2372,21 @@ impl ScreenCaptureState {
         result.buffer.unmap();
         let unmap_us = unmap_started.elapsed().as_micros() as u64;
 
-        if let Some(slot) = self.slots.get_mut(result.slot_idx)
-            && slot.pending
-            && slot.buffer.is_none()
-            && slot.buf_size == result.buf_size
-            && slot.row_pitch == result.row_pitch
-        {
-            slot.buffer = Some(result.buffer);
-            slot.pending = false;
-            slot.rgb_buf = std::mem::replace(&mut self.rgb_buf, result.rgb_buf);
-        }
-
         self.metrics.worker_jobs -= 1;
         self.metrics.worker_bytes -= result.buf_size;
+        let slot = &mut self.slots[result.slot_idx];
+        debug_assert!(slot.pending && slot.buffer.is_none());
+        debug_assert_eq!(slot.buf_size, result.buf_size);
+        debug_assert_eq!(slot.row_pitch, result.row_pitch);
+        if slot.map_signal.load(Ordering::Acquire) == MAP_CANCELLED {
+            // Never publish a cancelled frame or recycle its buffers after
+            // release. Unmapping and destruction stay on the render thread.
+            *slot = StagingSlot::new();
+            return;
+        }
+        slot.buffer = Some(result.buffer);
+        slot.pending = false;
+        slot.rgb_buf = std::mem::replace(&mut self.rgb_buf, result.rgb_buf);
         self.metrics.completed_frames += 1;
         self.metrics.decode_us += result.complete_us as u64 + unmap_us;
         self.metrics.conversion_us += result.conversion_us as u64;
@@ -2396,6 +2409,26 @@ impl ScreenCaptureState {
         //     self.rgb_buf.len(),
         //     result.complete_us,
         // );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn collect_cancelled_readbacks(&mut self) {
+        // A stopped client need not poll captures. The single worker returns
+        // jobs in order, so cancelled results precede any restarted capture.
+        for _ in 0..SLOT_COUNT {
+            if !self
+                .slots
+                .iter()
+                .any(|slot| slot.pending && slot.map_signal.load(Ordering::Acquire) == MAP_CANCELLED)
+            {
+                break;
+            }
+            let jobs = self.metrics.worker_jobs;
+            self.collect_worker_result();
+            if self.metrics.worker_jobs == jobs {
+                break;
+            }
+        }
     }
 
     /// Poll for a completed readback. Returns `Some((width, height))` when
