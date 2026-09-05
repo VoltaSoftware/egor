@@ -1793,6 +1793,8 @@ impl AppHandler<Renderer> for App {
             frame_stats.queue_submit_time = queue_submit_started_at.elapsed();
             #[cfg(target_os = "windows")]
             {
+                #[cfg(feature = "profiling")]
+                profiling::scope!("readback_dispatch");
                 if capture_active {
                     self.screen_capture.begin_readback_map();
                 }

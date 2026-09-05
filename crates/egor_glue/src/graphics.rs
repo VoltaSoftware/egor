@@ -2477,7 +2477,7 @@ impl ScreenCaptureState {
     ///
     /// Non-blocking: iterates ring-buffer slots oldest-first and consumes
     /// the first whose `map_async` callback has fired. Driven by the game
-    /// loop's existing `device.poll(PollType::Poll)`.
+    /// loop's device polling or queue submission.
     pub fn try_complete(
         &mut self,
     ) -> Option<(
