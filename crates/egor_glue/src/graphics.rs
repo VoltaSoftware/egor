@@ -1273,6 +1273,11 @@ impl ScreenCaptureState {
 
     // -- pipeline / resource setup (lazy) --------------------------------
 
+    pub(crate) fn prewarm_watch_pipelines(&mut self, device: &Device, format: TextureFormat) {
+        self.ensure_watch_capture_pipeline(device);
+        self.ensure_present_pipeline(device, format);
+    }
+
     fn ensure_pipeline(&mut self, device: &Device) {
         if self.blit_pipeline.is_some() {
             return;

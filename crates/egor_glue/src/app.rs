@@ -404,6 +404,7 @@ pub struct App {
     renderer_backend: RendererBackendPreference,
     render_targets: RenderTargetStore,
     screen_capture: ScreenCaptureState,
+    prewarm_watch_capture: bool,
     fps_limit: Option<u16>,
     native_refresh_rate_fps: Option<u16>,
     capture_frame_target: Option<CaptureFrameTarget>,
@@ -452,6 +453,7 @@ impl App {
             primitive_batch: PrimitiveBatch::default(),
             render_targets: RenderTargetStore::new(),
             screen_capture: ScreenCaptureState::new(),
+            prewarm_watch_capture: false,
             fps_limit: None,
             native_refresh_rate_fps: None,
             capture_frame_target: None,
@@ -490,6 +492,13 @@ impl App {
             config.visible = false;
         }
         self.hidden_window = true;
+        self
+    }
+
+    /// Prepare watch shaders during renderer initialization, before gameplay
+    /// frames begin. Capture textures and staging buffers remain on demand.
+    pub fn prewarm_watch_capture(mut self) -> Self {
+        self.prewarm_watch_capture = true;
         self
     }
 
@@ -925,6 +934,9 @@ impl AppHandler<Renderer> for App {
             backbuffer.set_vsync(device, hardware_vsync_enabled(self.vsync, self.fps_limit));
         }
         self.text_renderer = Some(TextRenderer::new(device, renderer.queue(), format));
+        if self.prewarm_watch_capture && renderer.supports_watch_overlay_capture() {
+            self.screen_capture.prewarm_watch_pipelines(device, format);
+        }
         if let Some(fps_limit) = self.fps_limit {
             set_native_preferred_fps(window, fps_limit);
         }
