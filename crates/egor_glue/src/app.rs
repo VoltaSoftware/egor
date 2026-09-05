@@ -435,6 +435,7 @@ pub struct App {
     surface_recovery: SurfaceRecoveryState,
     waiting_for_surface_change: bool,
     window_focused: bool,
+    hidden_window: bool,
     surface_occluded: bool,
     app_suspended: bool,
     frame_timer_reset_requested: bool,
@@ -482,6 +483,7 @@ impl App {
             surface_recovery: SurfaceRecoveryState::new(),
             waiting_for_surface_change: false,
             window_focused: true,
+            hidden_window: false,
             surface_occluded: false,
             app_suspended: false,
             frame_timer_reset_requested: true,
@@ -498,6 +500,17 @@ impl App {
         if let Some(c) = self.config.as_mut() {
             c.title = title.into();
         }
+        self
+    }
+
+    /// Set window icon
+    /// Render in an invisible, inactive desktop window for GPU tests.
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios")))]
+    pub fn hidden(mut self) -> Self {
+        if let Some(config) = self.config.as_mut() {
+            config.visible = false;
+        }
+        self.hidden_window = true;
         self
     }
 
@@ -948,7 +961,8 @@ impl AppHandler<Renderer> for App {
         let fps_limit_interval = self
             .fps_limit
             .and_then(|fps_limit| software_frame_interval_for_fps_limit(window, self.native_refresh_rate_fps, fps_limit, self.vsync));
-        let background_interval = (!self.window_focused || self.surface_occluded).then_some(Duration::from_millis(100));
+        let background_interval =
+            (!self.hidden_window && (!self.window_focused || self.surface_occluded)).then_some(Duration::from_millis(100));
 
         max_frame_interval(
             max_frame_interval(self.surface_acquire_retry_interval, fps_limit_interval),
@@ -979,7 +993,7 @@ impl AppHandler<Renderer> for App {
             return;
         }
 
-        if self.surface_occluded {
+        if self.surface_occluded && !self.hidden_window {
             self.frame_timer_reset_requested = true;
             self.surface_acquire_retry_interval = Some(surface_wait_retry_interval());
             self.finish_frame_stats(frame_stats, egor_frame_started_at);

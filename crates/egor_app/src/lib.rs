@@ -97,6 +97,7 @@ fn should_request_poll_redraw_manually() -> bool {
 pub struct AppConfig {
     pub control_flow: ControlFlow,
     pub title: String,
+    pub visible: bool,
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub position: Option<(i32, i32)>,
@@ -116,6 +117,7 @@ impl Default for AppConfig {
         Self {
             control_flow: ControlFlow::Poll,
             title: "Egor App".to_string(),
+            visible: true,
             width: None,
             height: None,
             position: None,
@@ -234,6 +236,7 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
 
         let mut win_attrs = Window::default_attributes()
             .with_visible(false)
+            .with_active(self.config.visible)
             .with_title(&self.config.title)
             .with_resizable(self.config.resizable)
             .with_maximized(self.config.maximized)
@@ -401,7 +404,7 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
         let recreate_window = handler.window_recreate_requested();
         let recreate_resource = handler.resource_recreate_requested();
 
-        window.set_visible(true);
+        window.set_visible(self.config.visible);
         if recreate_window {
             self.resource = Some(resource);
             self.handler = Some(handler);
