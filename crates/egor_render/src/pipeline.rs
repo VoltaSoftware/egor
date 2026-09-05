@@ -326,10 +326,7 @@ impl Pipelines {
         let cache_key = CustomPipelineKey {
             wgsl_source: wgsl_source.to_owned(),
             surface_format,
-            uniform_layouts: uniform_layouts
-                .iter()
-                .map(|layout| (*layout).clone())
-                .collect(),
+            uniform_layouts: uniform_layouts.iter().map(|layout| (*layout).clone()).collect(),
         };
         let compiled_pipeline_id = if let Some(&id) = self.custom_cache.get(&cache_key) {
             id
@@ -356,10 +353,7 @@ impl Pipelines {
             };
 
             let id = self.compiled_custom.len();
-            self.compiled_custom.push(CompiledCustomPipeline {
-                pipeline,
-                watch_pipeline,
-            });
+            self.compiled_custom.push(CompiledCustomPipeline { pipeline, watch_pipeline });
             self.custom_cache.insert(cache_key, id);
             id
         };
@@ -754,20 +748,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let mut pipelines = Pipelines::new(&device, surface_format, true);
         let uniform_layout = create_camera_bind_group_layout(&device);
 
-        let first = pipelines.add_custom(
-            &device,
-            surface_format,
-            CUSTOM_SHADER_WITH_OVERLAY,
-            &[&uniform_layout],
-            &[4],
-        );
-        let second = pipelines.add_custom(
-            &device,
-            surface_format,
-            CUSTOM_SHADER_WITH_OVERLAY,
-            &[&uniform_layout],
-            &[9],
-        );
+        let first = pipelines.add_custom(&device, surface_format, CUSTOM_SHADER_WITH_OVERLAY, &[&uniform_layout], &[4]);
+        let second = pipelines.add_custom(&device, surface_format, CUSTOM_SHADER_WITH_OVERLAY, &[&uniform_layout], &[9]);
 
         assert_eq!(pipelines.compiled_custom.len(), 1);
         assert_eq!(pipelines.custom.len(), 2);
@@ -799,20 +781,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let first_layout = create_camera_bind_group_layout(&device);
         let second_layout = create_camera_bind_group_layout(&device);
 
-        pipelines.add_custom(
-            &device,
-            surface_format,
-            CUSTOM_SHADER_WITH_OVERLAY,
-            &[&first_layout],
-            &[4],
-        );
-        pipelines.add_custom(
-            &device,
-            surface_format,
-            CUSTOM_SHADER_WITH_OVERLAY,
-            &[&second_layout],
-            &[9],
-        );
+        pipelines.add_custom(&device, surface_format, CUSTOM_SHADER_WITH_OVERLAY, &[&first_layout], &[4]);
+        pipelines.add_custom(&device, surface_format, CUSTOM_SHADER_WITH_OVERLAY, &[&second_layout], &[9]);
         pipelines.add_custom(
             &device,
             TextureFormat::Rgba8UnormSrgb,
