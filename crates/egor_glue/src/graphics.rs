@@ -721,6 +721,8 @@ fn decode_readback_into(
     alpha_mask: bool,
     _source_cache: &mut Vec<u8>,
 ) {
+    #[cfg(feature = "profiling")]
+    profiling::scope!("decode_readback");
     let w = cap_w as usize;
     let h = cap_h as usize;
     let pixel_count = w * h;
@@ -2369,7 +2371,11 @@ impl ScreenCaptureState {
         // the render thread so a CPU conversion worker cannot steal/hold the
         // context while the frame thread is polling, submitting, or presenting.
         let unmap_started = Instant::now();
-        result.buffer.unmap();
+        {
+            #[cfg(feature = "profiling")]
+            profiling::scope!("readback_unmap");
+            result.buffer.unmap();
+        }
         let unmap_us = unmap_started.elapsed().as_micros() as u64;
 
         self.metrics.worker_jobs -= 1;

@@ -29,3 +29,34 @@ pub fn start_puffin_server(bind: &str) {
 
 #[cfg(not(feature = "profiling"))]
 pub fn start_puffin_server(_bind: &str) {}
+
+#[cfg(all(feature = "profiling", target_os = "windows"))]
+pub(crate) struct FrameCpuCycles(u64);
+
+#[cfg(all(feature = "profiling", target_os = "windows"))]
+impl FrameCpuCycles {
+    pub(crate) fn start() -> Self {
+        Self(Self::current())
+    }
+
+    fn current() -> u64 {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentThread() -> *mut std::ffi::c_void;
+            fn QueryThreadCycleTime(thread: *mut std::ffi::c_void, cycles: *mut u64) -> i32;
+        }
+        let mut cycles = 0;
+        // The pseudo-handle is valid for this thread and must not be closed.
+        unsafe { QueryThreadCycleTime(GetCurrentThread(), &mut cycles) };
+        cycles
+    }
+}
+
+#[cfg(all(feature = "profiling", target_os = "windows"))]
+impl Drop for FrameCpuCycles {
+    fn drop(&mut self) {
+        // Keep cycles as cycles: CPU frequency changes prevent conversion to time.
+        let cycles = Self::current().saturating_sub(self.0);
+        profiling::scope!("render_thread_cycles", &cycles.to_string());
+    }
+}

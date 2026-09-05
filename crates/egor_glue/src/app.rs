@@ -1034,6 +1034,8 @@ impl AppHandler<Renderer> for App {
         profile_new_frame!();
         #[cfg(feature = "profiling")]
         profiling::scope!("frame");
+        #[cfg(all(feature = "profiling", target_os = "windows"))]
+        let _cpu_cycles = crate::profiling::FrameCpuCycles::start();
 
         self.frame_timer_reset_requested = false;
 
@@ -1093,6 +1095,8 @@ impl AppHandler<Renderer> for App {
         // can still take CPU time, so measure it separately from the callback.
         let poll_started = Instant::now();
         if self.screen_capture.readback_in_flight() {
+            #[cfg(feature = "profiling")]
+            profiling::scope!("readback_poll");
             let _ = renderer.device().poll(egor_render::wgpu::PollType::Poll);
         }
         #[cfg(not(target_arch = "wasm32"))]
