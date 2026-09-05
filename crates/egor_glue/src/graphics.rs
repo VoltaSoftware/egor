@@ -717,6 +717,7 @@ fn decode_readback_into(
     grayscale: bool,
     alpha_mask: bool,
     _source_cache: &mut Vec<u8>,
+    #[cfg(target_os = "android")] cache_mapped_color: bool,
 ) {
     let w = cap_w as usize;
     let h = cap_h as usize;
@@ -732,9 +733,10 @@ fn decode_readback_into(
         .expect("readback buffer range must remain mapped after map_async succeeds");
     // Small loads from host-visible Adreno Vulkan memory are very expensive.
     // One sequential copy lets color conversion read ordinary cached RAM.
+    // This extra copy regresses OpenGLES conversion time on the Pixel 2 XL.
     // Grayscale already uses a bulk copy and needs no intermediate storage.
     #[cfg(target_os = "android")]
-    let src = if !grayscale {
+    let src = if cache_mapped_color && !grayscale {
         _source_cache.clear();
         _source_cache.extend_from_slice(&data);
         _source_cache.as_ptr()
@@ -876,7 +878,7 @@ struct ReadbackWorker {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl ReadbackWorker {
-    fn new() -> Self {
+    fn new(#[cfg(target_os = "android")] cache_mapped_color: bool) -> Self {
         let (job_tx, job_rx) = mpsc::channel::<ReadbackJob>();
         let (result_tx, result_rx) = mpsc::channel::<ReadbackResult>();
         thread::Builder::new()
@@ -895,6 +897,8 @@ impl ReadbackWorker {
                         job.grayscale,
                         job.alpha_mask,
                         &mut source_cache,
+                        #[cfg(target_os = "android")]
+                        cache_mapped_color,
                     );
                     job.buffer.unmap();
                     let complete_us = complete_start.elapsed().as_micros();
@@ -948,6 +952,8 @@ pub struct ScreenCaptureState {
     metrics: ScreenCaptureMetrics,
     buffers_released: bool,
     full_dirty_after_skip: bool,
+    #[cfg(target_os = "android")]
+    cache_mapped_color: Option<bool>,
     // -- GPU blit resources (lazily initialised) --
     blit_pipeline: Option<egor_render::wgpu::RenderPipeline>,
     blit_gray_pipeline: Option<egor_render::wgpu::RenderPipeline>,
@@ -1020,6 +1026,8 @@ impl ScreenCaptureState {
             metrics: ScreenCaptureMetrics::default(),
             buffers_released: false,
             full_dirty_after_skip: false,
+            #[cfg(target_os = "android")]
+            cache_mapped_color: None,
             blit_pipeline: None,
             blit_gray_pipeline: None,
             blit_gray_alpha_pipeline: None,
@@ -2248,7 +2256,14 @@ impl ScreenCaptureState {
         };
 
         let job_bytes = job.buf_size;
-        let worker = self.readback_worker.get_or_insert_with(ReadbackWorker::new);
+        #[cfg(target_os = "android")]
+        let cache_mapped_color = self.cache_mapped_color.unwrap_or(false);
+        let worker = self.readback_worker.get_or_insert_with(|| {
+            ReadbackWorker::new(
+                #[cfg(target_os = "android")]
+                cache_mapped_color,
+            )
+        });
         match worker.jobs.send(job) {
             Ok(()) => {
                 self.metrics.worker_jobs += 1;
@@ -2274,6 +2289,8 @@ impl ScreenCaptureState {
                     grayscale,
                     alpha_mask,
                     &mut Vec::new(),
+                    #[cfg(target_os = "android")]
+                    cache_mapped_color,
                 );
                 job.buffer.unmap();
                 self.slots[idx].buffer = Some(job.buffer);
@@ -2475,6 +2492,10 @@ impl<'a> Graphics<'a> {
         w: u32,
         h: u32,
     ) -> Self {
+        #[cfg(target_os = "android")]
+        screen_capture
+            .cache_mapped_color
+            .get_or_insert_with(|| renderer.adapter_info().backend == egor_render::wgpu::Backend::Vulkan);
         Self {
             renderer,
             batch,
