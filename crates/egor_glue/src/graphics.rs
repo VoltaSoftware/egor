@@ -108,6 +108,21 @@ struct PreparedCapture {
 pub type WatchCaptureDirtyRects = Vec<[u16; 4]>;
 pub type WatchCaptureFrameTag = [u64; 4];
 
+/// Capture-only counters for profiling. Byte counts exclude driver overhead.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScreenCaptureMetrics {
+    pub readback_bytes: u64,
+    pub staging_allocations: u64,
+    pub staging_allocated_bytes: u64,
+    pub skipped_requests: u64,
+    pub completed_frames: u64,
+    pub decode_us: u64,
+    pub worker_jobs: u64,
+    pub worker_bytes: u64,
+    pub gpu_bytes: u64,
+    pub cpu_buffer_bytes: u64,
+}
+
 impl WatchCaptureUniform {
     fn bytes(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts((self as *const Self).cast::<u8>(), std::mem::size_of::<Self>()) }
@@ -906,6 +921,7 @@ impl ReadbackWorker {
 ///      [`ScreenCaptureState::try_complete`]. Native builds hand ready slots
 ///      to a worker thread; wasm consumes the ready slot synchronously.
 pub struct ScreenCaptureState {
+    metrics: ScreenCaptureMetrics,
     // -- GPU blit resources (lazily initialised) --
     blit_pipeline: Option<egor_render::wgpu::RenderPipeline>,
     blit_gray_pipeline: Option<egor_render::wgpu::RenderPipeline>,
@@ -975,6 +991,7 @@ pub struct ScreenCaptureState {
 impl ScreenCaptureState {
     pub fn new() -> Self {
         Self {
+            metrics: ScreenCaptureMetrics::default(),
             blit_pipeline: None,
             blit_gray_pipeline: None,
             blit_gray_alpha_pipeline: None,
@@ -1156,6 +1173,27 @@ impl ScreenCaptureState {
     /// Returns `true` if a capture was requested this frame.
     pub fn is_requested(&self) -> bool {
         self.requested
+    }
+
+    pub fn metrics(&self) -> ScreenCaptureMetrics {
+        let mut metrics = self.metrics;
+        metrics.gpu_bytes = self
+            .slots
+            .iter()
+            .filter_map(|slot| slot.buffer.as_ref())
+            .map(Buffer::size)
+            .sum::<u64>()
+            + metrics.worker_bytes
+            + self.capture_tex_w as u64
+                * self.capture_tex_h as u64
+                * if self.capture_tex_gray {
+                    if self.capture_tex_alpha_mask { 2 } else { 1 }
+                } else {
+                    4
+                }
+            + self.source_copy_w as u64 * self.source_copy_h as u64 * 4;
+        metrics.cpu_buffer_bytes = self.rgb_buf.capacity() as u64;
+        metrics
     }
 
     /// Returns `true` if any ring-buffer slot has a GPU readback in flight.
@@ -1363,6 +1401,7 @@ impl ScreenCaptureState {
         if self.slots[idx].pending {
             let status = self.slots[idx].map_signal.load(Ordering::Acquire);
             if status == MAP_READY {
+                self.metrics.skipped_requests += 1;
                 // Capture submission runs on the frame path. Do not consume
                 // mapped readbacks here; the poll path/worker owns that work.
                 return None;
@@ -1371,6 +1410,7 @@ impl ScreenCaptureState {
             } else {
                 // Ring full — GPU hasn't finished this slot yet.
                 // Skip capture entirely; no blit, no copy, no allocation.
+                self.metrics.skipped_requests += 1;
                 return None;
             }
         }
@@ -1614,7 +1654,10 @@ impl ScreenCaptureState {
         // Reuse the staging buffer if dimensions haven't changed
         let needs_new = slot.buffer.is_none() || slot.buf_size != buffer_size || slot.row_pitch != padded_row;
 
+        self.metrics.readback_bytes += buffer_size;
         if needs_new {
+            self.metrics.staging_allocations += 1;
+            self.metrics.staging_allocated_bytes += buffer_size;
             slot.buffer = Some(device.create_buffer(&BufferDescriptor {
                 label: None,
                 size: buffer_size,
@@ -1811,7 +1854,10 @@ impl ScreenCaptureState {
         let buffer_size = (padded_row * cap_h) as u64;
 
         let needs_new = slot.buffer.is_none() || slot.buf_size != buffer_size || slot.row_pitch != padded_row;
+        self.metrics.readback_bytes += buffer_size;
         if needs_new {
+            self.metrics.staging_allocations += 1;
+            self.metrics.staging_allocated_bytes += buffer_size;
             slot.buffer = Some(device.create_buffer(&BufferDescriptor {
                 label: None,
                 size: buffer_size,
@@ -2084,6 +2130,8 @@ impl ScreenCaptureState {
 
         decode_readback_into(&buffer, &mut self.rgb_buf, cap_w, cap_h, row_pitch, grayscale, alpha_mask);
         buffer.unmap();
+        self.metrics.completed_frames += 1;
+        self.metrics.decode_us += complete_start.elapsed().as_micros() as u64;
 
         self.slots[idx].buffer = Some(buffer);
         self.slots[idx].pending = false;
@@ -2131,9 +2179,12 @@ impl ScreenCaptureState {
             }
         };
 
+        let job_bytes = job.buf_size;
         let worker = self.readback_worker.get_or_insert_with(ReadbackWorker::new);
         match worker.jobs.send(job) {
             Ok(()) => {
+                self.metrics.worker_jobs += 1;
+                self.metrics.worker_bytes += job_bytes;
                 self.slots[idx].pending = false;
             }
             Err(err) => {
@@ -2193,6 +2244,10 @@ impl ScreenCaptureState {
             slot.buffer = Some(result.buffer);
         }
 
+        self.metrics.worker_jobs -= 1;
+        self.metrics.worker_bytes -= result.buf_size;
+        self.metrics.completed_frames += 1;
+        self.metrics.decode_us += result.complete_us as u64;
         self.rgb_buf = result.rgb_buf;
         self.result_ready = true;
         self.result_w = result.cap_w as u16;
@@ -2821,5 +2876,9 @@ impl<'a> Graphics<'a> {
     /// Access the completed screen capture RGB buffer.
     pub fn screen_capture_rgb_buf(&self) -> &[u8] {
         self.screen_capture.rgb_buf()
+    }
+
+    pub fn screen_capture_metrics(&self) -> ScreenCaptureMetrics {
+        self.screen_capture.metrics()
     }
 }
