@@ -1232,6 +1232,16 @@ impl ScreenCaptureState {
         self.full_dirty_after_skip = false;
     }
 
+    pub(crate) fn finish_private_warmup(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        let worker = self.readback_worker.take();
+        self.release_buffers();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.readback_worker = worker;
+        }
+    }
+
     pub(crate) fn take_buffers_released(&mut self) -> bool {
         std::mem::take(&mut self.buffers_released)
     }

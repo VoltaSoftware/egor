@@ -1134,7 +1134,11 @@ impl AppHandler<Renderer> for App {
                 if !complete {
                     log::warn!("[egor] private watch readback warmup timed out");
                 }
-                self.screen_capture.release_buffers();
+                if complete {
+                    self.screen_capture.finish_private_warmup();
+                } else {
+                    self.screen_capture.release_buffers();
+                }
                 self.watch_readback_warmup_started = None;
             } else {
                 self.finish_frame_stats(frame_stats, egor_frame_started_at);
