@@ -193,8 +193,6 @@ struct WatchFrameTarget {
     color_view: egor_render::wgpu::TextureView,
     _overlay_texture: egor_render::Texture,
     overlay_view: egor_render::wgpu::TextureView,
-    _depth_texture: egor_render::Texture,
-    depth_view: egor_render::wgpu::TextureView,
     width: u32,
     height: u32,
     format: TextureFormat,
@@ -236,29 +234,11 @@ impl WatchFrameTarget {
         });
         let overlay_view = overlay_texture.create_view(&Default::default());
 
-        let depth_texture = device.create_texture(&egor_render::wgpu::TextureDescriptor {
-            label: Some("Watch Frame Depth Target"),
-            size: egor_render::wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: egor_render::wgpu::TextureDimension::D2,
-            format: egor_render::Renderer::DEPTH_FORMAT,
-            usage: egor_render::wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        let depth_view = depth_texture.create_view(&Default::default());
-
         Self {
             _color_texture: color_texture,
             color_view,
             _overlay_texture: overlay_texture,
             overlay_view,
-            _depth_texture: depth_texture,
-            depth_view,
             width,
             height,
             format,
@@ -1178,6 +1158,10 @@ impl AppHandler<Renderer> for App {
         };
 
         let prep_started_at = Instant::now();
+        if self.screen_capture.take_buffers_released() {
+            self.watch_frame_target = None;
+            self.capture_frame_target = None;
+        }
 
         if let Some(native_refresh_rate_fps) = requested_native_refresh_rate_fps {
             self.native_refresh_rate_fps = native_refresh_rate_fps;
@@ -1353,7 +1337,9 @@ impl AppHandler<Renderer> for App {
             .map(|target| &target.color_view)
             .or(capture_frame_view)
             .unwrap_or(&frame.view);
-        let main_depth_view = watch_frame_target.map(|target| &target.depth_view).unwrap_or(renderer.depth_view());
+        // The watch color attachments have the backbuffer's dimensions and
+        // replace its main pass, so they can share the existing depth target.
+        let main_depth_view = renderer.depth_view();
         let watch_overlay_view = watch_frame_target.map(|target| &target.overlay_view);
 
         let render_pass_started_at = Instant::now();

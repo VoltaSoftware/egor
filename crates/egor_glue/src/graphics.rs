@@ -691,6 +691,8 @@ unsafe fn pack_rgba_to_rgb565(src: *const u8, dst: *mut u8, w: usize, h: usize, 
 fn unpremultiply_channel(channel: u8, alpha: u8) -> u8 {
     if alpha == 0 {
         0
+    } else if alpha == 255 {
+        channel
     } else {
         (((channel as u32 * 255) + (alpha as u32 / 2)) / alpha as u32).min(255) as u8
     }
@@ -706,7 +708,16 @@ fn readback_output_len(cap_w: u32, cap_h: u32, grayscale: bool, alpha_mask: bool
     }
 }
 
-fn decode_readback_into(buffer: &Buffer, dst: &mut Vec<u8>, cap_w: u32, cap_h: u32, row_pitch: usize, grayscale: bool, alpha_mask: bool) {
+fn decode_readback_into(
+    buffer: &Buffer,
+    dst: &mut Vec<u8>,
+    cap_w: u32,
+    cap_h: u32,
+    row_pitch: usize,
+    grayscale: bool,
+    alpha_mask: bool,
+    _source_cache: &mut Vec<u8>,
+) {
     let w = cap_w as usize;
     let h = cap_h as usize;
     let pixel_count = w * h;
@@ -719,6 +730,18 @@ fn decode_readback_into(buffer: &Buffer, dst: &mut Vec<u8>, cap_w: u32, cap_h: u
         .slice(..)
         .get_mapped_range()
         .expect("readback buffer range must remain mapped after map_async succeeds");
+    // Small loads from host-visible Adreno Vulkan memory are very expensive.
+    // One sequential copy lets color conversion read ordinary cached RAM.
+    // Grayscale already uses a bulk copy and needs no intermediate storage.
+    #[cfg(target_os = "android")]
+    let src = if !grayscale {
+        _source_cache.clear();
+        _source_cache.extend_from_slice(&data);
+        _source_cache.as_ptr()
+    } else {
+        data.as_ptr()
+    };
+    #[cfg(not(target_os = "android"))]
     let src = data.as_ptr();
 
     if alpha_mask {
@@ -778,6 +801,7 @@ fn decode_readback_into(buffer: &Buffer, dst: &mut Vec<u8>, cap_w: u32, cap_h: u
 
 struct StagingSlot {
     buffer: Option<Buffer>,
+    rgb_buf: Vec<u8>,
     buf_size: u64,
     row_pitch: u32,
     cap_w: u32,
@@ -795,6 +819,7 @@ impl StagingSlot {
     fn new() -> Self {
         Self {
             buffer: None,
+            rgb_buf: Vec::new(),
             buf_size: 0,
             row_pitch: 0,
             cap_w: 0,
@@ -813,6 +838,7 @@ impl StagingSlot {
 #[cfg(not(target_arch = "wasm32"))]
 struct ReadbackJob {
     slot_idx: usize,
+    rgb_buf: Vec<u8>,
     buffer: Buffer,
     buf_size: u64,
     row_pitch: usize,
@@ -856,9 +882,10 @@ impl ReadbackWorker {
         thread::Builder::new()
             .name("egor-readback".to_owned())
             .spawn(move || {
-                let mut rgb_buf = Vec::new();
+                let mut source_cache = Vec::new();
                 while let Ok(job) = job_rx.recv() {
                     let complete_start = Instant::now();
+                    let mut rgb_buf = job.rgb_buf;
                     decode_readback_into(
                         &job.buffer,
                         &mut rgb_buf,
@@ -867,6 +894,7 @@ impl ReadbackWorker {
                         job.row_pitch,
                         job.grayscale,
                         job.alpha_mask,
+                        &mut source_cache,
                     );
                     job.buffer.unmap();
                     let complete_us = complete_start.elapsed().as_micros();
@@ -882,7 +910,7 @@ impl ReadbackWorker {
                         metadata: job.metadata,
                         dirty_rects: job.dirty_rects,
                         frame_tag: job.frame_tag,
-                        rgb_buf: std::mem::take(&mut rgb_buf),
+                        rgb_buf,
                         complete_us,
                     };
                     if result_tx.send(result).is_err() {
@@ -900,13 +928,9 @@ impl ReadbackWorker {
 }
 
 /// Asynchronous screen capture with GPU blit-downsample, a ring buffer of
-/// staging buffers, and non-blocking readback. Mirrors the old OpenGL
-/// PBO + fence-sync pipeline: by the time we read slot N, the GPU has had
-/// `SLOT_COUNT − 1` extra frames to finish the copy, so stalls are
-/// virtually impossible.
-///
-/// Zero platform-specific code — works across Vulkan, Metal, DX12, and
-/// WebGPU via wgpu.
+/// staging buffers, and asynchronous readback through wgpu. Native conversion
+/// runs on a worker. An occupied ring skips new requests instead of waiting
+/// for the GPU or allowing the worker queue to grow.
 ///
 /// Lifecycle:
 ///   1. Game calls [`ScreenCaptureState::request`] each frame it wants a
@@ -922,6 +946,7 @@ impl ReadbackWorker {
 ///      to a worker thread; wasm consumes the ready slot synchronously.
 pub struct ScreenCaptureState {
     metrics: ScreenCaptureMetrics,
+    buffers_released: bool,
     // -- GPU blit resources (lazily initialised) --
     blit_pipeline: Option<egor_render::wgpu::RenderPipeline>,
     blit_gray_pipeline: Option<egor_render::wgpu::RenderPipeline>,
@@ -992,6 +1017,7 @@ impl ScreenCaptureState {
     pub fn new() -> Self {
         Self {
             metrics: ScreenCaptureMetrics::default(),
+            buffers_released: false,
             blit_pipeline: None,
             blit_gray_pipeline: None,
             blit_gray_alpha_pipeline: None,
@@ -1167,7 +1193,25 @@ impl ScreenCaptureState {
         self.source_copy_w = 0;
         self.source_copy_h = 0;
         self.watch_capture_uniform = None;
-        self.rgb_buf.clear();
+        self.rgb_buf = Vec::new();
+        self.slots = std::array::from_fn(|_| StagingSlot::new());
+        self.write_idx = 0;
+        self.needs_map = None;
+        self.result_ready = false;
+        self.result_metadata = None;
+        self.result_dirty_rects = None;
+        self.result_frame_tag = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.readback_worker = None;
+        }
+        self.metrics.worker_jobs = 0;
+        self.metrics.worker_bytes = 0;
+        self.buffers_released = true;
+    }
+
+    pub(crate) fn take_buffers_released(&mut self) -> bool {
+        std::mem::take(&mut self.buffers_released)
     }
 
     /// Returns `true` if a capture was requested this frame.
@@ -1192,7 +1236,8 @@ impl ScreenCaptureState {
                     4
                 }
             + self.source_copy_w as u64 * self.source_copy_h as u64 * 4;
-        metrics.cpu_buffer_bytes = self.rgb_buf.capacity() as u64;
+        metrics.cpu_buffer_bytes =
+            self.rgb_buf.capacity() as u64 + self.slots.iter().map(|slot| slot.rgb_buf.capacity() as u64).sum::<u64>();
         metrics
     }
 
@@ -2128,7 +2173,16 @@ impl ScreenCaptureState {
             }
         };
 
-        decode_readback_into(&buffer, &mut self.rgb_buf, cap_w, cap_h, row_pitch, grayscale, alpha_mask);
+        decode_readback_into(
+            &buffer,
+            &mut self.rgb_buf,
+            cap_w,
+            cap_h,
+            row_pitch,
+            grayscale,
+            alpha_mask,
+            &mut Vec::new(),
+        );
         buffer.unmap();
         self.metrics.completed_frames += 1;
         self.metrics.decode_us += complete_start.elapsed().as_micros() as u64;
@@ -2166,6 +2220,7 @@ impl ScreenCaptureState {
 
             ReadbackJob {
                 slot_idx: idx,
+                rgb_buf: std::mem::take(&mut slot.rgb_buf),
                 buffer,
                 buf_size: slot.buf_size,
                 row_pitch: slot.row_pitch as usize,
@@ -2185,7 +2240,8 @@ impl ScreenCaptureState {
             Ok(()) => {
                 self.metrics.worker_jobs += 1;
                 self.metrics.worker_bytes += job_bytes;
-                self.slots[idx].pending = false;
+                // Keep this slot occupied until collection. This bounds jobs
+                // and staging buffers to SLOT_COUNT when conversion is slow.
             }
             Err(err) => {
                 let job = err.0;
@@ -2196,7 +2252,16 @@ impl ScreenCaptureState {
                 let alpha_mask = job.alpha_mask;
                 let row_pitch = job.row_pitch;
                 let metadata = job.metadata;
-                decode_readback_into(&job.buffer, &mut self.rgb_buf, cap_w, cap_h, row_pitch, grayscale, alpha_mask);
+                decode_readback_into(
+                    &job.buffer,
+                    &mut self.rgb_buf,
+                    cap_w,
+                    cap_h,
+                    row_pitch,
+                    grayscale,
+                    alpha_mask,
+                    &mut Vec::new(),
+                );
                 job.buffer.unmap();
                 self.slots[idx].buffer = Some(job.buffer);
                 self.slots[idx].pending = false;
@@ -2236,19 +2301,20 @@ impl ScreenCaptureState {
         };
 
         if let Some(slot) = self.slots.get_mut(result.slot_idx)
-            && !slot.pending
+            && slot.pending
             && slot.buffer.is_none()
             && slot.buf_size == result.buf_size
             && slot.row_pitch == result.row_pitch
         {
             slot.buffer = Some(result.buffer);
+            slot.pending = false;
+            slot.rgb_buf = std::mem::replace(&mut self.rgb_buf, result.rgb_buf);
         }
 
         self.metrics.worker_jobs -= 1;
         self.metrics.worker_bytes -= result.buf_size;
         self.metrics.completed_frames += 1;
         self.metrics.decode_us += result.complete_us as u64;
-        self.rgb_buf = result.rgb_buf;
         self.result_ready = true;
         self.result_w = result.cap_w as u16;
         self.result_h = result.cap_h as u16;
@@ -2305,9 +2371,12 @@ impl ScreenCaptureState {
             if !self.slots[idx].pending {
                 continue;
             }
+            if self.slots[idx].buffer.is_none() {
+                continue;
+            } // Owned by the worker.
             let status = self.slots[idx].map_signal.load(Ordering::Acquire);
             if status == MAP_PENDING {
-                continue;
+                break; // Preserve frame order even if callbacks arrive out of order.
             }
             if status == MAP_FAILED {
                 eprintln!("[ScreenCapture] buffer map failed on slot {idx}");
