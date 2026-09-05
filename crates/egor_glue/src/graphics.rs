@@ -771,11 +771,25 @@ fn decode_readback_into(
                 for x in 0..w {
                     let s = unsafe { row.add(x * 4) };
                     let a = unsafe { *s.add(3) };
-                    let r = unpremultiply_channel(unsafe { *s }, a) as u16;
-                    let g = unpremultiply_channel(unsafe { *s.add(1) }, a) as u16;
-                    let b = unpremultiply_channel(unsafe { *s.add(2) }, a) as u16;
                     let idx = dst_off + x;
-                    let packed = if a == 0 { 0 } else { ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3) };
+                    // Map pixels are transparent and HUD/sprites are mostly
+                    // opaque. Handle alpha once per pixel, and only read RGB
+                    // when it contributes to the captured foreground.
+                    let packed = match a {
+                        0 => 0,
+                        255 => {
+                            let r = unsafe { *s } as u16;
+                            let g = unsafe { *s.add(1) } as u16;
+                            let b = unsafe { *s.add(2) } as u16;
+                            ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
+                        }
+                        _ => {
+                            let r = unpremultiply_channel(unsafe { *s }, a) as u16;
+                            let g = unpremultiply_channel(unsafe { *s.add(1) }, a) as u16;
+                            let b = unpremultiply_channel(unsafe { *s.add(2) }, a) as u16;
+                            ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
+                        }
+                    };
                     unsafe { *d.add(idx) = packed };
                     alpha_out[idx] = a;
                 }
