@@ -1090,10 +1090,10 @@ impl AppHandler<Renderer> for App {
             }
         }
 
-        // Drive wgpu map_async callbacks at the START of the frame.
-        // Poll never requests a GPU wait. Backend mapping and context locking
-        // can still take CPU time, so measure it separately from the callback.
+        // Windows dispatches completed maps after queue submission, which
+        // already polls wgpu. Other platforms keep their earlier delivery.
         let poll_started = Instant::now();
+        #[cfg(not(target_os = "windows"))]
         if self.screen_capture.readback_in_flight() {
             #[cfg(feature = "profiling")]
             profiling::scope!("readback_poll");
@@ -1791,6 +1791,13 @@ impl AppHandler<Renderer> for App {
                 return;
             }
             frame_stats.queue_submit_time = queue_submit_started_at.elapsed();
+            #[cfg(target_os = "windows")]
+            {
+                if capture_active {
+                    self.screen_capture.begin_readback_map();
+                }
+                self.screen_capture.dispatch_submitted_readbacks();
+            }
             if let Some(p) = presentable {
                 let present_started_at = Instant::now();
                 if let Err(error) = renderer.try_present(p) {
@@ -1808,6 +1815,7 @@ impl AppHandler<Renderer> for App {
 
         // Start the async map AFTER submit so the staging buffer isn't
         // in a pending-map state when the command buffer is submitted.
+        #[cfg(not(target_os = "windows"))]
         if capture_active {
             self.screen_capture.begin_readback_map();
         }

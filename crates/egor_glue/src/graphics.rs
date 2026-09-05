@@ -2231,6 +2231,25 @@ impl ScreenCaptureState {
 
     // -- readback polling ------------------------------------------------
 
+    #[cfg(target_os = "windows")]
+    pub(crate) fn dispatch_submitted_readbacks(&mut self) {
+        // Queue submission drives callbacks for older maps. Start conversion
+        // before present and the frame timer, so it can finish by the next
+        // callback without a second device poll or another frame of latency.
+        for i in 0..SLOT_COUNT {
+            let idx = (self.write_idx + i) % SLOT_COUNT;
+            let slot = &self.slots[idx];
+            if !slot.pending || slot.buffer.is_none() {
+                continue;
+            }
+            match slot.map_signal.load(Ordering::Acquire) {
+                MAP_PENDING => break,
+                MAP_READY => self.dispatch_slot_to_worker(idx),
+                _ => {}
+            }
+        }
+    }
+
     /// Consume the oldest completed ring-buffer slot. For grayscale the
     /// staging buffer already holds R8 data from the GPU — just strip row
     /// padding. For RGB565, convert BGRA→RGB565 with unsafe pointer math.
