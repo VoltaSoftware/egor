@@ -507,11 +507,12 @@ impl Renderer {
     pub fn adapter(&self) -> &Adapter {
         &self.gpu.adapter
     }
-    /// Returns information about the active GPU adapter/backend.
+    /// Flags used when creating this renderer's wgpu instance.
     pub fn instance_flags(&self) -> wgpu::InstanceFlags {
         self.instance_flags
     }
 
+    /// Returns information about the active GPU adapter/backend.
     pub fn adapter_info(&self) -> AdapterInfo {
         self.gpu.adapter.get_info()
     }
