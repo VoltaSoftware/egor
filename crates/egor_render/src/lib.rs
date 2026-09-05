@@ -1,6 +1,7 @@
 pub mod batch;
 pub mod frame;
 pub mod instance;
+mod instance_upload;
 mod pipeline;
 pub mod target;
 mod texture;
@@ -11,6 +12,8 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+
+pub use instance_upload::InstanceUploadMetrics;
 
 pub use wgpu::{
     self, AdapterInfo, Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, Extent3d, MemoryHints, Queue, RenderPass, Texture,
@@ -222,6 +225,7 @@ pub struct Renderer {
     depth_view: TextureView,
     depth_size: (u32, u32),
     shared_instance_buffer: Option<Buffer>,
+    instance_upload_pool: Option<instance_upload::InstanceUploadPool>,
     last_camera: [[[f32; 4]; 4]; 8],
 }
 
@@ -432,6 +436,8 @@ impl Renderer {
         let (depth_texture, depth_view) = Self::create_depth_texture(&device, 1, 1);
         log::info!("[egor] renderer init: complete");
 
+        let instance_upload_pool = (cfg!(target_os = "windows") && adapter.get_info().backend == wgpu::Backend::Gl)
+            .then(instance_upload::InstanceUploadPool::default);
         Ok(Renderer {
             instance_flags,
             gpu: Gpu {
@@ -458,6 +464,7 @@ impl Renderer {
             depth_view,
             depth_size: (1, 1),
             shared_instance_buffer: None,
+            instance_upload_pool,
             last_camera: [[[0.0; 4]; 4]; 8],
         })
     }
@@ -1072,6 +1079,23 @@ impl Renderer {
     /// Accepts per-batch instance slices to avoid an intermediate Vec — writes
     /// directly into the wgpu staging buffer via `write_buffer_with`.
     pub fn upload_shared_instances_batched(&mut self, batch_slices: &[&[instance::Instance]]) {
+        self.upload_instances(batch_slices, None);
+    }
+
+    /// Encode reusable instance uploads before any render pass in this encoder.
+    /// The encoder must be submitted for the upload slots to become available again.
+    pub fn upload_shared_instances_with_encoder(&mut self, batch_slices: &[&[instance::Instance]], encoder: &mut CommandEncoder) {
+        self.upload_instances(batch_slices, Some(encoder));
+    }
+
+    pub fn instance_upload_metrics(&self) -> InstanceUploadMetrics {
+        self.instance_upload_pool
+            .as_ref()
+            .map(instance_upload::InstanceUploadPool::metrics)
+            .unwrap_or_default()
+    }
+
+    fn upload_instances(&mut self, batch_slices: &[&[instance::Instance]], encoder: Option<&mut CommandEncoder>) {
         let inst_size = std::mem::size_of::<instance::Instance>();
         let total_instances: usize = batch_slices.iter().map(|s| s.len()).sum();
         if total_instances == 0 {
@@ -1089,6 +1113,11 @@ impl Renderer {
             }));
         }
         let buf = self.shared_instance_buffer.as_ref().unwrap();
+        if let (Some(pool), Some(encoder)) = (&mut self.instance_upload_pool, encoder)
+            && pool.upload(&self.gpu.device, encoder, buf, batch_slices, required_bytes)
+        {
+            return;
+        }
         if let Some(mut view) = self
             .gpu
             .queue

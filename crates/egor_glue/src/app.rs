@@ -365,8 +365,10 @@ pub struct FrameStats {
     pub user_callback_time: Duration,
     /// Time spent driving asynchronous GPU mapping callbacks before update.
     pub readback_poll_time: Duration,
-    /// Egor work between the user callback and surface acquisition.
+    /// Egor preparation and geometry upload before encoding render passes.
     pub prep_time: Duration,
+    /// Current retained instance-upload resources and cumulative fallback count.
+    pub instance_upload: egor_render::InstanceUploadMetrics,
     /// Time spent acquiring the current surface texture.
     pub surface_acquire_time: Duration,
     /// Time spent encoding draw calls into render passes.
@@ -1292,36 +1294,6 @@ impl AppHandler<Renderer> for App {
             }
         }
 
-        {
-            #[cfg(feature = "profiling")]
-            profiling::scope!("batch_upload");
-            // Pre-upload all batch geometry to GPU before starting any render pass.
-            // This batches the write_buffer calls together for better cache/driver behavior
-            // and makes the upload() calls inside draw_batch a no-op (dirty flags already cleared).
-            let mut _total_verts: usize = 0;
-            let mut _total_indices: usize = 0;
-            let mut _total_instances: usize = 0;
-            let mut _dirty_batches: usize = 0;
-            let inst_size = std::mem::size_of::<Instance>();
-            self.instance_byte_offsets.clear();
-            let mut running_offset: usize = 0;
-            for batch in &mut batches {
-                _total_verts += batch.geometry.vertex_count();
-                _total_indices += batch.geometry.index_count();
-                _total_instances += batch.geometry.instance_count();
-                if batch.geometry.is_dirty() {
-                    _dirty_batches += 1;
-                }
-                self.instance_byte_offsets.push((running_offset * inst_size) as u64);
-                running_offset += batch.geometry.instance_count();
-                batch.geometry.upload_geometry_only(&device, &queue);
-            }
-            {
-                let batch_instance_slices: Vec<&[Instance]> = batches.iter().map(|b| b.geometry.instances()).collect();
-                renderer.upload_shared_instances_batched(&batch_instance_slices);
-            }
-        } // profile_scope batch_upload
-
         let mut capture_active = self.screen_capture.is_requested();
         let mut capture_source_render_target = self.screen_capture.requested_source_render_target();
         let mut use_watch_frame_target = self.screen_capture.is_watch_overlay_capture_requested();
@@ -1414,6 +1386,39 @@ impl AppHandler<Renderer> for App {
         self.surface_recovery.record_frame_acquired();
         self.waiting_for_surface_change = false;
         self.surface_acquire_retry_interval = None;
+
+        let upload_started_at = Instant::now();
+        {
+            #[cfg(feature = "profiling")]
+            profiling::scope!("batch_upload");
+            // Pre-upload all batch geometry to GPU before starting any render pass.
+            // This batches the write_buffer calls together for better cache/driver behavior
+            // and makes the upload() calls inside draw_batch a no-op (dirty flags already cleared).
+            let mut _total_verts: usize = 0;
+            let mut _total_indices: usize = 0;
+            let mut _total_instances: usize = 0;
+            let mut _dirty_batches: usize = 0;
+            let inst_size = std::mem::size_of::<Instance>();
+            self.instance_byte_offsets.clear();
+            let mut running_offset: usize = 0;
+            for batch in &mut batches {
+                _total_verts += batch.geometry.vertex_count();
+                _total_indices += batch.geometry.index_count();
+                _total_instances += batch.geometry.instance_count();
+                if batch.geometry.is_dirty() {
+                    _dirty_batches += 1;
+                }
+                self.instance_byte_offsets.push((running_offset * inst_size) as u64);
+                running_offset += batch.geometry.instance_count();
+                batch.geometry.upload_geometry_only(&device, &queue);
+            }
+            {
+                let batch_instance_slices: Vec<&[Instance]> = batches.iter().map(|b| b.geometry.instances()).collect();
+                renderer.upload_shared_instances_with_encoder(&batch_instance_slices, &mut frame.encoder);
+            }
+        } // profile_scope batch_upload
+        frame_stats.prep_time += upload_started_at.elapsed();
+        frame_stats.instance_upload = renderer.instance_upload_metrics();
 
         let watch_frame_target = if use_watch_frame_target {
             self.watch_frame_target.as_ref()
