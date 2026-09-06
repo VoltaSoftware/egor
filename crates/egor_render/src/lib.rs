@@ -742,7 +742,9 @@ impl Renderer {
                     view: overlay_view,
                     resolve_target: None,
                     ops: Operations {
-                        load: LoadOp::Clear(wgpu::Color::BLACK),
+                        // Server-owned map pixels have zero overlay alpha, so the
+                        // background must stay transparent when we blend over it.
+                        load: LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: StoreOp::Store,
                     },
                     depth_slice: None,
