@@ -1,5 +1,6 @@
 use egor_render::{
-    AdapterInfo, Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, Extent3d, Renderer, Texture, TextureFormat,
+    AdapterInfo, Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, Extent3d,
+    Renderer, Texture, TextureFormat,
     batch::GeometryBatch,
     target::{OffscreenTarget, RenderTarget},
 };
@@ -36,13 +37,22 @@ pub struct RenderTargetStore {
 
 impl RenderTargetStore {
     pub fn new() -> Self {
-        Self { targets: Vec::new() }
+        Self {
+            targets: Vec::new(),
+        }
     }
 
     /// Create an offscreen render target and return its index.
-    pub fn create(&mut self, device: &Device, width: u32, height: u32, format: TextureFormat) -> usize {
+    pub fn create(
+        &mut self,
+        device: &Device,
+        width: u32,
+        height: u32,
+        format: TextureFormat,
+    ) -> usize {
         let id = self.targets.len();
-        self.targets.push(OffscreenTarget::new(device, width, height, format));
+        self.targets
+            .push(OffscreenTarget::new(device, width, height, format));
         id
     }
 
@@ -101,6 +111,7 @@ struct PreparedCapture {
     cap_h: u32,
     grayscale: bool,
     alpha_mask: bool,
+    rgba8: bool,
     metadata: Option<[f32; 10]>,
     dirty_rects: Option<Vec<[u16; 4]>>,
     frame_tag: Option<[u64; 4]>,
@@ -128,7 +139,12 @@ pub struct ScreenCaptureMetrics {
 
 impl WatchCaptureUniform {
     fn bytes(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts((self as *const Self).cast::<u8>(), std::mem::size_of::<Self>()) }
+        unsafe {
+            std::slice::from_raw_parts(
+                (self as *const Self).cast::<u8>(),
+                std::mem::size_of::<Self>(),
+            )
+        }
     }
 }
 
@@ -701,8 +717,17 @@ fn unpremultiply_channel(channel: u8, alpha: u8) -> u8 {
     }
 }
 
-fn readback_output_len(cap_w: u32, cap_h: u32, grayscale: bool, alpha_mask: bool) -> usize {
+fn readback_output_len(
+    cap_w: u32,
+    cap_h: u32,
+    grayscale: bool,
+    alpha_mask: bool,
+    rgba8: bool,
+) -> usize {
     let pixel_count = cap_w as usize * cap_h as usize;
+    if rgba8 {
+        return pixel_count * 4;
+    }
     match (grayscale, alpha_mask) {
         (true, false) => pixel_count,
         (true, true) => pixel_count * 2,
@@ -719,35 +744,69 @@ fn decode_readback_into(
     row_pitch: usize,
     grayscale: bool,
     alpha_mask: bool,
+    rgba8: bool,
     _source_cache: &mut Vec<u8>,
 ) {
     #[cfg(feature = "profiling")]
     profiling::scope!("decode_readback");
-    let w = cap_w as usize;
-    let h = cap_h as usize;
-    let pixel_count = w * h;
-    let out_len = readback_output_len(cap_w, cap_h, grayscale, alpha_mask);
-
-    dst.reserve(out_len.saturating_sub(dst.len()));
-    unsafe { dst.set_len(out_len) };
-
     let data = buffer
         .slice(..)
         .get_mapped_range()
         .expect("readback buffer range must remain mapped after map_async succeeds");
+    let data: &[u8] = &data;
     // Small loads from host-visible Adreno memory are very expensive.
     // One sequential copy lets color conversion read ordinary cached RAM.
     // Native GLES readback must avoid wgpu's emulated main-thread copy too.
-    // Grayscale already uses a bulk copy and needs no intermediate storage.
+    // Grayscale and RGBA8 already copy in bulk and need no intermediate storage.
     #[cfg(target_os = "android")]
-    let src = if !grayscale {
+    let data = if !grayscale && !rgba8 {
         _source_cache.clear();
-        _source_cache.extend_from_slice(&data);
-        _source_cache.as_ptr()
+        _source_cache.extend_from_slice(data);
+        _source_cache.as_slice()
     } else {
-        data.as_ptr()
+        data
     };
-    #[cfg(not(target_os = "android"))]
+    decode_readback_bytes(
+        data, dst, cap_w, cap_h, row_pitch, grayscale, alpha_mask, rgba8,
+    );
+}
+
+fn decode_readback_bytes(
+    data: &[u8],
+    dst: &mut Vec<u8>,
+    cap_w: u32,
+    cap_h: u32,
+    row_pitch: usize,
+    grayscale: bool,
+    alpha_mask: bool,
+    rgba8: bool,
+) {
+    let w = cap_w as usize;
+    let h = cap_h as usize;
+    let pixel_count = w * h;
+    let out_len = readback_output_len(cap_w, cap_h, grayscale, alpha_mask, rgba8);
+
+    // Preserve the actual RGBA8 bytes for screenshots, including low color bits.
+    // Network/watch captures continue to use the existing compact formats.
+    if rgba8 {
+        let row_bytes = w * 4;
+        dst.clear();
+        dst.reserve(out_len);
+        for y in 0..h {
+            dst.extend_from_slice(&data[y * row_pitch..y * row_pitch + row_bytes]);
+        }
+        return;
+    }
+
+    let input_channels = if grayscale {
+        if alpha_mask { 2 } else { 1 }
+    } else {
+        4
+    };
+    assert!(row_pitch >= w * input_channels);
+    assert!(data.len() >= h * row_pitch);
+    dst.reserve(out_len.saturating_sub(dst.len()));
+    unsafe { dst.set_len(out_len) };
     let src = data.as_ptr();
 
     if alpha_mask {
@@ -761,7 +820,11 @@ fn decode_readback_into(
                 let out = dst.as_mut_ptr();
                 for y in 0..h {
                     unsafe {
-                        std::ptr::copy_nonoverlapping(src.add(y * row_pitch), out.add(y * unpadded_row), unpadded_row);
+                        std::ptr::copy_nonoverlapping(
+                            src.add(y * row_pitch),
+                            out.add(y * unpadded_row),
+                            unpadded_row,
+                        );
                     }
                 }
             }
@@ -828,6 +891,7 @@ struct StagingSlot {
     cap_h: u32,
     grayscale: bool,
     alpha_mask: bool,
+    rgba8: bool,
     metadata: Option<[f32; 10]>,
     dirty_rects: Option<WatchCaptureDirtyRects>,
     frame_tag: Option<WatchCaptureFrameTag>,
@@ -846,6 +910,7 @@ impl StagingSlot {
             cap_h: 0,
             grayscale: false,
             alpha_mask: false,
+            rgba8: false,
             metadata: None,
             dirty_rects: None,
             frame_tag: None,
@@ -867,6 +932,7 @@ struct ReadbackJob {
     cap_h: u32,
     grayscale: bool,
     alpha_mask: bool,
+    rgba8: bool,
     metadata: Option<[f32; 10]>,
     dirty_rects: Option<WatchCaptureDirtyRects>,
     frame_tag: Option<WatchCaptureFrameTag>,
@@ -927,6 +993,7 @@ impl ReadbackWorker {
                             job.row_pitch,
                             job.grayscale,
                             job.alpha_mask,
+                            job.rgba8,
                             &mut source_cache,
                         );
                     }
@@ -1024,6 +1091,7 @@ pub struct ScreenCaptureState {
     capture_h: u32,
     pub grayscale: bool,
     pub alpha_mask: bool,
+    rgba8: bool,
     source_render_target: Option<usize>,
     watch_overlay_capture: bool,
     final_frame_logical_w: u32,
@@ -1092,6 +1160,7 @@ impl ScreenCaptureState {
             capture_h: 0,
             grayscale: false,
             alpha_mask: false,
+            rgba8: false,
             source_render_target: None,
             watch_overlay_capture: false,
             final_frame_logical_w: 0,
@@ -1139,6 +1208,7 @@ impl ScreenCaptureState {
         self.capture_h = h;
         self.grayscale = grayscale;
         self.alpha_mask = false;
+        self.rgba8 = false;
         self.source_render_target = None;
         self.watch_overlay_capture = false;
         self.request_metadata = None;
@@ -1146,12 +1216,27 @@ impl ScreenCaptureState {
         self.request_frame_tag = None;
     }
 
-    pub fn request_with_alpha_mask(&mut self, w: u32, h: u32, grayscale: bool, source_render_target: usize, metadata: Option<[f32; 10]>) {
+    /// Request full RGBA8 screenshot bytes instead of the compact RGB565 format.
+    /// Read the completed buffer through `rgb_buf()` after polling completion.
+    pub fn request_rgba8(&mut self, w: u32, h: u32) {
+        self.request(w, h, false);
+        self.rgba8 = true;
+    }
+
+    pub fn request_with_alpha_mask(
+        &mut self,
+        w: u32,
+        h: u32,
+        grayscale: bool,
+        source_render_target: usize,
+        metadata: Option<[f32; 10]>,
+    ) {
         self.requested = true;
         self.capture_w = w;
         self.capture_h = h;
         self.grayscale = grayscale;
         self.alpha_mask = true;
+        self.rgba8 = false;
         self.source_render_target = Some(source_render_target);
         self.watch_overlay_capture = false;
         self.request_metadata = metadata;
@@ -1176,6 +1261,7 @@ impl ScreenCaptureState {
         self.capture_h = h;
         self.grayscale = grayscale;
         self.alpha_mask = true;
+        self.rgba8 = false;
         self.source_render_target = None;
         self.watch_overlay_capture = true;
         self.final_frame_logical_w = logical_w.max(1);
@@ -1187,7 +1273,11 @@ impl ScreenCaptureState {
     }
 
     pub fn requested_source_render_target(&self) -> Option<usize> {
-        if self.requested { self.source_render_target } else { None }
+        if self.requested {
+            self.source_render_target
+        } else {
+            None
+        }
     }
 
     pub fn is_watch_overlay_capture_requested(&self) -> bool {
@@ -1282,17 +1372,21 @@ impl ScreenCaptureState {
                     4
                 }
             + self.source_copy_w as u64 * self.source_copy_h as u64 * 4;
-        metrics.cpu_buffer_bytes =
-            self.rgb_buf.capacity() as u64 + self.slots.iter().map(|slot| slot.rgb_buf.capacity() as u64).sum::<u64>();
+        metrics.cpu_buffer_bytes = self.rgb_buf.capacity() as u64
+            + self
+                .slots
+                .iter()
+                .map(|slot| slot.rgb_buf.capacity() as u64)
+                .sum::<u64>();
         metrics
     }
 
     /// Returns `true` while a slot still needs a GPU mapping callback.
     /// Ready mappings and CPU worker jobs do not need device polling.
     pub fn readback_in_flight(&self) -> bool {
-        self.slots
-            .iter()
-            .any(|s| s.pending && s.buffer.is_some() && s.map_signal.load(Ordering::Acquire) == MAP_PENDING)
+        self.slots.iter().any(|s| {
+            s.pending && s.buffer.is_some() && s.map_signal.load(Ordering::Acquire) == MAP_PENDING
+        })
     }
 
     // -- pipeline / resource setup (lazy) --------------------------------
@@ -1321,53 +1415,65 @@ impl ScreenCaptureState {
             source: egor_render::wgpu::ShaderSource::Wgsl(BLIT_GRAY_SHADER_WGSL.into()),
         });
 
-        let gray_alpha_shader = device.create_shader_module(egor_render::wgpu::ShaderModuleDescriptor {
-            label: None,
-            source: egor_render::wgpu::ShaderSource::Wgsl(BLIT_GRAY_ALPHA_SHADER_WGSL.into()),
-        });
+        let gray_alpha_shader =
+            device.create_shader_module(egor_render::wgpu::ShaderModuleDescriptor {
+                label: None,
+                source: egor_render::wgpu::ShaderSource::Wgsl(BLIT_GRAY_ALPHA_SHADER_WGSL.into()),
+            });
 
-        let encode_shader = device.create_shader_module(egor_render::wgpu::ShaderModuleDescriptor {
-            label: None,
-            source: egor_render::wgpu::ShaderSource::Wgsl(BLIT_ENCODE_SHADER_WGSL.into()),
-        });
+        let encode_shader =
+            device.create_shader_module(egor_render::wgpu::ShaderModuleDescriptor {
+                label: None,
+                source: egor_render::wgpu::ShaderSource::Wgsl(BLIT_ENCODE_SHADER_WGSL.into()),
+            });
 
-        let gray_encode_shader = device.create_shader_module(egor_render::wgpu::ShaderModuleDescriptor {
-            label: None,
-            source: egor_render::wgpu::ShaderSource::Wgsl(BLIT_GRAY_ENCODE_SHADER_WGSL.into()),
-        });
+        let gray_encode_shader =
+            device.create_shader_module(egor_render::wgpu::ShaderModuleDescriptor {
+                label: None,
+                source: egor_render::wgpu::ShaderSource::Wgsl(BLIT_GRAY_ENCODE_SHADER_WGSL.into()),
+            });
 
-        let gray_alpha_encode_shader = device.create_shader_module(egor_render::wgpu::ShaderModuleDescriptor {
-            label: None,
-            source: egor_render::wgpu::ShaderSource::Wgsl(BLIT_GRAY_ALPHA_ENCODE_SHADER_WGSL.into()),
-        });
+        let gray_alpha_encode_shader =
+            device.create_shader_module(egor_render::wgpu::ShaderModuleDescriptor {
+                label: None,
+                source: egor_render::wgpu::ShaderSource::Wgsl(
+                    BLIT_GRAY_ALPHA_ENCODE_SHADER_WGSL.into(),
+                ),
+            });
 
-        let bind_group_layout = device.create_bind_group_layout(&egor_render::wgpu::BindGroupLayoutDescriptor {
-            label: None,
-            entries: &[
-                egor_render::wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: egor_render::wgpu::ShaderStages::FRAGMENT,
-                    ty: egor_render::wgpu::BindingType::Texture {
-                        sample_type: egor_render::wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: egor_render::wgpu::TextureViewDimension::D2,
-                        multisampled: false,
+        let bind_group_layout =
+            device.create_bind_group_layout(&egor_render::wgpu::BindGroupLayoutDescriptor {
+                label: None,
+                entries: &[
+                    egor_render::wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: egor_render::wgpu::ShaderStages::FRAGMENT,
+                        ty: egor_render::wgpu::BindingType::Texture {
+                            sample_type: egor_render::wgpu::TextureSampleType::Float {
+                                filterable: true,
+                            },
+                            view_dimension: egor_render::wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                egor_render::wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: egor_render::wgpu::ShaderStages::FRAGMENT,
-                    ty: egor_render::wgpu::BindingType::Sampler(egor_render::wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
+                    egor_render::wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: egor_render::wgpu::ShaderStages::FRAGMENT,
+                        ty: egor_render::wgpu::BindingType::Sampler(
+                            egor_render::wgpu::SamplerBindingType::Filtering,
+                        ),
+                        count: None,
+                    },
+                ],
+            });
 
-        let pipeline_layout = device.create_pipeline_layout(&egor_render::wgpu::PipelineLayoutDescriptor {
-            label: None,
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
-        });
+        let pipeline_layout =
+            device.create_pipeline_layout(&egor_render::wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[Some(&bind_group_layout)],
+                immediate_size: 0,
+            });
 
         let make_pipeline = |label, module: &egor_render::wgpu::ShaderModule, format| {
             device.create_render_pipeline(&egor_render::wgpu::RenderPipelineDescriptor {
@@ -1405,7 +1511,8 @@ impl ScreenCaptureState {
         let gray_alpha_pipeline = make_pipeline(None, &gray_alpha_shader, TextureFormat::Rg8Unorm);
         let encode_pipeline = make_pipeline(None, &encode_shader, TextureFormat::Rgba8Unorm);
         let gray_encode_pipeline = make_pipeline(None, &gray_encode_shader, TextureFormat::R8Unorm);
-        let gray_alpha_encode_pipeline = make_pipeline(None, &gray_alpha_encode_shader, TextureFormat::Rg8Unorm);
+        let gray_alpha_encode_pipeline =
+            make_pipeline(None, &gray_alpha_encode_shader, TextureFormat::Rg8Unorm);
 
         let sampler = device.create_sampler(&egor_render::wgpu::SamplerDescriptor {
             label: None,
@@ -1426,7 +1533,14 @@ impl ScreenCaptureState {
         self.blit_bind_group_layout = Some(bind_group_layout);
     }
 
-    fn ensure_capture_texture(&mut self, device: &Device, w: u32, h: u32, grayscale: bool, alpha_mask: bool) {
+    fn ensure_capture_texture(
+        &mut self,
+        device: &Device,
+        w: u32,
+        h: u32,
+        grayscale: bool,
+        alpha_mask: bool,
+    ) {
         if self.capture_tex_w == w
             && self.capture_tex_h == h
             && self.capture_tex_gray == grayscale
@@ -1453,7 +1567,8 @@ impl ScreenCaptureState {
             sample_count: 1,
             dimension: egor_render::wgpu::TextureDimension::D2,
             format,
-            usage: egor_render::wgpu::TextureUsages::RENDER_ATTACHMENT | egor_render::wgpu::TextureUsages::COPY_SRC,
+            usage: egor_render::wgpu::TextureUsages::RENDER_ATTACHMENT
+                | egor_render::wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
 
@@ -1480,7 +1595,8 @@ impl ScreenCaptureState {
             sample_count: 1,
             dimension: egor_render::wgpu::TextureDimension::D2,
             format,
-            usage: egor_render::wgpu::TextureUsages::TEXTURE_BINDING | egor_render::wgpu::TextureUsages::COPY_DST,
+            usage: egor_render::wgpu::TextureUsages::TEXTURE_BINDING
+                | egor_render::wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         self.source_copy_view = Some(tex.create_view(&Default::default()));
@@ -1496,6 +1612,7 @@ impl ScreenCaptureState {
         let cap_h = self.capture_h.max(1);
         let grayscale = self.grayscale;
         let alpha_mask = self.alpha_mask;
+        let rgba8 = self.rgba8;
         self.source_render_target = None;
 
         // -- Ring-buffer slot availability check --------------------------
@@ -1534,13 +1651,18 @@ impl ScreenCaptureState {
             cap_h,
             grayscale,
             alpha_mask,
+            rgba8,
             metadata: self.request_metadata.take(),
             dirty_rects,
             frame_tag: self.request_frame_tag.take(),
         })
     }
 
-    fn source_bind_group(&self, device: &Device, source_view: &egor_render::wgpu::TextureView) -> egor_render::wgpu::BindGroup {
+    fn source_bind_group(
+        &self,
+        device: &Device,
+        source_view: &egor_render::wgpu::TextureView,
+    ) -> egor_render::wgpu::BindGroup {
         let bind_group_layout = self.blit_bind_group_layout.as_ref().expect("pipeline init");
         let sampler = self.blit_sampler.as_ref().expect("pipeline init");
 
@@ -1573,46 +1695,56 @@ impl ScreenCaptureState {
             label: Some("Watch Capture Gray Shader"),
             source: egor_render::wgpu::ShaderSource::Wgsl(WATCH_CAPTURE_GRAY_SHADER_WGSL.into()),
         });
-        let encode_shader = device.create_shader_module(egor_render::wgpu::ShaderModuleDescriptor {
-            label: Some("Watch Capture Encode Shader"),
-            source: egor_render::wgpu::ShaderSource::Wgsl(WATCH_CAPTURE_ENCODE_SHADER_WGSL.into()),
-        });
-        let gray_encode_shader = device.create_shader_module(egor_render::wgpu::ShaderModuleDescriptor {
-            label: Some("Watch Capture Gray Encode Shader"),
-            source: egor_render::wgpu::ShaderSource::Wgsl(WATCH_CAPTURE_GRAY_ENCODE_SHADER_WGSL.into()),
-        });
+        let encode_shader =
+            device.create_shader_module(egor_render::wgpu::ShaderModuleDescriptor {
+                label: Some("Watch Capture Encode Shader"),
+                source: egor_render::wgpu::ShaderSource::Wgsl(
+                    WATCH_CAPTURE_ENCODE_SHADER_WGSL.into(),
+                ),
+            });
+        let gray_encode_shader =
+            device.create_shader_module(egor_render::wgpu::ShaderModuleDescriptor {
+                label: Some("Watch Capture Gray Encode Shader"),
+                source: egor_render::wgpu::ShaderSource::Wgsl(
+                    WATCH_CAPTURE_GRAY_ENCODE_SHADER_WGSL.into(),
+                ),
+            });
 
-        let bind_group_layout = device.create_bind_group_layout(&egor_render::wgpu::BindGroupLayoutDescriptor {
-            label: Some("Watch Capture Bind Group Layout"),
-            entries: &[
-                egor_render::wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: egor_render::wgpu::ShaderStages::FRAGMENT,
-                    ty: egor_render::wgpu::BindingType::Texture {
-                        sample_type: egor_render::wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: egor_render::wgpu::TextureViewDimension::D2,
-                        multisampled: false,
+        let bind_group_layout =
+            device.create_bind_group_layout(&egor_render::wgpu::BindGroupLayoutDescriptor {
+                label: Some("Watch Capture Bind Group Layout"),
+                entries: &[
+                    egor_render::wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: egor_render::wgpu::ShaderStages::FRAGMENT,
+                        ty: egor_render::wgpu::BindingType::Texture {
+                            sample_type: egor_render::wgpu::TextureSampleType::Float {
+                                filterable: true,
+                            },
+                            view_dimension: egor_render::wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                egor_render::wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: egor_render::wgpu::ShaderStages::FRAGMENT,
-                    ty: egor_render::wgpu::BindingType::Buffer {
-                        ty: egor_render::wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    egor_render::wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: egor_render::wgpu::ShaderStages::FRAGMENT,
+                        ty: egor_render::wgpu::BindingType::Buffer {
+                            ty: egor_render::wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-            ],
-        });
+                ],
+            });
 
-        let pipeline_layout = device.create_pipeline_layout(&egor_render::wgpu::PipelineLayoutDescriptor {
-            label: Some("Watch Capture Pipeline Layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
-        });
+        let pipeline_layout =
+            device.create_pipeline_layout(&egor_render::wgpu::PipelineLayoutDescriptor {
+                label: Some("Watch Capture Pipeline Layout"),
+                bind_group_layouts: &[Some(&bind_group_layout)],
+                immediate_size: 0,
+            });
 
         let make_pipeline = |label, module: &egor_render::wgpu::ShaderModule, format| {
             device.create_render_pipeline(&egor_render::wgpu::RenderPipelineDescriptor {
@@ -1645,8 +1777,16 @@ impl ScreenCaptureState {
             })
         };
 
-        self.watch_capture_pipeline = Some(make_pipeline(Some("Watch Capture"), &shader, TextureFormat::Rgba8Unorm));
-        self.watch_capture_gray_pipeline = Some(make_pipeline(Some("Watch Capture Gray"), &gray_shader, TextureFormat::Rg8Unorm));
+        self.watch_capture_pipeline = Some(make_pipeline(
+            Some("Watch Capture"),
+            &shader,
+            TextureFormat::Rgba8Unorm,
+        ));
+        self.watch_capture_gray_pipeline = Some(make_pipeline(
+            Some("Watch Capture Gray"),
+            &gray_shader,
+            TextureFormat::Rg8Unorm,
+        ));
         self.watch_capture_encode_pipeline = Some(make_pipeline(
             Some("Watch Capture Encode"),
             &encode_shader,
@@ -1676,7 +1816,10 @@ impl ScreenCaptureState {
                 mapped_at_creation: false,
             }));
         }
-        let uniform_buffer = self.watch_capture_uniform.as_ref().expect("watch capture uniform");
+        let uniform_buffer = self
+            .watch_capture_uniform
+            .as_ref()
+            .expect("watch capture uniform");
         if self.last_watch_capture_uniform != Some(uniform) {
             queue.write_buffer(uniform_buffer, 0, uniform.bytes());
             self.last_watch_capture_uniform = Some(uniform);
@@ -1686,7 +1829,10 @@ impl ScreenCaptureState {
                 return binding.clone();
             }
         }
-        let layout = self.watch_capture_bind_group_layout.as_ref().expect("watch capture layout");
+        let layout = self
+            .watch_capture_bind_group_layout
+            .as_ref()
+            .expect("watch capture layout");
 
         let binding = device.create_bind_group(&egor_render::wgpu::BindGroupDescriptor {
             label: Some("Watch Capture Bind Group"),
@@ -1720,6 +1866,7 @@ impl ScreenCaptureState {
             cap_h,
             grayscale,
             alpha_mask,
+            rgba8,
             metadata,
             dirty_rects,
             frame_tag,
@@ -1730,9 +1877,18 @@ impl ScreenCaptureState {
 
         let pipeline = match (grayscale, alpha_mask, encode_srgb) {
             (true, false, false) => self.blit_gray_pipeline.as_ref().expect("pipeline init"),
-            (true, false, true) => self.blit_gray_encode_pipeline.as_ref().expect("pipeline init"),
-            (true, true, false) => self.blit_gray_alpha_pipeline.as_ref().expect("pipeline init"),
-            (true, true, true) => self.blit_gray_alpha_encode_pipeline.as_ref().expect("pipeline init"),
+            (true, false, true) => self
+                .blit_gray_encode_pipeline
+                .as_ref()
+                .expect("pipeline init"),
+            (true, true, false) => self
+                .blit_gray_alpha_pipeline
+                .as_ref()
+                .expect("pipeline init"),
+            (true, true, true) => self
+                .blit_gray_alpha_encode_pipeline
+                .as_ref()
+                .expect("pipeline init"),
             (false, _, false) => self.blit_pipeline.as_ref().expect("pipeline init"),
             (false, _, true) => self.blit_encode_pipeline.as_ref().expect("pipeline init"),
         };
@@ -1775,7 +1931,8 @@ impl ScreenCaptureState {
         let buffer_size = (padded_row * cap_h) as u64;
 
         // Reuse the staging buffer if dimensions haven't changed
-        let needs_new = slot.buffer.is_none() || slot.buf_size != buffer_size || slot.row_pitch != padded_row;
+        let needs_new =
+            slot.buffer.is_none() || slot.buf_size != buffer_size || slot.row_pitch != padded_row;
 
         self.metrics.readback_bytes += buffer_size;
         if needs_new {
@@ -1822,6 +1979,7 @@ impl ScreenCaptureState {
         slot.cap_h = cap_h;
         slot.grayscale = grayscale;
         slot.alpha_mask = alpha_mask;
+        slot.rgba8 = rgba8;
         slot.metadata = metadata;
         slot.dirty_rects = dirty_rects;
         slot.frame_tag = frame_tag;
@@ -1838,7 +1996,12 @@ impl ScreenCaptureState {
     ///
     /// `source` is the backbuffer `Texture` (must have `COPY_SRC` usage).
     /// The encoder must be the same one that will be submitted this frame.
-    pub fn capture_from_texture(&mut self, device: &Device, encoder: &mut CommandEncoder, source: &Texture) {
+    pub fn capture_from_texture(
+        &mut self,
+        device: &Device,
+        encoder: &mut CommandEncoder,
+        source: &Texture,
+    ) {
         let Some(prepared) = self.prepare_capture() else {
             return;
         };
@@ -1871,7 +2034,13 @@ impl ScreenCaptureState {
 
         let source_view = self.source_copy_view.as_ref().expect("source copy init");
         let bind_group = self.source_bind_group(device, source_view);
-        self.capture_prepared_bind_group(device, encoder, prepared, source.format().is_srgb(), &bind_group);
+        self.capture_prepared_bind_group(
+            device,
+            encoder,
+            prepared,
+            source.format().is_srgb(),
+            &bind_group,
+        );
     }
 
     /// Capture from an already bindable render target. Used on surfaces that
@@ -1915,6 +2084,7 @@ impl ScreenCaptureState {
             cap_h,
             grayscale,
             alpha_mask,
+            rgba8,
             metadata,
             dirty_rects,
             frame_tag,
@@ -1935,10 +2105,22 @@ impl ScreenCaptureState {
         };
         let bind_group = self.watch_capture_bind_group(device, queue, overlay_view, uniform);
         let pipeline = match (grayscale, encode_srgb) {
-            (true, false) => self.watch_capture_gray_pipeline.as_ref().expect("watch capture pipeline"),
-            (true, true) => self.watch_capture_gray_encode_pipeline.as_ref().expect("watch capture pipeline"),
-            (false, false) => self.watch_capture_pipeline.as_ref().expect("watch capture pipeline"),
-            (false, true) => self.watch_capture_encode_pipeline.as_ref().expect("watch capture pipeline"),
+            (true, false) => self
+                .watch_capture_gray_pipeline
+                .as_ref()
+                .expect("watch capture pipeline"),
+            (true, true) => self
+                .watch_capture_gray_encode_pipeline
+                .as_ref()
+                .expect("watch capture pipeline"),
+            (false, false) => self
+                .watch_capture_pipeline
+                .as_ref()
+                .expect("watch capture pipeline"),
+            (false, true) => self
+                .watch_capture_encode_pipeline
+                .as_ref()
+                .expect("watch capture pipeline"),
         };
         let capture_view = self.capture_view.as_ref().expect("capture texture init");
 
@@ -1976,7 +2158,8 @@ impl ScreenCaptureState {
         let padded_row = (unpadded_row + align - 1) / align * align;
         let buffer_size = (padded_row * cap_h) as u64;
 
-        let needs_new = slot.buffer.is_none() || slot.buf_size != buffer_size || slot.row_pitch != padded_row;
+        let needs_new =
+            slot.buffer.is_none() || slot.buf_size != buffer_size || slot.row_pitch != padded_row;
         self.metrics.readback_bytes += buffer_size;
         if needs_new {
             self.metrics.staging_allocations += 1;
@@ -2019,6 +2202,7 @@ impl ScreenCaptureState {
         slot.cap_h = cap_h;
         slot.grayscale = grayscale;
         slot.alpha_mask = alpha_mask;
+        slot.rgba8 = rgba8;
         slot.metadata = metadata;
         slot.dirty_rects = dirty_rects;
         slot.frame_tag = frame_tag;
@@ -2040,40 +2224,43 @@ impl ScreenCaptureState {
             source: egor_render::wgpu::ShaderSource::Wgsl(BLIT_SHADER_WGSL.into()),
         });
         let bind_group_layout = self.blit_bind_group_layout.as_ref().expect("pipeline init");
-        let pipeline_layout = device.create_pipeline_layout(&egor_render::wgpu::PipelineLayoutDescriptor {
-            label: None,
-            bind_group_layouts: &[Some(bind_group_layout)],
-            immediate_size: 0,
-        });
+        let pipeline_layout =
+            device.create_pipeline_layout(&egor_render::wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[Some(bind_group_layout)],
+                immediate_size: 0,
+            });
 
-        self.present_pipeline = Some(device.create_render_pipeline(&egor_render::wgpu::RenderPipelineDescriptor {
-            label: None,
-            layout: Some(&pipeline_layout),
-            vertex: egor_render::wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: Default::default(),
+        self.present_pipeline = Some(device.create_render_pipeline(
+            &egor_render::wgpu::RenderPipelineDescriptor {
+                label: None,
+                layout: Some(&pipeline_layout),
+                vertex: egor_render::wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(egor_render::wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(egor_render::wgpu::ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: egor_render::wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: egor_render::wgpu::PrimitiveState {
+                    topology: egor_render::wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
             },
-            fragment: Some(egor_render::wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(egor_render::wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: egor_render::wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: egor_render::wgpu::PrimitiveState {
-                topology: egor_render::wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: Default::default(),
-            multiview_mask: None,
-            cache: None,
-        }));
+        ));
         self.present_pipeline_format = Some(format);
     }
 
@@ -2089,51 +2276,54 @@ impl ScreenCaptureState {
             source: egor_render::wgpu::ShaderSource::Wgsl(BLIT_SHADER_WGSL.into()),
         });
         let bind_group_layout = self.blit_bind_group_layout.as_ref().expect("pipeline init");
-        let pipeline_layout = device.create_pipeline_layout(&egor_render::wgpu::PipelineLayoutDescriptor {
-            label: None,
-            bind_group_layouts: &[Some(bind_group_layout)],
-            immediate_size: 0,
-        });
+        let pipeline_layout =
+            device.create_pipeline_layout(&egor_render::wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[Some(bind_group_layout)],
+                immediate_size: 0,
+            });
 
-        self.composite_pipeline = Some(device.create_render_pipeline(&egor_render::wgpu::RenderPipelineDescriptor {
-            label: None,
-            layout: Some(&pipeline_layout),
-            vertex: egor_render::wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: Default::default(),
+        self.composite_pipeline = Some(device.create_render_pipeline(
+            &egor_render::wgpu::RenderPipelineDescriptor {
+                label: None,
+                layout: Some(&pipeline_layout),
+                vertex: egor_render::wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(egor_render::wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(egor_render::wgpu::ColorTargetState {
+                        format,
+                        blend: Some(egor_render::wgpu::BlendState {
+                            color: egor_render::wgpu::BlendComponent {
+                                src_factor: egor_render::wgpu::BlendFactor::One,
+                                dst_factor: egor_render::wgpu::BlendFactor::OneMinusSrcAlpha,
+                                operation: egor_render::wgpu::BlendOperation::Add,
+                            },
+                            alpha: egor_render::wgpu::BlendComponent {
+                                src_factor: egor_render::wgpu::BlendFactor::One,
+                                dst_factor: egor_render::wgpu::BlendFactor::OneMinusSrcAlpha,
+                                operation: egor_render::wgpu::BlendOperation::Add,
+                            },
+                        }),
+                        write_mask: egor_render::wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: egor_render::wgpu::PrimitiveState {
+                    topology: egor_render::wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
             },
-            fragment: Some(egor_render::wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(egor_render::wgpu::ColorTargetState {
-                    format,
-                    blend: Some(egor_render::wgpu::BlendState {
-                        color: egor_render::wgpu::BlendComponent {
-                            src_factor: egor_render::wgpu::BlendFactor::One,
-                            dst_factor: egor_render::wgpu::BlendFactor::OneMinusSrcAlpha,
-                            operation: egor_render::wgpu::BlendOperation::Add,
-                        },
-                        alpha: egor_render::wgpu::BlendComponent {
-                            src_factor: egor_render::wgpu::BlendFactor::One,
-                            dst_factor: egor_render::wgpu::BlendFactor::OneMinusSrcAlpha,
-                            operation: egor_render::wgpu::BlendOperation::Add,
-                        },
-                    }),
-                    write_mask: egor_render::wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: egor_render::wgpu::PrimitiveState {
-                topology: egor_render::wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: Default::default(),
-            multiview_mask: None,
-            cache: None,
-        }));
+        ));
         self.composite_pipeline_format = Some(format);
     }
 
@@ -2184,7 +2374,10 @@ impl ScreenCaptureState {
     ) {
         self.ensure_composite_pipeline(device, dest_format);
         let bind_group = self.source_bind_group(device, source_view);
-        let pipeline = self.composite_pipeline.as_ref().expect("composite pipeline");
+        let pipeline = self
+            .composite_pipeline
+            .as_ref()
+            .expect("composite pipeline");
 
         let mut rpass = encoder.begin_render_pass(&egor_render::wgpu::RenderPassDescriptor {
             label: None,
@@ -2224,9 +2417,18 @@ impl ScreenCaptureState {
         };
         slot.map_signal.store(MAP_PENDING, Ordering::Release);
         let signal = slot.map_signal.clone();
-        buffer.slice(..).map_async(egor_render::wgpu::MapMode::Read, move |result| {
-            signal.store(if result.is_ok() { MAP_READY } else { MAP_FAILED }, Ordering::Release);
-        });
+        buffer
+            .slice(..)
+            .map_async(egor_render::wgpu::MapMode::Read, move |result| {
+                signal.store(
+                    if result.is_ok() {
+                        MAP_READY
+                    } else {
+                        MAP_FAILED
+                    },
+                    Ordering::Release,
+                );
+            });
     }
 
     // -- readback polling ------------------------------------------------
@@ -2261,6 +2463,7 @@ impl ScreenCaptureState {
         let row_pitch = self.slots[idx].row_pitch as usize;
         let grayscale = self.slots[idx].grayscale;
         let alpha_mask = self.slots[idx].alpha_mask;
+        let rgba8 = self.slots[idx].rgba8;
 
         let buffer = match self.slots[idx].buffer.take() {
             Some(b) => b,
@@ -2278,6 +2481,7 @@ impl ScreenCaptureState {
             row_pitch,
             grayscale,
             alpha_mask,
+            rgba8,
             &mut Vec::new(),
         );
         let conversion_us = complete_start.elapsed().as_micros() as u64;
@@ -2330,6 +2534,7 @@ impl ScreenCaptureState {
                 cap_h: slot.cap_h,
                 grayscale: slot.grayscale,
                 alpha_mask: slot.alpha_mask,
+                rgba8: slot.rgba8,
                 metadata: slot.metadata.take(),
                 dirty_rects: slot.dirty_rects.take(),
                 frame_tag: slot.frame_tag.take(),
@@ -2352,6 +2557,7 @@ impl ScreenCaptureState {
                 let cap_h = job.cap_h;
                 let grayscale = job.grayscale;
                 let alpha_mask = job.alpha_mask;
+                let rgba8 = job.rgba8;
                 let row_pitch = job.row_pitch;
                 let metadata = job.metadata;
                 decode_readback_into(
@@ -2362,6 +2568,7 @@ impl ScreenCaptureState {
                     row_pitch,
                     grayscale,
                     alpha_mask,
+                    rgba8,
                     &mut Vec::new(),
                 );
                 job.buffer.unmap();
@@ -2457,11 +2664,9 @@ impl ScreenCaptureState {
         // A stopped client need not poll captures. The single worker returns
         // jobs in order, so cancelled results precede any restarted capture.
         for _ in 0..SLOT_COUNT {
-            if !self
-                .slots
-                .iter()
-                .any(|slot| slot.pending && slot.map_signal.load(Ordering::Acquire) == MAP_CANCELLED)
-            {
+            if !self.slots.iter().any(|slot| {
+                slot.pending && slot.map_signal.load(Ordering::Acquire) == MAP_CANCELLED
+            }) {
                 break;
             }
             let jobs = self.metrics.worker_jobs;
@@ -2615,7 +2820,8 @@ impl<'a> Graphics<'a> {
 
     /// Create a new offscreen render target
     pub fn create_offscreen(&self, width: u32, height: u32) -> OffscreenTarget {
-        self.renderer.create_offscreen_target(width, height, self.target_format)
+        self.renderer
+            .create_offscreen_target(width, height, self.target_format)
     }
 
     /// Return information about the active GPU adapter/backend.
@@ -2629,7 +2835,11 @@ impl<'a> Graphics<'a> {
     }
 
     /// Render to an offscreen target
-    pub fn render_offscreen(&mut self, target: &mut OffscreenTarget, render_fn: impl FnMut(&mut Graphics)) {
+    pub fn render_offscreen(
+        &mut self,
+        target: &mut OffscreenTarget,
+        render_fn: impl FnMut(&mut Graphics),
+    ) {
         self.render_offscreen_with_limits(
             target,
             GeometryBatch::DEFAULT_MAX_VERTICES,
@@ -2674,12 +2884,18 @@ impl<'a> Graphics<'a> {
         offscreen_gfx.upload_camera();
         let mut geometry = offscreen_batch.drain_all();
 
-        let mut encoder = self.renderer.device().create_command_encoder(&Default::default());
+        let mut encoder = self
+            .renderer
+            .device()
+            .create_command_encoder(&Default::default());
 
         {
-            let mut r_pass =
-                self.renderer
-                    .begin_render_pass_with_depth(&mut encoder, target.render_view(), target.offscreen_depth_view(), true);
+            let mut r_pass = self.renderer.begin_render_pass_with_depth(
+                &mut encoder,
+                target.render_view(),
+                target.offscreen_depth_view(),
+                true,
+            );
 
             let mut cur_tex: Option<usize> = None;
             let mut cur_shd: Option<usize> = None;
@@ -2689,8 +2905,12 @@ impl<'a> Graphics<'a> {
             let mut cur_scissor = None;
 
             if let Some(first) = geometry.first() {
-                self.renderer
-                    .bind_pass_state(&mut r_pass, first.texture_id, first.shader_id, first.replace_blend);
+                self.renderer.bind_pass_state(
+                    &mut r_pass,
+                    first.texture_id,
+                    first.shader_id,
+                    first.replace_blend,
+                );
                 cur_tex = first.texture_id;
                 cur_shd = first.shader_id;
                 cur_replace_blend = first.replace_blend;
@@ -2750,8 +2970,11 @@ impl<'a> Graphics<'a> {
     /// Call after user drawing is complete and before the render pass
     pub(crate) fn upload_camera(&mut self) {
         let (w, h) = self.target_size;
-        self.renderer
-            .upload_camera_matrix(self.camera.view_proj((w as f32, h as f32).into()).to_cols_array_2d());
+        self.renderer.upload_camera_matrix(
+            self.camera
+                .view_proj((w as f32, h as f32).into())
+                .to_cols_array_2d(),
+        );
     }
 
     /// Clear the screen to a color
@@ -2778,10 +3001,24 @@ impl<'a> Graphics<'a> {
     /// overhead.  Used by the optimised `draw_cmd` fast-path for all
     /// non-rotated sprite draws (entities, UI, health bars, etc.).
     #[inline(always)]
-    pub fn push_sprite(&mut self, tex_id: usize, x: f32, y: f32, w: f32, h: f32, uvs: [f32; 4], color: [f32; 4]) {
+    pub fn push_sprite(
+        &mut self,
+        tex_id: usize,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        uvs: [f32; 4],
+        color: [f32; 4],
+    ) {
         self.batch.push_instance(
-            egor_render::instance::Instance::new([w, 0.0, 0.0, h], [x + w * 0.5, y + h * 0.5, self.batch.draw_depth()], color, uvs)
-                .with_watch_overlay(self.batch.watch_overlay()),
+            egor_render::instance::Instance::new(
+                [w, 0.0, 0.0, h],
+                [x + w * 0.5, y + h * 0.5, self.batch.draw_depth()],
+                color,
+                uvs,
+            )
+            .with_watch_overlay(self.batch.watch_overlay()),
             Some(tex_id),
             self.current_shader,
         );
@@ -2807,8 +3044,13 @@ impl<'a> Graphics<'a> {
     #[inline(always)]
     pub fn push_tile(&mut self, x: f32, y: f32, w: f32, h: f32, depth: f32, uvs: [f32; 4]) {
         self.batch.push_instance_unchecked(
-            egor_render::instance::Instance::new([w, 0.0, 0.0, h], [x + w * 0.5, y + h * 0.5, depth], [1.0, 1.0, 1.0, 1.0], uvs)
-                .with_watch_overlay(self.batch.watch_overlay()),
+            egor_render::instance::Instance::new(
+                [w, 0.0, 0.0, h],
+                [x + w * 0.5, y + h * 0.5, depth],
+                [1.0, 1.0, 1.0, 1.0],
+                uvs,
+            )
+            .with_watch_overlay(self.batch.watch_overlay()),
         );
     }
 
@@ -2816,10 +3058,23 @@ impl<'a> Graphics<'a> {
     /// batch-key comparisons. The caller MUST call [`ensure_tile_batch`]
     /// first whenever the texture changes. Uses the current draw_depth.
     #[inline(always)]
-    pub fn push_sprite_unchecked(&mut self, x: f32, y: f32, w: f32, h: f32, uvs: [f32; 4], color: [f32; 4]) {
+    pub fn push_sprite_unchecked(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        uvs: [f32; 4],
+        color: [f32; 4],
+    ) {
         self.batch.push_instance_unchecked(
-            egor_render::instance::Instance::new([w, 0.0, 0.0, h], [x + w * 0.5, y + h * 0.5, self.batch.draw_depth()], color, uvs)
-                .with_watch_overlay(self.batch.watch_overlay()),
+            egor_render::instance::Instance::new(
+                [w, 0.0, 0.0, h],
+                [x + w * 0.5, y + h * 0.5, self.batch.draw_depth()],
+                color,
+                uvs,
+            )
+            .with_watch_overlay(self.batch.watch_overlay()),
         );
     }
 
@@ -2860,7 +3115,10 @@ impl<'a> Graphics<'a> {
     pub fn push_geometry(&mut self, verts: &[egor_render::vertex::Vertex], indices: &[u16]) {
         let vert_count = verts.len();
         let idx_count = indices.len();
-        if let Some((v_slice, i_slice, base)) = self.batch.allocate(vert_count, idx_count, None, self.current_shader) {
+        if let Some((v_slice, i_slice, base)) =
+            self.batch
+                .allocate(vert_count, idx_count, None, self.current_shader)
+        {
             v_slice.copy_from_slice(verts);
             for (i, idx) in indices.iter().enumerate() {
                 i_slice[i] = *idx + base;
@@ -2886,7 +3144,11 @@ impl<'a> Graphics<'a> {
     }
     /// Draw a line of text
     pub fn text(&mut self, text: &str) -> TextBuilder<'_> {
-        let mut builder = TextBuilder::new(self.text_renderer, text.to_string(), self.batch.render_target());
+        let mut builder = TextBuilder::new(
+            self.text_renderer,
+            text.to_string(),
+            self.batch.render_target(),
+        );
         if let Some((x, y, width, height)) = self.batch.scissor() {
             builder = builder.clip(Rect::new(
                 glam::Vec2::new(x as f32, y as f32),
@@ -2939,7 +3201,8 @@ impl<'a> Graphics<'a> {
 
     /// Load a custom shader with associated uniform buffers
     pub fn load_shader_with_uniforms(&mut self, wgsl_source: &str, uniform_ids: &[usize]) -> usize {
-        self.renderer.add_shader_with_uniforms(wgsl_source, uniform_ids)
+        self.renderer
+            .add_shader_with_uniforms(wgsl_source, uniform_ids)
     }
 
     /// Execute drawing commands with a custom shader
@@ -2994,18 +3257,27 @@ impl<'a> Graphics<'a> {
     /// Create a managed offscreen render target and return its store index.
     /// Also registers it as a drawable texture, returning `(store_id, egor_texture_id)`.
     pub fn create_managed_render_target(&mut self, width: u32, height: u32) -> (usize, usize) {
-        let store_id = self
-            .render_targets
-            .create(self.renderer.device(), width, height, self.target_format);
-        let tex_id = self.renderer.add_offscreen_texture(self.render_targets.get_mut(store_id));
+        let store_id =
+            self.render_targets
+                .create(self.renderer.device(), width, height, self.target_format);
+        let tex_id = self
+            .renderer
+            .add_offscreen_texture(self.render_targets.get_mut(store_id));
         (store_id, tex_id)
     }
 
     /// Resize a managed render target. Re-registers the texture binding.
     /// Returns the (possibly new) egor texture id.
-    pub fn resize_managed_render_target(&mut self, store_id: usize, width: u32, height: u32) -> usize {
-        self.render_targets.resize(self.renderer.device(), store_id, width, height);
-        self.renderer.add_offscreen_texture(self.render_targets.get_mut(store_id))
+    pub fn resize_managed_render_target(
+        &mut self,
+        store_id: usize,
+        width: u32,
+        height: u32,
+    ) -> usize {
+        self.render_targets
+            .resize(self.renderer.device(), store_id, width, height);
+        self.renderer
+            .add_offscreen_texture(self.render_targets.get_mut(store_id))
     }
 
     /// Direct subsequent draw commands to a managed offscreen render target.
@@ -3025,6 +3297,11 @@ impl<'a> Graphics<'a> {
         self.screen_capture.request(w, h, grayscale);
     }
 
+    /// Capture lossless RGBA8 pixels; existing network captures remain RGB565.
+    pub fn request_screen_capture_rgba8(&mut self, w: u32, h: u32) {
+        self.screen_capture.request_rgba8(w, h);
+    }
+
     pub fn request_screen_capture_with_alpha_mask(
         &mut self,
         w: u32,
@@ -3033,8 +3310,13 @@ impl<'a> Graphics<'a> {
         source_render_target: usize,
         metadata: Option<[f32; 10]>,
     ) {
-        self.screen_capture
-            .request_with_alpha_mask(w, h, grayscale, source_render_target, metadata);
+        self.screen_capture.request_with_alpha_mask(
+            w,
+            h,
+            grayscale,
+            source_render_target,
+            metadata,
+        );
     }
 
     pub fn request_watch_frame_capture(
@@ -3063,7 +3345,8 @@ impl<'a> Graphics<'a> {
     }
 
     pub fn composite_render_target_to_backbuffer(&mut self, source_render_target: usize) {
-        self.screen_capture.request_composite_render_target(source_render_target);
+        self.screen_capture
+            .request_composite_render_target(source_render_target);
     }
 
     pub fn release_screen_capture_resources(&mut self) {
@@ -3091,5 +3374,41 @@ impl<'a> Graphics<'a> {
 
     pub fn screen_capture_metrics(&self) -> ScreenCaptureMetrics {
         self.screen_capture.metrics()
+    }
+}
+
+#[cfg(test)]
+mod capture_format_tests {
+    use super::*;
+
+    #[test]
+    fn screenshot_readback_preserves_low_bits_alpha_and_strips_row_padding() {
+        let data = [
+            9, 17, 25, 253, 10, 18, 26, 254, 0xee, 0xee, 0xee, 0xee, 11, 19, 27, 255, 12, 20, 28,
+            0, 0xee, 0xee, 0xee, 0xee,
+        ];
+        let mut output = Vec::new();
+        decode_readback_bytes(&data, &mut output, 2, 2, 12, false, false, true);
+        assert_eq!(
+            output,
+            [
+                9, 17, 25, 253, 10, 18, 26, 254, 11, 19, 27, 255, 12, 20, 28, 0
+            ]
+        );
+
+        // The same input still uses the original RGB565 format for watch capture.
+        decode_readback_bytes(&data, &mut output, 2, 2, 12, false, false, false);
+        assert_eq!(output, [0x83, 0x08, 0x83, 0x08, 0x83, 0x08, 0xa3, 0x08]);
+    }
+
+    #[test]
+    fn queued_capture_keeps_its_format_when_the_next_request_changes_mode() {
+        let mut capture = ScreenCaptureState::new();
+        capture.request_rgba8(8, 8);
+        let screenshot = capture.prepare_capture().unwrap();
+        capture.request(8, 8, false);
+        let network = capture.prepare_capture().unwrap();
+        assert!(screenshot.rgba8);
+        assert!(!network.rgba8);
     }
 }

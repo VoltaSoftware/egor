@@ -44,7 +44,10 @@ pub struct PrimitiveBatch {
 
 impl Default for PrimitiveBatch {
     fn default() -> Self {
-        Self::new(GeometryBatch::DEFAULT_MAX_VERTICES, GeometryBatch::DEFAULT_MAX_INDICES)
+        Self::new(
+            GeometryBatch::DEFAULT_MAX_VERTICES,
+            GeometryBatch::DEFAULT_MAX_INDICES,
+        )
     }
 }
 
@@ -72,7 +75,12 @@ impl PrimitiveBatch {
         self.new_entry_for_target(texture_id, shader_id, self.render_target)
     }
 
-    fn new_entry_for_target(&mut self, texture_id: Option<usize>, shader_id: Option<usize>, render_target: Option<usize>) -> BatchEntry {
+    fn new_entry_for_target(
+        &mut self,
+        texture_id: Option<usize>,
+        shader_id: Option<usize>,
+        render_target: Option<usize>,
+    ) -> BatchEntry {
         if render_target.is_some() {
             self.has_rt_overrides = true;
         }
@@ -111,17 +119,31 @@ impl PrimitiveBatch {
             && last.replace_blend == self.replace_blend
             && !last.geometry.would_overflow(vert_count, idx_count)
         {
-            return self.batches.last_mut().unwrap().geometry.try_allocate(vert_count, idx_count);
+            return self
+                .batches
+                .last_mut()
+                .unwrap()
+                .geometry
+                .try_allocate(vert_count, idx_count);
         }
 
         let entry = self.new_entry(texture_id, shader_id);
         self.batches.push(entry);
-        self.batches.last_mut().unwrap().geometry.try_allocate(vert_count, idx_count)
+        self.batches
+            .last_mut()
+            .unwrap()
+            .geometry
+            .try_allocate(vert_count, idx_count)
     }
 
     /// Pushes an instance into the current batch if it matches `texture_id` + `shader_id`,
     /// otherwise starts a new batch. Preserves insertion order for correct draw ordering.
-    pub(crate) fn push_instance(&mut self, instance: Instance, texture_id: Option<usize>, shader_id: Option<usize>) {
+    pub(crate) fn push_instance(
+        &mut self,
+        instance: Instance,
+        texture_id: Option<usize>,
+        shader_id: Option<usize>,
+    ) {
         self.push_instance_for_target(instance, texture_id, shader_id, self.render_target);
     }
 
@@ -166,7 +188,11 @@ impl PrimitiveBatch {
     /// Call once before a sequence of `push_instance_unchecked` calls.
     /// Marks the batch dirty so individual pushes don't need to.
     /// Returns `true` if a new batch was created (for diagnostics).
-    pub(crate) fn ensure_batch(&mut self, texture_id: Option<usize>, shader_id: Option<usize>) -> bool {
+    pub(crate) fn ensure_batch(
+        &mut self,
+        texture_id: Option<usize>,
+        shader_id: Option<usize>,
+    ) -> bool {
         if let Some(last) = self.batches.last_mut() {
             if last.texture_id == texture_id
                 && last.shader_id == shader_id
@@ -182,7 +208,11 @@ impl PrimitiveBatch {
 
         let entry = self.new_entry(texture_id, shader_id);
         self.batches.push(entry);
-        self.batches.last_mut().unwrap().geometry.mark_instances_dirty();
+        self.batches
+            .last_mut()
+            .unwrap()
+            .geometry
+            .mark_instances_dirty();
         true
     }
 
@@ -191,7 +221,14 @@ impl PrimitiveBatch {
     #[allow(dead_code)]
     pub(crate) fn iter_mut(
         &mut self,
-    ) -> impl Iterator<Item = (Option<usize>, Option<usize>, Option<(u32, u32, u32, u32)>, &mut GeometryBatch)> {
+    ) -> impl Iterator<
+        Item = (
+            Option<usize>,
+            Option<usize>,
+            Option<(u32, u32, u32, u32)>,
+            &mut GeometryBatch,
+        ),
+    > {
         self.batches
             .iter_mut()
             .map(|e| (e.texture_id, e.shader_id, e.scissor, &mut e.geometry))
@@ -211,7 +248,10 @@ impl PrimitiveBatch {
     /// Assigns a slot ID so the hot-path comparison is a single `u32` instead
     /// of a full 64-byte matrix comparison.
     pub fn set_camera_matrix(&mut self, mat: [[f32; 4]; 4]) {
-        if let Some(idx) = self.camera_matrices[..self.camera_count].iter().position(|m| *m == mat) {
+        if let Some(idx) = self.camera_matrices[..self.camera_count]
+            .iter()
+            .position(|m| *m == mat)
+        {
             self.camera_slot = (idx as u32) + 1;
         } else {
             if self.camera_count >= self.camera_matrices.len() {
@@ -353,7 +393,12 @@ mod tests {
         batch.set_scissor(Some((1, 2, 3, 4)));
         batch.set_draw_depth(0.75);
         batch.ensure_batch(Some(7), Some(3));
-        batch.push_instance_unchecked(Instance::new([1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0], [1.0; 4], [0.0, 0.0, 1.0, 1.0]));
+        batch.push_instance_unchecked(Instance::new(
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0],
+            [1.0; 4],
+            [0.0, 0.0, 1.0, 1.0],
+        ));
 
         let drained = batch.drain_all();
         assert_eq!(drained.len(), 1);
@@ -468,7 +513,8 @@ impl Drop for RectangleBuilder<'_> {
         let color = self.color.components();
 
         self.batch.push_instance(
-            Instance::new(affine, [center.x, center.y, self.depth], color, self.uvs).with_watch_overlay(self.batch.watch_overlay()),
+            Instance::new(affine, [center.x, center.y, self.depth], color, self.uvs)
+                .with_watch_overlay(self.batch.watch_overlay()),
             self.tex_id,
             self.shader_id,
         );
@@ -541,7 +587,10 @@ impl Drop for PolygonBuilder<'_> {
         let vert_count = points.len();
         let idx_count = (points.len().saturating_sub(2)) * 3;
 
-        if let Some((verts, indices, base)) = self.batch.allocate(vert_count, idx_count, None, self.shader_id) {
+        if let Some((verts, indices, base)) =
+            self.batch
+                .allocate(vert_count, idx_count, None, self.shader_id)
+        {
             for (i, p) in points.iter().enumerate() {
                 let world = rot * *p + center;
                 verts[i] = Vertex::new(world.into(), color, [0.0, 0.0]);
@@ -631,7 +680,10 @@ impl Drop for PolylineBuilder<'_> {
         let vert_count = segments * 4;
         let idx_count = segments * 6;
 
-        if let Some((verts, indices, mut base)) = self.batch.allocate(vert_count, idx_count, None, self.shader_id) {
+        if let Some((verts, indices, mut base)) =
+            self.batch
+                .allocate(vert_count, idx_count, None, self.shader_id)
+        {
             let mut vi = 0;
             let mut ii = 0;
 
@@ -654,7 +706,14 @@ impl Drop for PolylineBuilder<'_> {
                     vi += 1;
                 }
 
-                indices[ii..ii + 6].copy_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
+                indices[ii..ii + 6].copy_from_slice(&[
+                    base,
+                    base + 1,
+                    base + 2,
+                    base + 2,
+                    base + 3,
+                    base,
+                ]);
                 ii += 6;
                 base += 4;
             }
@@ -751,7 +810,8 @@ impl<'a> PathBuilder<'a> {
     /// `ctrl` is the control point, `to` is the end point.
     /// Requires an open subpath (`begin()` called)
     pub fn quad_to(mut self, ctrl: Vec2, to: Vec2) -> Self {
-        self.builder.quadratic_bezier_to(point(ctrl.x, ctrl.y), point(to.x, to.y));
+        self.builder
+            .quadratic_bezier_to(point(ctrl.x, ctrl.y), point(to.x, to.y));
         self
     }
     /// Adds a cubic bezier curve to the current subpath.
@@ -772,8 +832,10 @@ impl<'a> PathBuilder<'a> {
 
     /// Adds a rectangle to the path
     pub fn rect(mut self, size: Vec2) -> Self {
-        self.builder
-            .add_rectangle(&Box2D::new(Point2D::new(0.0, 0.0), Point2D::new(size.x, size.y)), Winding::Positive);
+        self.builder.add_rectangle(
+            &Box2D::new(Point2D::new(0.0, 0.0), Point2D::new(size.x, size.y)),
+            Winding::Positive,
+        );
         self
     }
     /// Adds a rounded rectangle to the path, optionally specifying per-corner radii
@@ -787,13 +849,15 @@ impl<'a> PathBuilder<'a> {
             bottom_right: 0.0,
         });
 
-        self.builder.add_rounded_rectangle(&rect, &radii, Winding::Positive);
+        self.builder
+            .add_rounded_rectangle(&rect, &radii, Winding::Positive);
 
         self
     }
     /// Adds a circle to the path
     pub fn circle(mut self, radius: f32) -> Self {
-        self.builder.add_circle(Point::new(0.0, 0.0), radius, Winding::Positive);
+        self.builder
+            .add_circle(Point::new(0.0, 0.0), radius, Winding::Positive);
         self
     }
 }
@@ -836,7 +900,10 @@ impl Drop for PathBuilder<'_> {
         let vert_count = geometry.vertices.len();
         let idx_count = geometry.indices.len();
 
-        if let Some((verts, indices, base)) = self.batch.allocate(vert_count, idx_count, None, self.shader_id) {
+        if let Some((verts, indices, base)) =
+            self.batch
+                .allocate(vert_count, idx_count, None, self.shader_id)
+        {
             for (vi, mut vo) in geometry.vertices.into_iter().enumerate() {
                 let mut p: Vec2 = vo.position.into();
                 p = rot * (self.scale * p) + self.position;

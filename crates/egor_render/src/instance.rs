@@ -32,7 +32,13 @@ impl Instance {
         }
     }
 
-    pub fn new_outlined(affine: [f32; 4], translate: [f32; 3], color: [f32; 4], uv: [f32; 4], outline_color: [f32; 4]) -> Self {
+    pub fn new_outlined(
+        affine: [f32; 4],
+        translate: [f32; 3],
+        color: [f32; 4],
+        uv: [f32; 4],
+        outline_color: [f32; 4],
+    ) -> Self {
         Self {
             affine,
             translate,

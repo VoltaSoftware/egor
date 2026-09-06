@@ -7,7 +7,8 @@ use crate::{
     primitives::PrimitiveBatch,
     profile_new_frame,
     surface_recovery::{
-        DeviceLossAction, SurfaceFailure, SurfaceRecoveryAction, SurfaceRecoveryState, max_frame_interval, retry_interval_for_refresh,
+        DeviceLossAction, SurfaceFailure, SurfaceRecoveryAction, SurfaceRecoveryState,
+        max_frame_interval, retry_interval_for_refresh,
     },
     text::TextRenderer,
 };
@@ -21,8 +22,8 @@ use egor_app::PhysicalPosition;
 #[cfg(target_os = "ios")]
 use egor_app::WindowExtIOS;
 use egor_app::{
-    AppConfig, AppHandler, AppRunner, ControlFlow, Fullscreen, PhysicalSize, StartCause, Window, WindowEvent, input::Input,
-    time::FrameTimer,
+    AppConfig, AppHandler, AppRunner, ControlFlow, Fullscreen, PhysicalSize, StartCause, Window,
+    WindowEvent, input::Input, time::FrameTimer,
 };
 use egor_render::{
     MemoryHints, Renderer, RendererBackendPreference, TextureFormat,
@@ -108,8 +109,15 @@ fn refresh_rate_fps(window: &Window, native_refresh_rate_fps: Option<u16>) -> Op
     })
 }
 
-fn surface_acquire_retry_interval(window: &Window, native_refresh_rate_fps: Option<u16>, consecutive_failures: u32) -> Duration {
-    retry_interval_for_refresh(refresh_rate_fps(window, native_refresh_rate_fps), consecutive_failures)
+fn surface_acquire_retry_interval(
+    window: &Window,
+    native_refresh_rate_fps: Option<u16>,
+    consecutive_failures: u32,
+) -> Duration {
+    retry_interval_for_refresh(
+        refresh_rate_fps(window, native_refresh_rate_fps),
+        consecutive_failures,
+    )
 }
 
 fn surface_wait_retry_interval() -> Duration {
@@ -120,7 +128,10 @@ fn should_wait_for_surface_restore(is_minimized: bool, size: PhysicalSize<u32>) 
     is_minimized || size.width == 0 || size.height == 0
 }
 
-fn backbuffer_format_matches_renderer(backbuffer_format: TextureFormat, renderer_format: TextureFormat) -> bool {
+fn backbuffer_format_matches_renderer(
+    backbuffer_format: TextureFormat,
+    renderer_format: TextureFormat,
+) -> bool {
     backbuffer_format == renderer_format
 }
 
@@ -159,7 +170,8 @@ impl CaptureFrameTarget {
             sample_count: 1,
             dimension: egor_render::wgpu::TextureDimension::D2,
             format,
-            usage: egor_render::wgpu::TextureUsages::RENDER_ATTACHMENT | egor_render::wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: egor_render::wgpu::TextureUsages::RENDER_ATTACHMENT
+                | egor_render::wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let view = texture.create_view(&Default::default());
@@ -172,12 +184,18 @@ impl CaptureFrameTarget {
         }
     }
 
-    fn ensure(slot: &mut Option<Self>, device: &egor_render::Device, width: u32, height: u32, format: TextureFormat) {
+    fn ensure(
+        slot: &mut Option<Self>,
+        device: &egor_render::Device,
+        width: u32,
+        height: u32,
+        format: TextureFormat,
+    ) {
         let width = width.max(1);
         let height = height.max(1);
-        let needs_new = slot
-            .as_ref()
-            .is_none_or(|target| target.width != width || target.height != height || target.format != format);
+        let needs_new = slot.as_ref().is_none_or(|target| {
+            target.width != width || target.height != height || target.format != format
+        });
         if needs_new {
             *slot = Some(Self::new(device, width, height, format));
         }
@@ -213,7 +231,8 @@ impl WatchFrameTarget {
             sample_count: 1,
             dimension: egor_render::wgpu::TextureDimension::D2,
             format,
-            usage: egor_render::wgpu::TextureUsages::RENDER_ATTACHMENT | egor_render::wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: egor_render::wgpu::TextureUsages::RENDER_ATTACHMENT
+                | egor_render::wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let color_view = color_texture.create_view(&Default::default());
@@ -229,7 +248,8 @@ impl WatchFrameTarget {
             sample_count: 1,
             dimension: egor_render::wgpu::TextureDimension::D2,
             format: TextureFormat::Rgba8Unorm,
-            usage: egor_render::wgpu::TextureUsages::RENDER_ATTACHMENT | egor_render::wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: egor_render::wgpu::TextureUsages::RENDER_ATTACHMENT
+                | egor_render::wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let overlay_view = overlay_texture.create_view(&Default::default());
@@ -245,12 +265,18 @@ impl WatchFrameTarget {
         }
     }
 
-    fn ensure(slot: &mut Option<Self>, device: &egor_render::Device, width: u32, height: u32, format: TextureFormat) {
+    fn ensure(
+        slot: &mut Option<Self>,
+        device: &egor_render::Device,
+        width: u32,
+        height: u32,
+        format: TextureFormat,
+    ) {
         let width = width.max(1);
         let height = height.max(1);
-        let needs_new = slot
-            .as_ref()
-            .is_none_or(|target| target.width != width || target.height != height || target.format != format);
+        let needs_new = slot.as_ref().is_none_or(|target| {
+            target.width != width || target.height != height || target.format != format
+        });
         if needs_new {
             *slot = Some(Self::new(device, width, height, format));
         }
@@ -295,7 +321,8 @@ impl<'a> AppControl<'a> {
 
     /// Enable or disable borderless fullscreen mode
     pub fn set_fullscreen(&self, enabled: bool) {
-        self.window.set_fullscreen(enabled.then_some(Fullscreen::Borderless(None)));
+        self.window
+            .set_fullscreen(enabled.then_some(Fullscreen::Borderless(None)));
     }
 
     /// Enable or disable vertical sync
@@ -507,7 +534,13 @@ impl App {
         self
     }
 
-    fn prepare_watch_renderer(&mut self, renderer: &mut Renderer, format: TextureFormat, width: u32, height: u32) {
+    fn prepare_watch_renderer(
+        &mut self,
+        renderer: &mut Renderer,
+        format: TextureFormat,
+        width: u32,
+        height: u32,
+    ) {
         let (device, queue) = (renderer.device().clone(), renderer.queue().clone());
         self.screen_capture.prewarm_watch_pipelines(&device, format);
 
@@ -538,7 +571,8 @@ impl App {
                 true,
             );
             renderer.bind_pass_state_with_watch_overlay(&mut pass, None, None, replace_blend, true);
-            let (mut texture, mut shader, mut blend, mut camera, mut quad_bound) = (None, None, replace_blend, u32::MAX, true);
+            let (mut texture, mut shader, mut blend, mut camera, mut quad_bound) =
+                (None, None, replace_blend, u32::MAX, true);
             renderer.draw_batch_with_watch_overlay(
                 &mut pass,
                 &mut batch,
@@ -557,11 +591,23 @@ impl App {
         for grayscale in [false, true] {
             self.screen_capture
                 .request_watch_overlay_capture(8, 8, 8, 8, 1, grayscale, None, None, None);
-            self.screen_capture
-                .capture_from_watch_overlay(&device, &queue, &mut encoder, &target.overlay_view, 8, 8, format.is_srgb());
+            self.screen_capture.capture_from_watch_overlay(
+                &device,
+                &queue,
+                &mut encoder,
+                &target.overlay_view,
+                8,
+                8,
+                format.is_srgb(),
+            );
         }
-        self.screen_capture
-            .present_sampled_view(&device, &mut encoder, &target.color_view, &presented.view, format);
+        self.screen_capture.present_sampled_view(
+            &device,
+            &mut encoder,
+            &target.color_view,
+            &presented.view,
+            format,
+        );
         if let Err(error) = renderer.try_submit_commands(encoder.finish()) {
             log::warn!("[egor] watch pipeline warmup submission failed: {error:?}");
         }
@@ -768,7 +814,8 @@ impl App {
 
         let size = window_surface_size(&window);
         if size.width == 0 || size.height == 0 {
-            self.surface_recovery.record_surface_failure(SurfaceFailure::ZeroSizedSurface);
+            self.surface_recovery
+                .record_surface_failure(SurfaceFailure::ZeroSizedSurface);
             return false;
         }
 
@@ -803,7 +850,10 @@ impl App {
             self.request_renderer_recreation("backbuffer format changed during surface recovery");
             return false;
         }
-        backbuffer.set_vsync(renderer.device(), hardware_vsync_enabled(self.vsync, self.fps_limit));
+        backbuffer.set_vsync(
+            renderer.device(),
+            hardware_vsync_enabled(self.vsync, self.fps_limit),
+        );
 
         self.backbuffer = Some(backbuffer);
         self.waiting_for_surface_change = false;
@@ -848,19 +898,30 @@ impl App {
             return;
         }
 
-        log::info!("[egor] changing renderer backend from {:?} to {:?}", self.renderer_backend, backend);
+        log::info!(
+            "[egor] changing renderer backend from {:?} to {:?}",
+            self.renderer_backend,
+            backend
+        );
         self.renderer_backend = backend;
         self.renderer_recreate_requested = true;
         self.frame_timer_reset_requested = true;
         // WGL permanently sets a Win32 window's pixel format. A fresh HWND is
         // required before another API (notably DX12) can create its swapchain.
-        self.renderer_recreate_window_requested = cfg!(any(target_arch = "wasm32", target_os = "windows"));
+        self.renderer_recreate_window_requested =
+            cfg!(any(target_arch = "wasm32", target_os = "windows"));
         self.drop_renderer_owned_resources();
     }
 
     async fn create_renderer_with_retry(&self, window: Arc<Window>) -> Renderer {
         loop {
-            match Renderer::try_new_with_backend(window.clone(), &self.memory_hints, self.renderer_backend).await {
+            match Renderer::try_new_with_backend(
+                window.clone(),
+                &self.memory_hints,
+                self.renderer_backend,
+            )
+            .await
+            {
                 Ok(renderer) => return renderer,
                 Err(error) => {
                     log::error!("[egor] renderer init failed: {error:?}; retrying");
@@ -913,7 +974,9 @@ impl AppHandler<Renderer> for App {
                 if *occluded {
                     self.backbuffer = None;
                     self.surface_recovery
-                        .record_surface_failure(SurfaceFailure::Acquire(egor_render::target::SurfaceAcquireFailure::Occluded));
+                        .record_surface_failure(SurfaceFailure::Acquire(
+                            egor_render::target::SurfaceAcquireFailure::Occluded,
+                        ));
                     self.surface_acquire_retry_interval = Some(Duration::from_millis(100));
                 } else {
                     self.waiting_for_surface_change = false;
@@ -975,7 +1038,14 @@ impl AppHandler<Renderer> for App {
                     log::warn!("[egor] initial backbuffer creation failed: {error:?}");
                     None
                 }
-                None => match Backbuffer::try_new(renderer.instance(), renderer.adapter(), renderer.device(), window, w, h) {
+                None => match Backbuffer::try_new(
+                    renderer.instance(),
+                    renderer.adapter(),
+                    renderer.device(),
+                    window,
+                    w,
+                    h,
+                ) {
                     Ok(backbuffer) => Some(backbuffer),
                     Err(error) => {
                         log::warn!("[egor] initial backbuffer creation failed: {error:?}");
@@ -1023,11 +1093,17 @@ impl AppHandler<Renderer> for App {
     }
 
     fn poll_frame_interval(&self, window: &Window) -> Option<Duration> {
-        let fps_limit_interval = self
-            .fps_limit
-            .and_then(|fps_limit| software_frame_interval_for_fps_limit(window, self.native_refresh_rate_fps, fps_limit, self.vsync));
-        let background_interval =
-            (!self.hidden_window && (!self.window_focused || self.surface_occluded)).then_some(Duration::from_millis(100));
+        let fps_limit_interval = self.fps_limit.and_then(|fps_limit| {
+            software_frame_interval_for_fps_limit(
+                window,
+                self.native_refresh_rate_fps,
+                fps_limit,
+                self.vsync,
+            )
+        });
+        let background_interval = (!self.hidden_window
+            && (!self.window_focused || self.surface_occluded))
+            .then_some(Duration::from_millis(100));
 
         max_frame_interval(
             max_frame_interval(self.surface_acquire_retry_interval, fps_limit_interval),
@@ -1035,7 +1111,13 @@ impl AppHandler<Renderer> for App {
         )
     }
 
-    fn frame(&mut self, _window: &Window, renderer: &mut Renderer, input: &mut Input, timer: &FrameTimer) {
+    fn frame(
+        &mut self,
+        _window: &Window,
+        renderer: &mut Renderer,
+        input: &mut Input,
+        timer: &FrameTimer,
+    ) {
         let egor_frame_started_at = Instant::now();
         let mut frame_stats = FrameStats::default();
 
@@ -1067,10 +1149,14 @@ impl AppHandler<Renderer> for App {
             return;
         }
 
-        if should_wait_for_surface_restore(_window.is_minimized().unwrap_or(false), window_surface_size(_window)) {
+        if should_wait_for_surface_restore(
+            _window.is_minimized().unwrap_or(false),
+            window_surface_size(_window),
+        ) {
             self.frame_timer_reset_requested = true;
             self.backbuffer = None;
-            self.surface_recovery.record_surface_failure(SurfaceFailure::ZeroSizedSurface);
+            self.surface_recovery
+                .record_surface_failure(SurfaceFailure::ZeroSizedSurface);
             self.surface_acquire_retry_interval = Some(surface_wait_retry_interval());
             self.finish_frame_stats(frame_stats, egor_frame_started_at);
             return;
@@ -1111,9 +1197,12 @@ impl AppHandler<Renderer> for App {
         self.screen_capture.collect_cancelled_readbacks();
         frame_stats.readback_poll_time = poll_started.elapsed();
 
-        if self.backbuffer.is_none() && should_wait_for_surface_restore(false, window_surface_size(_window)) {
+        if self.backbuffer.is_none()
+            && should_wait_for_surface_restore(false, window_surface_size(_window))
+        {
             self.frame_timer_reset_requested = true;
-            self.surface_recovery.record_surface_failure(SurfaceFailure::ZeroSizedSurface);
+            self.surface_recovery
+                .record_surface_failure(SurfaceFailure::ZeroSizedSurface);
             self.surface_acquire_retry_interval = Some(surface_wait_retry_interval());
             self.finish_frame_stats(frame_stats, egor_frame_started_at);
             return;
@@ -1128,14 +1217,18 @@ impl AppHandler<Renderer> for App {
 
         if self.backbuffer.is_none() && !self.recreate_backbuffer(renderer) {
             self.frame_timer_reset_requested = true;
-            let action = self.surface_recovery.record_surface_failure(SurfaceFailure::BackbufferCreateFailed);
+            let action = self
+                .surface_recovery
+                .record_surface_failure(SurfaceFailure::BackbufferCreateFailed);
             match action {
                 SurfaceRecoveryAction::WaitForResize => {
                     self.surface_acquire_retry_interval = Some(surface_wait_retry_interval());
                 }
                 SurfaceRecoveryAction::WaitForSurfaceChange => {
                     if !self.waiting_for_surface_change {
-                        log::warn!("[egor] pausing backbuffer creation until Android reports a surface change");
+                        log::warn!(
+                            "[egor] pausing backbuffer creation until Android reports a surface change"
+                        );
                     }
                     self.waiting_for_surface_change = true;
                     self.surface_acquire_retry_interval = Some(surface_wait_retry_interval());
@@ -1170,7 +1263,13 @@ impl AppHandler<Renderer> for App {
         self.events_drained.clear();
         std::mem::swap(&mut self.events, &mut self.events_drained);
 
-        let (requested_size, requested_vsync, requested_fps_limit, requested_native_refresh_rate_fps, requested_renderer_backend) = {
+        let (
+            requested_size,
+            requested_vsync,
+            requested_fps_limit,
+            requested_native_refresh_rate_fps,
+            requested_renderer_backend,
+        ) = {
             let mut ctx = FrameContext {
                 events: std::mem::take(&mut self.events_drained),
                 app: AppControl {
@@ -1216,9 +1315,13 @@ impl AppHandler<Renderer> for App {
                         .unwrap_or_else(|| "unknown panic".to_string());
                     drop(ctx);
                     if renderer.device_lost() {
-                        log::error!("[egor] user frame callback panicked after GPU device loss: {panic_message:?}");
+                        log::error!(
+                            "[egor] user frame callback panicked after GPU device loss: {panic_message:?}"
+                        );
                         self.gpu_device_recreated_pending_frame = false;
-                        self.request_renderer_recreation("user callback panicked after device loss");
+                        self.request_renderer_recreation(
+                            "user callback panicked after device loss",
+                        );
                         self.finish_frame_stats(frame_stats, egor_frame_started_at);
                         return;
                     }
@@ -1308,11 +1411,16 @@ impl AppHandler<Renderer> for App {
             let unsupported_shader = batches
                 .iter()
                 .filter(|batch| batch.render_target.is_none())
-                .find_map(|batch| (!renderer.supports_watch_overlay_pipeline(batch.shader_id)).then_some(batch.shader_id));
+                .find_map(|batch| {
+                    (!renderer.supports_watch_overlay_pipeline(batch.shader_id))
+                        .then_some(batch.shader_id)
+                });
             if unsupported_capture || has_text || unsupported_shader.is_some() {
                 if unsupported_capture {
                     if !self.watch_overlay_capture_unsupported_logged {
-                        log::warn!("[egor] watch overlay capture skipped: backend does not support the dynamic overlay MRT path");
+                        log::warn!(
+                            "[egor] watch overlay capture skipped: backend does not support the dynamic overlay MRT path"
+                        );
                         self.watch_overlay_capture_unsupported_logged = true;
                     }
                 } else {
@@ -1330,13 +1438,17 @@ impl AppHandler<Renderer> for App {
                 WatchFrameTarget::ensure(&mut self.watch_frame_target, &device, w, h, format);
             }
         }
-        let use_capture_frame_target =
-            capture_active && !use_watch_frame_target && capture_source_render_target.is_none() && !backbuffer.supports_copy_src();
+        let use_capture_frame_target = capture_active
+            && !use_watch_frame_target
+            && capture_source_render_target.is_none()
+            && !backbuffer.supports_copy_src();
         if use_capture_frame_target {
             CaptureFrameTarget::ensure(&mut self.capture_frame_target, &device, w, h, format);
         }
         let capture_frame_view = if use_capture_frame_target {
-            self.capture_frame_target.as_ref().map(CaptureFrameTarget::view)
+            self.capture_frame_target
+                .as_ref()
+                .map(CaptureFrameTarget::view)
         } else {
             None
         };
@@ -1359,10 +1471,12 @@ impl AppHandler<Renderer> for App {
 
         let Some(mut frame) = frame_result else {
             let acquire_failure = backbuffer.last_acquire_failure();
-            let action = self.surface_recovery.record_surface_failure(match acquire_failure {
-                Some(failure) => SurfaceFailure::Acquire(failure),
-                None => SurfaceFailure::ConfigureFailed,
-            });
+            let action = self
+                .surface_recovery
+                .record_surface_failure(match acquire_failure {
+                    Some(failure) => SurfaceFailure::Acquire(failure),
+                    None => SurfaceFailure::ConfigureFailed,
+                });
             self.surface_acquire_retry_interval = Some(surface_acquire_retry_interval(
                 _window,
                 self.native_refresh_rate_fps,
@@ -1373,13 +1487,18 @@ impl AppHandler<Renderer> for App {
                 SurfaceRecoveryAction::RecreateBackbuffer => {
                     if self.recreate_backbuffer(renderer) {
                         self.surface_recovery.record_frame_acquired();
-                        self.surface_acquire_retry_interval =
-                            Some(surface_acquire_retry_interval(_window, self.native_refresh_rate_fps, 0));
+                        self.surface_acquire_retry_interval = Some(surface_acquire_retry_interval(
+                            _window,
+                            self.native_refresh_rate_fps,
+                            0,
+                        ));
                     }
                 }
                 SurfaceRecoveryAction::WaitForSurfaceChange => {
                     if !self.waiting_for_surface_change {
-                        log::warn!("[egor] pausing surface recovery until Android reports a surface change");
+                        log::warn!(
+                            "[egor] pausing surface recovery until Android reports a surface change"
+                        );
                     }
                     self.waiting_for_surface_change = true;
                     self.surface_acquire_retry_interval = Some(surface_wait_retry_interval());
@@ -1414,13 +1533,18 @@ impl AppHandler<Renderer> for App {
                 if batch.geometry.is_dirty() {
                     _dirty_batches += 1;
                 }
-                self.instance_byte_offsets.push((running_offset * inst_size) as u64);
+                self.instance_byte_offsets
+                    .push((running_offset * inst_size) as u64);
                 running_offset += batch.geometry.instance_count();
                 batch.geometry.upload_geometry_only(&device, &queue);
             }
             {
-                let batch_instance_slices: Vec<&[Instance]> = batches.iter().map(|b| b.geometry.instances()).collect();
-                renderer.upload_shared_instances_with_encoder(&batch_instance_slices, &mut frame.encoder);
+                let batch_instance_slices: Vec<&[Instance]> =
+                    batches.iter().map(|b| b.geometry.instances()).collect();
+                renderer.upload_shared_instances_with_encoder(
+                    &batch_instance_slices,
+                    &mut frame.encoder,
+                );
             }
         } // profile_scope batch_upload
         frame_stats.prep_time += upload_started_at.elapsed();
@@ -1454,14 +1578,17 @@ impl AppHandler<Renderer> for App {
                 while batch_start < batches.len() {
                     let group_rt = batches[batch_start].render_target;
                     let mut batch_end = batch_start + 1;
-                    while batch_end < batches.len() && batches[batch_end].render_target == group_rt {
+                    while batch_end < batches.len() && batches[batch_end].render_target == group_rt
+                    {
                         batch_end += 1;
                     }
 
                     // Handle render-target transition
                     if current_rt != group_rt {
                         if let Some(prev_rt) = current_rt {
-                            self.render_targets.get(prev_rt).copy_to_sample(&mut frame.encoder);
+                            self.render_targets
+                                .get(prev_rt)
+                                .copy_to_sample(&mut frame.encoder);
                         }
                         current_rt = group_rt;
                     }
@@ -1510,7 +1637,12 @@ impl AppHandler<Renderer> for App {
                                     true,
                                 )
                             } else {
-                                renderer.begin_render_pass_with_depth(&mut frame.encoder, view, depth_view, true)
+                                renderer.begin_render_pass_with_depth(
+                                    &mut frame.encoder,
+                                    view,
+                                    depth_view,
+                                    true,
+                                )
                             }
                         } else if watch_pass {
                             renderer.begin_render_pass_load_with_watch_overlay_depth(
@@ -1520,7 +1652,11 @@ impl AppHandler<Renderer> for App {
                                 depth_view,
                             )
                         } else {
-                            renderer.begin_render_pass_load_with_depth(&mut frame.encoder, view, depth_view)
+                            renderer.begin_render_pass_load_with_depth(
+                                &mut frame.encoder,
+                                view,
+                                depth_view,
+                            )
                         };
 
                         let first_batch = &batches[batch_start];
@@ -1552,27 +1688,33 @@ impl AppHandler<Renderer> for App {
                                 None => full_scissor,
                             };
                             if cur_scissor != target_scissor {
-                                r_pass.set_scissor_rect(target_scissor.0, target_scissor.1, target_scissor.2, target_scissor.3);
+                                r_pass.set_scissor_rect(
+                                    target_scissor.0,
+                                    target_scissor.1,
+                                    target_scissor.2,
+                                    target_scissor.3,
+                                );
                                 cur_scissor = target_scissor;
                             }
                             let offset = batch.camera_slot * stride;
                             if let Some(shared_buf) = renderer.shared_instance_buffer() {
-                                frame_stats.draw_calls += renderer.draw_batch_shared_with_watch_overlay(
-                                    &mut r_pass,
-                                    &mut batch.geometry,
-                                    batch.texture_id,
-                                    batch.shader_id,
-                                    batch.replace_blend,
-                                    offset,
-                                    &mut cur_tex,
-                                    &mut cur_shd,
-                                    &mut cur_replace_blend,
-                                    &mut cur_cam_offset,
-                                    &mut quad_bound,
-                                    shared_buf,
-                                    self.instance_byte_offsets[idx],
-                                    watch_pass,
-                                );
+                                frame_stats.draw_calls += renderer
+                                    .draw_batch_shared_with_watch_overlay(
+                                        &mut r_pass,
+                                        &mut batch.geometry,
+                                        batch.texture_id,
+                                        batch.shader_id,
+                                        batch.replace_blend,
+                                        offset,
+                                        &mut cur_tex,
+                                        &mut cur_shd,
+                                        &mut cur_replace_blend,
+                                        &mut cur_cam_offset,
+                                        &mut quad_bound,
+                                        shared_buf,
+                                        self.instance_byte_offsets[idx],
+                                        watch_pass,
+                                    );
                             } else {
                                 frame_stats.draw_calls += renderer.draw_batch_with_watch_overlay(
                                     &mut r_pass,
@@ -1591,7 +1733,9 @@ impl AppHandler<Renderer> for App {
                             }
                         }
 
-                        let is_last_group_for_target = batches[batch_end..].iter().all(|batch| batch.render_target != group_rt);
+                        let is_last_group_for_target = batches[batch_end..]
+                            .iter()
+                            .all(|batch| batch.render_target != group_rt);
                         if has_text && is_last_group_for_target {
                             text_renderer.prepare(&device, &queue, rt_w, rt_h, group_rt);
                             text_renderer.render(&mut r_pass);
@@ -1604,7 +1748,9 @@ impl AppHandler<Renderer> for App {
 
                 // Copy the last offscreen target if it was active
                 if let Some(prev_rt) = current_rt {
-                    self.render_targets.get(prev_rt).copy_to_sample(&mut frame.encoder);
+                    self.render_targets
+                        .get(prev_rt)
+                        .copy_to_sample(&mut frame.encoder);
                 }
 
                 if batches.is_empty() {
@@ -1671,27 +1817,33 @@ impl AppHandler<Renderer> for App {
                                 None => full_scissor,
                             };
                             if cur_scissor != target_scissor {
-                                r_pass.set_scissor_rect(target_scissor.0, target_scissor.1, target_scissor.2, target_scissor.3);
+                                r_pass.set_scissor_rect(
+                                    target_scissor.0,
+                                    target_scissor.1,
+                                    target_scissor.2,
+                                    target_scissor.3,
+                                );
                                 cur_scissor = target_scissor;
                             }
                             let offset = batch.camera_slot * stride;
                             if let Some(shared_buf) = renderer.shared_instance_buffer() {
-                                frame_stats.draw_calls += renderer.draw_batch_shared_with_watch_overlay(
-                                    &mut r_pass,
-                                    &mut batch.geometry,
-                                    batch.texture_id,
-                                    batch.shader_id,
-                                    batch.replace_blend,
-                                    offset,
-                                    &mut cur_tex,
-                                    &mut cur_shd,
-                                    &mut cur_replace_blend,
-                                    &mut cur_cam_offset,
-                                    &mut quad_bound,
-                                    shared_buf,
-                                    self.instance_byte_offsets[idx],
-                                    watch_pass,
-                                );
+                                frame_stats.draw_calls += renderer
+                                    .draw_batch_shared_with_watch_overlay(
+                                        &mut r_pass,
+                                        &mut batch.geometry,
+                                        batch.texture_id,
+                                        batch.shader_id,
+                                        batch.replace_blend,
+                                        offset,
+                                        &mut cur_tex,
+                                        &mut cur_shd,
+                                        &mut cur_replace_blend,
+                                        &mut cur_cam_offset,
+                                        &mut quad_bound,
+                                        shared_buf,
+                                        self.instance_byte_offsets[idx],
+                                        watch_pass,
+                                    );
                             } else {
                                 frame_stats.draw_calls += renderer.draw_batch_with_watch_overlay(
                                     &mut r_pass,
@@ -1732,8 +1884,13 @@ impl AppHandler<Renderer> for App {
             #[cfg(feature = "profiling")]
             profiling::scope!("watch_composite");
             let source_view = self.render_targets.get(source_rt_id).view();
-            self.screen_capture
-                .composite_sampled_view(&device, &mut frame.encoder, source_view, &frame.view, format);
+            self.screen_capture.composite_sampled_view(
+                &device,
+                &mut frame.encoder,
+                source_view,
+                &frame.view,
+                format,
+            );
         }
 
         // Screen capture: blit-downsample the final frame into a small capture
@@ -1751,26 +1908,49 @@ impl AppHandler<Renderer> for App {
                     h,
                     format.is_srgb(),
                 );
-                self.screen_capture
-                    .present_sampled_view(&device, &mut frame.encoder, &watch_target.color_view, &frame.view, format);
+                self.screen_capture.present_sampled_view(
+                    &device,
+                    &mut frame.encoder,
+                    &watch_target.color_view,
+                    &frame.view,
+                    format,
+                );
             } else if let Some(source_rt_id) = capture_source_render_target {
                 let source_view = self.render_targets.get(source_rt_id).view();
-                self.screen_capture
-                    .capture_from_sampled_view(&device, &mut frame.encoder, source_view, format.is_srgb());
+                self.screen_capture.capture_from_sampled_view(
+                    &device,
+                    &mut frame.encoder,
+                    source_view,
+                    format.is_srgb(),
+                );
             } else if let Some(source_view) = capture_frame_view {
-                self.screen_capture
-                    .capture_from_sampled_view(&device, &mut frame.encoder, source_view, format.is_srgb());
-                self.screen_capture
-                    .present_sampled_view(&device, &mut frame.encoder, source_view, &frame.view, format);
+                self.screen_capture.capture_from_sampled_view(
+                    &device,
+                    &mut frame.encoder,
+                    source_view,
+                    format.is_srgb(),
+                );
+                self.screen_capture.present_sampled_view(
+                    &device,
+                    &mut frame.encoder,
+                    source_view,
+                    &frame.view,
+                    format,
+                );
             } else {
-                let bb_ptr = frame.backbuffer_texture().map(|t| t as *const egor_render::Texture);
+                let bb_ptr = frame
+                    .backbuffer_texture()
+                    .map(|t| t as *const egor_render::Texture);
                 if let Some(ptr) = bb_ptr {
                     // SAFETY: the texture is owned by Frame.presentable which is
                     // not dropped until after this block, and we only read it.
                     let bb_tex = unsafe { &*ptr };
-                    self.screen_capture.capture_from_texture(&device, &mut frame.encoder, bb_tex);
+                    self.screen_capture
+                        .capture_from_texture(&device, &mut frame.encoder, bb_tex);
                 } else {
-                    eprintln!("[egor] Screen capture requested but no backbuffer texture available");
+                    eprintln!(
+                        "[egor] Screen capture requested but no backbuffer texture available"
+                    );
                     self.screen_capture.request(0, 0, false);
                 }
             }
@@ -1855,7 +2035,8 @@ impl AppHandler<Renderer> for App {
 
     fn resize(&mut self, w: u32, h: u32, renderer: &mut Renderer) {
         if w == 0 || h == 0 {
-            self.surface_recovery.record_surface_failure(SurfaceFailure::ZeroSizedSurface);
+            self.surface_recovery
+                .record_surface_failure(SurfaceFailure::ZeroSizedSurface);
             self.backbuffer = None;
             self.surface_acquire_retry_interval = Some(Duration::from_millis(100));
             return;
@@ -1903,7 +2084,8 @@ impl AppHandler<Renderer> for App {
             renderer.drop_startup_surface();
             self.backbuffer = None;
             if size.width == 0 || size.height == 0 {
-                self.surface_recovery.record_surface_failure(SurfaceFailure::ZeroSizedSurface);
+                self.surface_recovery
+                    .record_surface_failure(SurfaceFailure::ZeroSizedSurface);
                 log::info!("[egor] app resumed with zero-sized surface; waiting for resize");
                 self.surface_acquire_retry_interval = Some(Duration::from_millis(100));
                 return;
@@ -1919,15 +2101,27 @@ impl AppHandler<Renderer> for App {
 
         let device = renderer.device();
         if size.width == 0 || size.height == 0 {
-            self.surface_recovery.record_surface_failure(SurfaceFailure::ZeroSizedSurface);
+            self.surface_recovery
+                .record_surface_failure(SurfaceFailure::ZeroSizedSurface);
             log::info!("[egor] app resumed with zero-sized surface; waiting for resize");
             self.backbuffer = None;
             self.surface_acquire_retry_interval = Some(Duration::from_millis(100));
             return;
         }
 
-        log::info!("[egor] app resumed: recreating backbuffer {}x{}", size.width, size.height);
-        let mut backbuffer = match Backbuffer::try_new(renderer.instance(), renderer.adapter(), device, window, size.width, size.height) {
+        log::info!(
+            "[egor] app resumed: recreating backbuffer {}x{}",
+            size.width,
+            size.height
+        );
+        let mut backbuffer = match Backbuffer::try_new(
+            renderer.instance(),
+            renderer.adapter(),
+            device,
+            window,
+            size.width,
+            size.height,
+        ) {
             Ok(backbuffer) => backbuffer,
             Err(error) => {
                 log::warn!("[egor] app resume backbuffer creation failed: {error:?}");
@@ -1969,7 +2163,10 @@ mod tests {
         assert!(app.capture_frame_target.is_none());
         assert!(app.offscreen_batches.is_empty());
         assert!(app.instance_byte_offsets.is_empty());
-        assert_eq!(app.surface_acquire_retry_interval, Some(Duration::from_millis(1000)));
+        assert_eq!(
+            app.surface_acquire_retry_interval,
+            Some(Duration::from_millis(1000))
+        );
     }
 
     #[test]
@@ -1999,10 +2196,22 @@ mod tests {
 
     #[test]
     fn minimized_or_zero_sized_surface_waits_for_restore() {
-        assert!(should_wait_for_surface_restore(true, PhysicalSize::new(1280, 720)));
-        assert!(should_wait_for_surface_restore(false, PhysicalSize::new(0, 720)));
-        assert!(should_wait_for_surface_restore(false, PhysicalSize::new(1280, 0)));
-        assert!(!should_wait_for_surface_restore(false, PhysicalSize::new(1280, 720)));
+        assert!(should_wait_for_surface_restore(
+            true,
+            PhysicalSize::new(1280, 720)
+        ));
+        assert!(should_wait_for_surface_restore(
+            false,
+            PhysicalSize::new(0, 720)
+        ));
+        assert!(should_wait_for_surface_restore(
+            false,
+            PhysicalSize::new(1280, 0)
+        ));
+        assert!(!should_wait_for_surface_restore(
+            false,
+            PhysicalSize::new(1280, 720)
+        ));
     }
 
     #[test]
