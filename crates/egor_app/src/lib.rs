@@ -5,7 +5,9 @@ pub mod time;
     target_os = "android",
     not(any(feature = "android-native-activity", feature = "android-game-activity"))
 ))]
-compile_error!("On Android, enable either the `android-native-activity` or `android-game-activity` feature for egor_app");
+compile_error!(
+    "On Android, enable either the `android-native-activity` or `android-game-activity` feature for egor_app"
+);
 
 use crate::{input::Input, time::FrameTimer};
 use std::sync::Arc;
@@ -41,7 +43,9 @@ pub struct AndroidAppStore {
 #[cfg(target_os = "android")]
 impl AndroidAppStore {
     pub const fn new() -> Self {
-        Self { app: const_rwlock(None) }
+        Self {
+            app: const_rwlock(None),
+        }
     }
 
     pub fn set(&self, app: AndroidApp) {
@@ -65,7 +69,10 @@ use winit::{
 };
 
 #[cfg(target_os = "ios")]
-fn platform_control_flow(control_flow: ControlFlow, poll_frame_interval: Option<Duration>) -> ControlFlow {
+fn platform_control_flow(
+    control_flow: ControlFlow,
+    poll_frame_interval: Option<Duration>,
+) -> ControlFlow {
     match control_flow {
         ControlFlow::Poll => poll_frame_interval
             .map(|interval| ControlFlow::WaitUntil(Instant::now() + interval))
@@ -75,7 +82,10 @@ fn platform_control_flow(control_flow: ControlFlow, poll_frame_interval: Option<
 }
 
 #[cfg(not(target_os = "ios"))]
-fn platform_control_flow(control_flow: ControlFlow, poll_frame_interval: Option<Duration>) -> ControlFlow {
+fn platform_control_flow(
+    control_flow: ControlFlow,
+    poll_frame_interval: Option<Duration>,
+) -> ControlFlow {
     match control_flow {
         ControlFlow::Poll => poll_frame_interval
             .map(|interval| ControlFlow::WaitUntil(Instant::now() + interval))
@@ -97,6 +107,7 @@ fn should_request_poll_redraw_manually() -> bool {
 pub struct AppConfig {
     pub control_flow: ControlFlow,
     pub title: String,
+    pub visible: bool,
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub position: Option<(i32, i32)>,
@@ -116,6 +127,7 @@ impl Default for AppConfig {
         Self {
             control_flow: ControlFlow::Poll,
             title: "Egor App".to_string(),
+            visible: true,
             width: None,
             height: None,
             position: None,
@@ -149,7 +161,14 @@ pub trait AppHandler<R> {
     /// Called after the resource is initialized & window is ready
     fn on_ready(&mut self, _window: &Window, _resource: &mut R) {}
     /// Called every frame
-    fn frame(&mut self, _window: &Window, _resource: &mut R, _input: &mut Input, _timer: &FrameTimer) {}
+    fn frame(
+        &mut self,
+        _window: &Window,
+        _resource: &mut R,
+        _input: &mut Input,
+        _timer: &FrameTimer,
+    ) {
+    }
     /// Return true when the resource should be dropped and recreated.
     fn resource_recreate_requested(&self) -> bool {
         false
@@ -214,7 +233,11 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         self.timer.reset_next_update();
 
-        if let (Some(window), Some(resource), Some(handler)) = (self.window.clone(), self.resource.as_mut(), self.handler.as_mut()) {
+        if let (Some(window), Some(resource), Some(handler)) = (
+            self.window.clone(),
+            self.resource.as_mut(),
+            self.handler.as_mut(),
+        ) {
             handler.resumed(window, resource);
         }
 
@@ -234,6 +257,7 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
 
         let mut win_attrs = Window::default_attributes()
             .with_visible(false)
+            .with_active(self.config.visible)
             .with_title(&self.config.title)
             .with_resizable(self.config.resizable)
             .with_maximized(self.config.maximized)
@@ -300,7 +324,8 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => {
                 let Some(window) = &self.window else { return };
-                let (Some(resource), Some(handler)) = (&mut self.resource, &mut self.handler) else {
+                let (Some(resource), Some(handler)) = (&mut self.resource, &mut self.handler)
+                else {
                     return;
                 };
 
@@ -348,7 +373,9 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
                 }
             }
             WindowEvent::Resized(size) => {
-                if let (Some(resource), Some(handler)) = (self.resource.as_mut(), self.handler.as_mut()) {
+                if let (Some(resource), Some(handler)) =
+                    (self.resource.as_mut(), self.handler.as_mut())
+                {
                     handler.resize(size.width, size.height, resource);
                 }
             }
@@ -401,7 +428,7 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
         let recreate_window = handler.window_recreate_requested();
         let recreate_resource = handler.resource_recreate_requested();
 
-        window.set_visible(true);
+        window.set_visible(self.config.visible);
         if recreate_window {
             self.resource = Some(resource);
             self.handler = Some(handler);
@@ -438,6 +465,24 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Invisible Win32 windows do not receive WM_PAINT. Drive the same
+        // paced frame path explicitly without ever showing/activating them.
+        if !self.config.visible
+            && self.config.control_flow == ControlFlow::Poll
+            && self.resource.is_some()
+            && let Some(window_id) = self.window.as_ref().map(|window| window.id())
+        {
+            self.window_event(event_loop, window_id, WindowEvent::RedrawRequested);
+            event_loop.set_control_flow(
+                self.queued_poll_redraw_at
+                    .map(ControlFlow::WaitUntil)
+                    .unwrap_or(ControlFlow::Poll),
+            );
+            if let Some(handler) = self.handler.as_mut() {
+                handler.about_to_wait();
+            }
+            return;
+        }
         if self.config.control_flow == ControlFlow::Poll
             && self.queued_poll_redraw
             && let Some(window) = &self.window
@@ -465,7 +510,10 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
                 window.request_redraw();
                 event_loop.set_control_flow(ControlFlow::Wait);
             } else {
-                event_loop.set_control_flow(platform_control_flow(self.config.control_flow, poll_frame_interval));
+                event_loop.set_control_flow(platform_control_flow(
+                    self.config.control_flow,
+                    poll_frame_interval,
+                ));
             }
         }
 
@@ -486,7 +534,12 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
         }
     }
 
-    fn device_event(&mut self, _event_loop: &ActiveEventLoop, device_id: DeviceId, event: DeviceEvent) {
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
         if let Some(handler) = self.handler.as_mut() {
             handler.device_event(device_id, &event);
         }
@@ -523,7 +576,9 @@ impl<R, H: AppHandler<R> + 'static> AppRunner<R, H> {
 
     fn poll_frame_interval(&self) -> Option<Duration> {
         let window = self.window.as_deref()?;
-        self.handler.as_ref().and_then(|handler| handler.poll_frame_interval(window))
+        self.handler
+            .as_ref()
+            .and_then(|handler| handler.poll_frame_interval(window))
     }
 
     fn poll_frame_interval_for_handler(handler: &H, window: &Window) -> Option<Duration> {
@@ -601,7 +656,9 @@ impl<R, H: AppHandler<R> + 'static> AppRunner<R, H> {
         #[cfg(target_os = "android")]
         {
             #[cfg(feature = "log")]
-            android_logger::init_once(android_logger::Config::default().with_max_level(log::LevelFilter::Info));
+            android_logger::init_once(
+                android_logger::Config::default().with_max_level(log::LevelFilter::Info),
+            );
 
             use winit::platform::android::EventLoopBuilderExtAndroid;
             let android_app = ANDROID_APP.cloned().unwrap();
@@ -638,7 +695,10 @@ impl<R, H: AppHandler<R> + 'static> AppRunner<R, H> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             #[cfg(all(feature = "log", not(target_os = "android")))]
-            let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("error")).try_init();
+            let _ = env_logger::Builder::from_env(
+                env_logger::Env::default().default_filter_or("error"),
+            )
+            .try_init();
 
             event_loop.run_app(&mut self).unwrap();
         }
@@ -661,7 +721,8 @@ mod tests {
         }
 
         fn before_resource_recreate(&mut self) {
-            self.before_recreate_calls.set(self.before_recreate_calls.get() + 1);
+            self.before_recreate_calls
+                .set(self.before_recreate_calls.get() + 1);
         }
     }
 
@@ -690,10 +751,17 @@ mod tests {
     #[test]
     fn recreated_resource_can_be_installed_after_prepare() {
         let before_recreate_calls = Rc::new(Cell::new(0));
-        let mut runner = AppRunner::new(TestHandler { before_recreate_calls }, AppConfig::default());
+        let mut runner = AppRunner::new(
+            TestHandler {
+                before_recreate_calls,
+            },
+            AppConfig::default(),
+        );
         runner.resource = Some(1);
 
-        let handler = runner.prepare_resource_recreate().expect("handler should be returned");
+        let handler = runner
+            .prepare_resource_recreate()
+            .expect("handler should be returned");
         runner.resource = Some(2);
         runner.handler = Some(handler);
 

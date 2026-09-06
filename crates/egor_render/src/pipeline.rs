@@ -1,10 +1,11 @@
 use std::{borrow::Cow, collections::HashMap};
 
 use wgpu::{
-    BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType, BlendState, BufferBindingType, ColorTargetState,
-    ColorWrites, CompareFunction, DepthStencilState, Device, FragmentState, PipelineLayoutDescriptor, RenderPipeline,
-    RenderPipelineDescriptor, SamplerBindingType, ShaderModuleDescriptor, ShaderSource, ShaderStages, StencilState, TextureFormat,
-    TextureSampleType, TextureViewDimension, VertexState, include_wgsl,
+    BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType, BlendState,
+    BufferBindingType, ColorTargetState, ColorWrites, CompareFunction, DepthStencilState, Device,
+    FragmentState, PipelineLayoutDescriptor, RenderPipeline, RenderPipelineDescriptor,
+    SamplerBindingType, ShaderModuleDescriptor, ShaderSource, ShaderStages, StencilState,
+    TextureFormat, TextureSampleType, TextureViewDimension, VertexState, include_wgsl,
 };
 
 use crate::{instance::Instance, vertex::Vertex};
@@ -46,7 +47,11 @@ fn skip_ascii_whitespace(source: &str, mut index: usize) -> usize {
 
 fn parse_fragment_argument_names(params: &str) -> Option<String> {
     let mut names = Vec::new();
-    for param in params.split(',').map(str::trim).filter(|param| !param.is_empty()) {
+    for param in params
+        .split(',')
+        .map(str::trim)
+        .filter(|param| !param.is_empty())
+    {
         let (name, _) = param.split_once(':')?;
         names.push(name.trim());
     }
@@ -60,45 +65,72 @@ fn wrap_custom_shader_for_srgb_output(wgsl_source: &str) -> Cow<'_, str> {
     const RETURN_TYPE: &str = "vec4<f32>";
 
     let Some(fn_pos) = wgsl_source.find(USER_FN) else {
-        log::warn!("[egor] custom shader has no fs_main entrypoint; sRGB output encoding was not applied");
+        log::warn!(
+            "[egor] custom shader has no fs_main entrypoint; sRGB output encoding was not applied"
+        );
         return Cow::Borrowed(wgsl_source);
     };
     let Some(attr_pos) = wgsl_source[..fn_pos].rfind(FRAGMENT_ATTR) else {
-        log::warn!("[egor] custom shader fs_main has no @fragment attribute; sRGB output encoding was not applied");
+        log::warn!(
+            "[egor] custom shader fs_main has no @fragment attribute; sRGB output encoding was not applied"
+        );
         return Cow::Borrowed(wgsl_source);
     };
-    if !wgsl_source[attr_pos + FRAGMENT_ATTR.len()..fn_pos].trim().is_empty() {
-        log::warn!("[egor] custom shader @fragment attribute could not be matched to fs_main; sRGB output encoding was not applied");
+    if !wgsl_source[attr_pos + FRAGMENT_ATTR.len()..fn_pos]
+        .trim()
+        .is_empty()
+    {
+        log::warn!(
+            "[egor] custom shader @fragment attribute could not be matched to fs_main; sRGB output encoding was not applied"
+        );
         return Cow::Borrowed(wgsl_source);
     }
 
-    let Some(params_start) = wgsl_source[fn_pos..].find('(').map(|offset| fn_pos + offset) else {
-        log::warn!("[egor] custom shader fs_main params could not be parsed; sRGB output encoding was not applied");
+    let Some(params_start) = wgsl_source[fn_pos..]
+        .find('(')
+        .map(|offset| fn_pos + offset)
+    else {
+        log::warn!(
+            "[egor] custom shader fs_main params could not be parsed; sRGB output encoding was not applied"
+        );
         return Cow::Borrowed(wgsl_source);
     };
-    let Some(params_end) = wgsl_source[params_start..].find(')').map(|offset| params_start + offset) else {
-        log::warn!("[egor] custom shader fs_main params could not be parsed; sRGB output encoding was not applied");
+    let Some(params_end) = wgsl_source[params_start..]
+        .find(')')
+        .map(|offset| params_start + offset)
+    else {
+        log::warn!(
+            "[egor] custom shader fs_main params could not be parsed; sRGB output encoding was not applied"
+        );
         return Cow::Borrowed(wgsl_source);
     };
     let params = &wgsl_source[params_start + 1..params_end];
     let Some(argument_names) = parse_fragment_argument_names(params) else {
-        log::warn!("[egor] custom shader fs_main arguments could not be parsed; sRGB output encoding was not applied");
+        log::warn!(
+            "[egor] custom shader fs_main arguments could not be parsed; sRGB output encoding was not applied"
+        );
         return Cow::Borrowed(wgsl_source);
     };
 
     let mut cursor = skip_ascii_whitespace(wgsl_source, params_end + 1);
     if !wgsl_source[cursor..].starts_with("->") {
-        log::warn!("[egor] custom shader fs_main return type could not be parsed; sRGB output encoding was not applied");
+        log::warn!(
+            "[egor] custom shader fs_main return type could not be parsed; sRGB output encoding was not applied"
+        );
         return Cow::Borrowed(wgsl_source);
     }
     cursor = skip_ascii_whitespace(wgsl_source, cursor + 2);
     if !wgsl_source[cursor..].starts_with(RETURN_LOCATION) {
-        log::warn!("[egor] custom shader fs_main return location could not be parsed; sRGB output encoding was not applied");
+        log::warn!(
+            "[egor] custom shader fs_main return location could not be parsed; sRGB output encoding was not applied"
+        );
         return Cow::Borrowed(wgsl_source);
     }
     cursor = skip_ascii_whitespace(wgsl_source, cursor + RETURN_LOCATION.len());
     if !wgsl_source[cursor..].starts_with(RETURN_TYPE) {
-        log::warn!("[egor] custom shader fs_main return type is not vec4<f32>; sRGB output encoding was not applied");
+        log::warn!(
+            "[egor] custom shader fs_main return type is not vec4<f32>; sRGB output encoding was not applied"
+        );
         return Cow::Borrowed(wgsl_source);
     }
     let return_type_end = cursor + RETURN_TYPE.len();
@@ -112,7 +144,9 @@ fn wrap_custom_shader_for_srgb_output(wgsl_source: &str) -> Cow<'_, str> {
     wrapped.push_str(SRGB_OUTPUT_HELPERS);
     wrapped.push_str("\n@fragment\nfn fs_main(");
     wrapped.push_str(params);
-    wrapped.push_str(") -> @location(0) vec4<f32> {\n    return egor_linear_to_srgb(egor_user_fs_main(");
+    wrapped.push_str(
+        ") -> @location(0) vec4<f32> {\n    return egor_linear_to_srgb(egor_user_fs_main(",
+    );
     wrapped.push_str(&argument_names);
     wrapped.push_str("));\n}\n");
 
@@ -120,65 +154,102 @@ fn wrap_custom_shader_for_srgb_output(wgsl_source: &str) -> Cow<'_, str> {
 }
 
 fn first_fragment_argument_name(params: &str) -> Option<String> {
-    let first = params.split(',').map(str::trim).find(|param| !param.is_empty())?;
+    let first = params
+        .split(',')
+        .map(str::trim)
+        .find(|param| !param.is_empty())?;
     let (name, _) = first.split_once(':')?;
     Some(name.trim().to_owned())
 }
 
-fn wrap_custom_shader_for_watch_output(wgsl_source: &str, encode_srgb: bool) -> Option<Cow<'_, str>> {
+fn wrap_custom_shader_for_watch_output(
+    wgsl_source: &str,
+    encode_srgb: bool,
+) -> Option<Cow<'_, str>> {
     const FRAGMENT_ATTR: &str = "@fragment";
     const USER_FN: &str = "fn fs_main";
     const RETURN_LOCATION: &str = "@location(0)";
     const RETURN_TYPE: &str = "vec4<f32>";
 
     let Some(fn_pos) = wgsl_source.find(USER_FN) else {
-        log::warn!("[egor] custom shader has no fs_main entrypoint; watch overlay output was not applied");
+        log::warn!(
+            "[egor] custom shader has no fs_main entrypoint; watch overlay output was not applied"
+        );
         return None;
     };
     let Some(attr_pos) = wgsl_source[..fn_pos].rfind(FRAGMENT_ATTR) else {
-        log::warn!("[egor] custom shader fs_main has no @fragment attribute; watch overlay output was not applied");
+        log::warn!(
+            "[egor] custom shader fs_main has no @fragment attribute; watch overlay output was not applied"
+        );
         return None;
     };
-    if !wgsl_source[attr_pos + FRAGMENT_ATTR.len()..fn_pos].trim().is_empty() {
-        log::warn!("[egor] custom shader @fragment attribute could not be matched to fs_main; watch overlay output was not applied");
+    if !wgsl_source[attr_pos + FRAGMENT_ATTR.len()..fn_pos]
+        .trim()
+        .is_empty()
+    {
+        log::warn!(
+            "[egor] custom shader @fragment attribute could not be matched to fs_main; watch overlay output was not applied"
+        );
         return None;
     }
 
-    let Some(params_start) = wgsl_source[fn_pos..].find('(').map(|offset| fn_pos + offset) else {
-        log::warn!("[egor] custom shader fs_main params could not be parsed; watch overlay output was not applied");
+    let Some(params_start) = wgsl_source[fn_pos..]
+        .find('(')
+        .map(|offset| fn_pos + offset)
+    else {
+        log::warn!(
+            "[egor] custom shader fs_main params could not be parsed; watch overlay output was not applied"
+        );
         return None;
     };
-    let Some(params_end) = wgsl_source[params_start..].find(')').map(|offset| params_start + offset) else {
-        log::warn!("[egor] custom shader fs_main params could not be parsed; watch overlay output was not applied");
+    let Some(params_end) = wgsl_source[params_start..]
+        .find(')')
+        .map(|offset| params_start + offset)
+    else {
+        log::warn!(
+            "[egor] custom shader fs_main params could not be parsed; watch overlay output was not applied"
+        );
         return None;
     };
     let params = &wgsl_source[params_start + 1..params_end];
     let Some(argument_names) = parse_fragment_argument_names(params) else {
-        log::warn!("[egor] custom shader fs_main arguments could not be parsed; watch overlay output was not applied");
+        log::warn!(
+            "[egor] custom shader fs_main arguments could not be parsed; watch overlay output was not applied"
+        );
         return None;
     };
     let Some(first_argument_name) = first_fragment_argument_name(params) else {
-        log::warn!("[egor] custom shader fs_main first argument could not be parsed; watch overlay output was not applied");
+        log::warn!(
+            "[egor] custom shader fs_main first argument could not be parsed; watch overlay output was not applied"
+        );
         return None;
     };
     if !wgsl_source.contains("watch_overlay") {
-        log::warn!("[egor] custom shader has no watch_overlay fragment input; watch overlay output was not applied");
+        log::warn!(
+            "[egor] custom shader has no watch_overlay fragment input; watch overlay output was not applied"
+        );
         return None;
     };
 
     let mut cursor = skip_ascii_whitespace(wgsl_source, params_end + 1);
     if !wgsl_source[cursor..].starts_with("->") {
-        log::warn!("[egor] custom shader fs_main return type could not be parsed; watch overlay output was not applied");
+        log::warn!(
+            "[egor] custom shader fs_main return type could not be parsed; watch overlay output was not applied"
+        );
         return None;
     }
     cursor = skip_ascii_whitespace(wgsl_source, cursor + 2);
     if !wgsl_source[cursor..].starts_with(RETURN_LOCATION) {
-        log::warn!("[egor] custom shader fs_main return location could not be parsed; watch overlay output was not applied");
+        log::warn!(
+            "[egor] custom shader fs_main return location could not be parsed; watch overlay output was not applied"
+        );
         return None;
     }
     cursor = skip_ascii_whitespace(wgsl_source, cursor + RETURN_LOCATION.len());
     if !wgsl_source[cursor..].starts_with(RETURN_TYPE) {
-        log::warn!("[egor] custom shader fs_main return type is not vec4<f32>; watch overlay output was not applied");
+        log::warn!(
+            "[egor] custom shader fs_main return type is not vec4<f32>; watch overlay output was not applied"
+        );
         return None;
     }
     let return_type_end = cursor + RETURN_TYPE.len();
@@ -263,7 +334,11 @@ pub(crate) struct Pipelines {
 
 impl Pipelines {
     /// Creates all pipelines and bind group layouts for the given device and surface format
-    pub fn new(device: &Device, surface_format: TextureFormat, watch_overlay_supported: bool) -> Self {
+    pub fn new(
+        device: &Device,
+        surface_format: TextureFormat,
+        watch_overlay_supported: bool,
+    ) -> Self {
         let texture_layout = create_texture_bind_group_layout(device);
         let camera_layout = create_camera_bind_group_layout(device);
 
@@ -277,8 +352,16 @@ impl Pipelines {
             false,
             false,
         );
-        let primitive_replace =
-            create_primitive_pipeline(device, surface_format, &texture_layout, &camera_layout, None, false, true, false);
+        let primitive_replace = create_primitive_pipeline(
+            device,
+            surface_format,
+            &texture_layout,
+            &camera_layout,
+            None,
+            false,
+            true,
+            false,
+        );
         let primitive_watch = watch_overlay_supported.then(|| {
             create_primitive_pipeline(
                 device,
@@ -291,8 +374,18 @@ impl Pipelines {
                 true,
             )
         });
-        let primitive_replace_watch = watch_overlay_supported
-            .then(|| create_primitive_pipeline(device, surface_format, &texture_layout, &camera_layout, None, false, true, true));
+        let primitive_replace_watch = watch_overlay_supported.then(|| {
+            create_primitive_pipeline(
+                device,
+                surface_format,
+                &texture_layout,
+                &camera_layout,
+                None,
+                false,
+                true,
+                true,
+            )
+        });
 
         Self {
             primitive,
@@ -326,7 +419,10 @@ impl Pipelines {
         let cache_key = CustomPipelineKey {
             wgsl_source: wgsl_source.to_owned(),
             surface_format,
-            uniform_layouts: uniform_layouts.iter().map(|layout| (*layout).clone()).collect(),
+            uniform_layouts: uniform_layouts
+                .iter()
+                .map(|layout| (*layout).clone())
+                .collect(),
         };
         let compiled_pipeline_id = if let Some(&id) = self.custom_cache.get(&cache_key) {
             id
@@ -353,7 +449,10 @@ impl Pipelines {
             };
 
             let id = self.compiled_custom.len();
-            self.compiled_custom.push(CompiledCustomPipeline { pipeline, watch_pipeline });
+            self.compiled_custom.push(CompiledCustomPipeline {
+                pipeline,
+                watch_pipeline,
+            });
             self.custom_cache.insert(cache_key, id);
             id
         };
@@ -482,7 +581,11 @@ fn create_primitive_pipeline(
     watch_overlay: bool,
 ) -> RenderPipeline {
     let shader = device.create_shader_module(include_wgsl!("../shader.wgsl"));
-    let fragment_entry_point = match (replace, surface_needs_srgb_encode(surface_format), watch_overlay) {
+    let fragment_entry_point = match (
+        replace,
+        surface_needs_srgb_encode(surface_format),
+        watch_overlay,
+    ) {
         (true, true, true) => "fs_replace_srgb_encoded_watch",
         (true, false, true) => "fs_replace_watch",
         (false, true, true) => "fs_main_srgb_encoded_watch",
@@ -581,7 +684,8 @@ fn create_custom_pipeline(
         source: ShaderSource::Wgsl(wgsl_source),
     });
 
-    let mut layouts: Vec<Option<&BindGroupLayout>> = vec![Some(texture_layout), Some(camera_layout)];
+    let mut layouts: Vec<Option<&BindGroupLayout>> =
+        vec![Some(texture_layout), Some(camera_layout)];
     layouts.extend(extra_layouts.iter().map(|l| Some(*l)));
 
     let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
@@ -631,13 +735,17 @@ fn create_custom_watch_pipeline(
     extra_layouts: &[&BindGroupLayout],
     wgsl_source: &str,
 ) -> Option<RenderPipeline> {
-    let wgsl_source = wrap_custom_shader_for_watch_output(wgsl_source, surface_needs_srgb_encode(surface_format))?;
+    let wgsl_source = wrap_custom_shader_for_watch_output(
+        wgsl_source,
+        surface_needs_srgb_encode(surface_format),
+    )?;
     let shader = device.create_shader_module(ShaderModuleDescriptor {
         label: Some("Custom Watch Shader"),
         source: ShaderSource::Wgsl(wgsl_source),
     });
 
-    let mut layouts: Vec<Option<&BindGroupLayout>> = vec![Some(texture_layout), Some(camera_layout)];
+    let mut layouts: Vec<Option<&BindGroupLayout>> =
+        vec![Some(texture_layout), Some(camera_layout)];
     layouts.extend(extra_layouts.iter().map(|l| Some(*l)));
 
     let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
@@ -730,12 +838,15 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
     #[test]
     fn custom_watch_wrapper_requires_overlay_factor() {
-        assert!(wrap_custom_shader_for_watch_output(CUSTOM_SHADER_WITHOUT_OVERLAY, false).is_none());
+        assert!(
+            wrap_custom_shader_for_watch_output(CUSTOM_SHADER_WITHOUT_OVERLAY, false).is_none()
+        );
     }
 
     #[test]
     fn custom_watch_wrapper_emits_overlay_attachment() {
-        let wrapped = wrap_custom_shader_for_watch_output(CUSTOM_SHADER_WITH_OVERLAY, false).expect("wrapper should succeed");
+        let wrapped = wrap_custom_shader_for_watch_output(CUSTOM_SHADER_WITH_OVERLAY, false)
+            .expect("wrapper should succeed");
 
         assert!(wrapped.contains("@location(1) overlay: vec4<f32>"));
         assert!(wrapped.contains("input.watch_overlay"));
@@ -748,8 +859,20 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let mut pipelines = Pipelines::new(&device, surface_format, true);
         let uniform_layout = create_camera_bind_group_layout(&device);
 
-        let first = pipelines.add_custom(&device, surface_format, CUSTOM_SHADER_WITH_OVERLAY, &[&uniform_layout], &[4]);
-        let second = pipelines.add_custom(&device, surface_format, CUSTOM_SHADER_WITH_OVERLAY, &[&uniform_layout], &[9]);
+        let first = pipelines.add_custom(
+            &device,
+            surface_format,
+            CUSTOM_SHADER_WITH_OVERLAY,
+            &[&uniform_layout],
+            &[4],
+        );
+        let second = pipelines.add_custom(
+            &device,
+            surface_format,
+            CUSTOM_SHADER_WITH_OVERLAY,
+            &[&uniform_layout],
+            &[9],
+        );
 
         assert_eq!(pipelines.compiled_custom.len(), 1);
         assert_eq!(pipelines.custom.len(), 2);
@@ -781,8 +904,20 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let first_layout = create_camera_bind_group_layout(&device);
         let second_layout = create_camera_bind_group_layout(&device);
 
-        pipelines.add_custom(&device, surface_format, CUSTOM_SHADER_WITH_OVERLAY, &[&first_layout], &[4]);
-        pipelines.add_custom(&device, surface_format, CUSTOM_SHADER_WITH_OVERLAY, &[&second_layout], &[9]);
+        pipelines.add_custom(
+            &device,
+            surface_format,
+            CUSTOM_SHADER_WITH_OVERLAY,
+            &[&first_layout],
+            &[4],
+        );
+        pipelines.add_custom(
+            &device,
+            surface_format,
+            CUSTOM_SHADER_WITH_OVERLAY,
+            &[&second_layout],
+            &[9],
+        );
         pipelines.add_custom(
             &device,
             TextureFormat::Rgba8UnormSrgb,

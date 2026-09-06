@@ -1,6 +1,7 @@
 pub mod batch;
 pub mod frame;
 pub mod instance;
+mod instance_upload;
 mod pipeline;
 pub mod target;
 mod texture;
@@ -12,15 +13,18 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+pub use instance_upload::InstanceUploadMetrics;
+
 pub use wgpu::{
-    self, AdapterInfo, Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, Extent3d, MemoryHints, Queue, RenderPass, Texture,
-    TextureFormat,
+    self, AdapterInfo, Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, Extent3d,
+    MemoryHints, Queue, RenderPass, Texture, TextureFormat,
 };
 
 use wgpu::{
-    Adapter, BindGroup, BindGroupDescriptor, BindGroupEntry, Color, DeviceDescriptor, Instance, InstanceDescriptor, LoadOp, Operations,
-    RenderPassColorAttachment, RenderPassDepthStencilAttachment, RenderPassDescriptor, RequestAdapterOptions, StoreOp, SurfaceTarget,
-    TextureUsages, TextureView, WindowHandle,
+    Adapter, BindGroup, BindGroupDescriptor, BindGroupEntry, Color, DeviceDescriptor, Instance,
+    InstanceDescriptor, LoadOp, Operations, RenderPassColorAttachment,
+    RenderPassDepthStencilAttachment, RenderPassDescriptor, RequestAdapterOptions, StoreOp,
+    SurfaceTarget, TextureUsages, TextureView, WindowHandle,
     util::{BufferInitDescriptor, DeviceExt, new_instance_with_webgpu_detection},
 };
 
@@ -85,6 +89,7 @@ impl RendererBackendPreference {
 
 fn renderer_instance_descriptor() -> InstanceDescriptor {
     let mut desc = InstanceDescriptor::new_without_display_handle();
+    desc.flags = desc.flags.with_env();
     configure_renderer_instance_flags(&mut desc);
     desc
 }
@@ -107,7 +112,10 @@ pub enum RendererInitError {
     CreateSurface(String),
     RequestAdapter(String),
     RequestDevice(String),
-    AdapterLimit { max_texture_dimension_2d: u32, required: u32 },
+    AdapterLimit {
+        max_texture_dimension_2d: u32,
+        required: u32,
+    },
     SurfaceConfig(target::BackbufferError),
 }
 
@@ -166,10 +174,17 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
 const REQUIRED_MAX_TEXTURE_DIMENSION_2D: u32 = 4096;
 
 fn format_supports_usages(adapter: &Adapter, format: TextureFormat, usages: TextureUsages) -> bool {
-    adapter.get_texture_format_features(format).allowed_usages.contains(usages)
+    adapter
+        .get_texture_format_features(format)
+        .allowed_usages
+        .contains(usages)
 }
 
-fn watch_overlay_capture_supported(adapter: &Adapter, device: &Device, surface_format: TextureFormat) -> bool {
+fn watch_overlay_capture_supported(
+    adapter: &Adapter,
+    device: &Device,
+    surface_format: TextureFormat,
+) -> bool {
     let limits = device.limits();
     if limits.max_color_attachments < 2 {
         log::warn!(
@@ -203,6 +218,7 @@ fn watch_overlay_capture_supported(adapter: &Adapter, device: &Device, surface_f
 /// Handles rendering pipelines, surface configuration, resources (textures, buffers), & drawing
 pub struct Renderer {
     gpu: Gpu,
+    instance_flags: wgpu::InstanceFlags,
     pipelines: Pipelines,
     quad_vertex_buffer: Buffer,
     quad_index_buffer: Buffer,
@@ -220,6 +236,7 @@ pub struct Renderer {
     depth_view: TextureView,
     depth_size: (u32, u32),
     shared_instance_buffer: Option<Buffer>,
+    instance_upload_pool: Option<instance_upload::InstanceUploadPool>,
     last_camera: [[[f32; 4]; 4]; 8],
 }
 
@@ -227,7 +244,10 @@ impl Renderer {
     /// Creates a renderer & initializes GPU state using the window's surface
     ///
     /// Sets up wgpu, pipelines, default texture & camera resources
-    pub async fn new(window: impl Into<SurfaceTarget<'static>> + WindowHandle, memory_hints: &MemoryHints) -> Self {
+    pub async fn new(
+        window: impl Into<SurfaceTarget<'static>> + WindowHandle,
+        memory_hints: &MemoryHints,
+    ) -> Self {
         Self::try_new(window, memory_hints)
             .await
             .expect("failed to initialize egor renderer")
@@ -267,6 +287,7 @@ impl Renderer {
             }
         }
         log::info!("[egor] renderer init: instance flags: {:?}", desc.flags);
+        let instance_flags = desc.flags;
         let instance = new_instance_with_webgpu_detection(desc).await;
         #[cfg(not(target_os = "android"))]
         log::info!("[egor] renderer init: creating adapter selection surface");
@@ -311,7 +332,10 @@ impl Renderer {
 
             let mut narrowed_desc = renderer_instance_descriptor();
             narrowed_desc.backends = selected_backends;
-            log::info!("[egor] renderer init: narrowed Android instance flags: {:?}", narrowed_desc.flags);
+            log::info!(
+                "[egor] renderer init: narrowed Android instance flags: {:?}",
+                narrowed_desc.flags
+            );
             let instance = new_instance_with_webgpu_detection(narrowed_desc).await;
             let adapter = instance
                 .request_adapter(&RequestAdapterOptions {
@@ -340,10 +364,13 @@ impl Renderer {
             });
         }
         #[cfg(target_arch = "wasm32")]
-        let mut required_limits = wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter_limits.clone());
+        let mut required_limits =
+            wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter_limits.clone());
         #[cfg(not(target_arch = "wasm32"))]
         let mut required_limits = adapter_limits;
-        required_limits.max_texture_dimension_2d = required_limits.max_texture_dimension_2d.max(REQUIRED_MAX_TEXTURE_DIMENSION_2D);
+        required_limits.max_texture_dimension_2d = required_limits
+            .max_texture_dimension_2d
+            .max(REQUIRED_MAX_TEXTURE_DIMENSION_2D);
         log::info!("[egor] renderer init: requesting device");
         let (device, queue) = adapter
             .request_device(&DeviceDescriptor {
@@ -365,21 +392,28 @@ impl Renderer {
 
         #[cfg(target_os = "android")]
         let (surface_format, startup_surface) = {
-            log::info!("[egor] renderer init: creating Android startup surface for format selection");
+            log::info!(
+                "[egor] renderer init: creating Android startup surface for format selection"
+            );
             let surface = instance
                 .create_surface(window)
                 .map_err(|error| RendererInitError::CreateSurface(error.to_string()))?;
             let (_surface_config, surface_format, _) =
-                target::surface_config_with_android_gl_fallback(&surface, &adapter, 1, 1).map_err(RendererInitError::SurfaceConfig)?;
+                target::surface_config_with_android_gl_fallback(&surface, &adapter, 1, 1)
+                    .map_err(RendererInitError::SurfaceConfig)?;
             (surface_format, Some(surface))
         };
         #[cfg(not(target_os = "android"))]
         let (_surface_config, surface_format, _) =
-            target::surface_config_with_android_gl_fallback(&surface, &adapter, 1, 1).map_err(RendererInitError::SurfaceConfig)?;
+            target::surface_config_with_android_gl_fallback(&surface, &adapter, 1, 1)
+                .map_err(RendererInitError::SurfaceConfig)?;
         #[cfg(not(target_os = "android"))]
         let startup_surface = Some(surface);
-        let watch_overlay_supported = watch_overlay_capture_supported(&adapter, &device, surface_format);
-        log::info!("[egor] renderer init: watch overlay capture MRT supported: {watch_overlay_supported}");
+        let watch_overlay_supported =
+            watch_overlay_capture_supported(&adapter, &device, surface_format);
+        log::info!(
+            "[egor] renderer init: watch overlay capture MRT supported: {watch_overlay_supported}"
+        );
         log::info!("[egor] renderer init: creating pipelines and core buffers");
         let pipelines = Pipelines::new(&device, surface_format, watch_overlay_supported);
 
@@ -400,7 +434,8 @@ impl Renderer {
         });
         let min_alignment = device.limits().min_uniform_buffer_offset_alignment.max(256) as u32;
         let camera_data_size = std::mem::size_of::<CameraUniform>() as u32;
-        let camera_slot_stride = ((camera_data_size + min_alignment - 1) / min_alignment) * min_alignment;
+        let camera_slot_stride =
+            ((camera_data_size + min_alignment - 1) / min_alignment) * min_alignment;
         let camera_slot_count: u32 = 8;
         let camera_buffer_size = camera_slot_stride * camera_slot_count;
 
@@ -429,7 +464,11 @@ impl Renderer {
         let (depth_texture, depth_view) = Self::create_depth_texture(&device, 1, 1);
         log::info!("[egor] renderer init: complete");
 
+        let instance_upload_pool = (cfg!(target_os = "windows")
+            && adapter.get_info().backend == wgpu::Backend::Gl)
+            .then(instance_upload::InstanceUploadPool::default);
         Ok(Renderer {
+            instance_flags,
             gpu: Gpu {
                 instance,
                 adapter,
@@ -454,13 +493,18 @@ impl Renderer {
             depth_view,
             depth_size: (1, 1),
             shared_instance_buffer: None,
+            instance_upload_pool,
             last_camera: [[[0.0; 4]; 4]; 8],
         })
     }
 
     pub const DEPTH_FORMAT: TextureFormat = TextureFormat::Depth16Unorm;
 
-    pub fn create_depth_texture(device: &Device, width: u32, height: u32) -> (wgpu::Texture, TextureView) {
+    pub fn create_depth_texture(
+        device: &Device,
+        width: u32,
+        height: u32,
+    ) -> (wgpu::Texture, TextureView) {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Depth Texture"),
             size: wgpu::Extent3d {
@@ -503,6 +547,11 @@ impl Renderer {
     pub fn adapter(&self) -> &Adapter {
         &self.gpu.adapter
     }
+    /// Flags used when creating this renderer's wgpu instance.
+    pub fn instance_flags(&self) -> wgpu::InstanceFlags {
+        self.instance_flags
+    }
+
     /// Returns information about the active GPU adapter/backend.
     pub fn adapter_info(&self) -> AdapterInfo {
         self.gpu.adapter.get_info()
@@ -527,7 +576,11 @@ impl Renderer {
     /// Consume the surface created during renderer startup and configure it as
     /// the first backbuffer. This avoids connecting the same native window to a
     /// second surface on platforms such as Android/EGL.
-    pub fn take_startup_backbuffer(&mut self, w: u32, h: u32) -> Option<Result<target::Backbuffer, target::BackbufferError>> {
+    pub fn take_startup_backbuffer(
+        &mut self,
+        w: u32,
+        h: u32,
+    ) -> Option<Result<target::Backbuffer, target::BackbufferError>> {
         let surface = self.startup_surface.take()?;
         Some(target::Backbuffer::try_from_surface(
             &self.gpu.adapter,
@@ -554,11 +607,15 @@ impl Renderer {
 
     /// Begins a frame with the given render target
     pub fn begin_frame(&mut self, target: &mut dyn RenderTarget) -> Option<Frame> {
-        self.try_begin_frame(target).expect("failed to begin egor frame")
+        self.try_begin_frame(target)
+            .expect("failed to begin egor frame")
     }
 
     /// Begins a frame with panic containment around GPU/device calls.
-    pub fn try_begin_frame(&mut self, target: &mut dyn RenderTarget) -> Result<Option<Frame>, RendererFrameError> {
+    pub fn try_begin_frame(
+        &mut self,
+        target: &mut dyn RenderTarget,
+    ) -> Result<Option<Frame>, RendererFrameError> {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let (view, presentable) = target.acquire(&self.gpu.device)?;
             let encoder = self.gpu.device.create_command_encoder(&Default::default());
@@ -582,12 +639,18 @@ impl Renderer {
     }
 
     /// Finish encoder without submitting — for timing encoder.finish() separately.
-    pub fn finish_encoder(&mut self, frame: Frame) -> (wgpu::CommandBuffer, Option<crate::frame::Presentable>) {
+    pub fn finish_encoder(
+        &mut self,
+        frame: Frame,
+    ) -> (wgpu::CommandBuffer, Option<crate::frame::Presentable>) {
         frame.finish_encoder()
     }
 
     /// Finish encoder without submitting, returning driver/backend panics as errors.
-    pub fn try_finish_encoder(&mut self, frame: Frame) -> Result<(wgpu::CommandBuffer, Option<Presentable>), RendererFrameError> {
+    pub fn try_finish_encoder(
+        &mut self,
+        frame: Frame,
+    ) -> Result<(wgpu::CommandBuffer, Option<Presentable>), RendererFrameError> {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| frame.finish_encoder()))
             .map_err(|payload| RendererFrameError::FinishEncoder(panic_payload_message(payload)))
     }
@@ -598,7 +661,10 @@ impl Renderer {
     }
 
     /// Submit a pre-finished command buffer, returning driver/backend panics as errors.
-    pub fn try_submit_commands(&self, commands: wgpu::CommandBuffer) -> Result<(), RendererFrameError> {
+    pub fn try_submit_commands(
+        &self,
+        commands: wgpu::CommandBuffer,
+    ) -> Result<(), RendererFrameError> {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.gpu.queue.submit(Some(commands));
         }))
@@ -615,19 +681,38 @@ impl Renderer {
 
     /// Begins a render pass with the given encoder and target view.
     /// Clears the view (set by [`Self::set_clear_color`]) and the depth buffer.
-    pub fn begin_render_pass<'a>(&'a self, encoder: &'a mut CommandEncoder, view: &'a TextureView) -> RenderPass<'a> {
+    pub fn begin_render_pass<'a>(
+        &'a self,
+        encoder: &'a mut CommandEncoder,
+        view: &'a TextureView,
+    ) -> RenderPass<'a> {
         self.begin_render_pass_with_depth(encoder, view, &self.depth_view, true)
     }
 
     /// Begins a one-pass render pass and discards depth after drawing.
     /// Use this when no later pass needs to load the depth buffer.
-    pub fn begin_render_pass_discard_depth<'a>(&'a self, encoder: &'a mut CommandEncoder, view: &'a TextureView) -> RenderPass<'a> {
-        self.begin_render_pass_with_depth_clear_color_and_store(encoder, view, &self.depth_view, self.clear_color, true, StoreOp::Discard)
+    pub fn begin_render_pass_discard_depth<'a>(
+        &'a self,
+        encoder: &'a mut CommandEncoder,
+        view: &'a TextureView,
+    ) -> RenderPass<'a> {
+        self.begin_render_pass_with_depth_clear_color_and_store(
+            encoder,
+            view,
+            &self.depth_view,
+            self.clear_color,
+            true,
+            StoreOp::Discard,
+        )
     }
 
     /// Begins a render pass that preserves existing content (LoadOp::Load).
     /// Used when splitting a frame into multiple passes (e.g. camera changes).
-    pub fn begin_render_pass_load<'a>(&'a self, encoder: &'a mut CommandEncoder, view: &'a TextureView) -> RenderPass<'a> {
+    pub fn begin_render_pass_load<'a>(
+        &'a self,
+        encoder: &'a mut CommandEncoder,
+        view: &'a TextureView,
+    ) -> RenderPass<'a> {
         self.begin_render_pass_load_with_depth(encoder, view, &self.depth_view)
     }
 
@@ -643,7 +728,13 @@ impl Renderer {
         depth_view: &'a TextureView,
         clear_depth: bool,
     ) -> RenderPass<'a> {
-        self.begin_render_pass_with_depth_clear_color(encoder, view, depth_view, self.clear_color, clear_depth)
+        self.begin_render_pass_with_depth_clear_color(
+            encoder,
+            view,
+            depth_view,
+            self.clear_color,
+            clear_depth,
+        )
     }
 
     /// Begins a render pass with an explicit depth view and explicit clear color.
@@ -655,7 +746,14 @@ impl Renderer {
         clear_color: wgpu::Color,
         clear_depth: bool,
     ) -> RenderPass<'a> {
-        self.begin_render_pass_with_depth_clear_color_and_store(encoder, view, depth_view, clear_color, clear_depth, StoreOp::Store)
+        self.begin_render_pass_with_depth_clear_color_and_store(
+            encoder,
+            view,
+            depth_view,
+            clear_color,
+            clear_depth,
+            StoreOp::Store,
+        )
     }
 
     fn begin_render_pass_with_depth_clear_color_and_store<'a>(
@@ -680,7 +778,11 @@ impl Renderer {
             depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
                 view: depth_view,
                 depth_ops: Some(Operations {
-                    load: if clear_depth { LoadOp::Clear(1.0) } else { LoadOp::Load },
+                    load: if clear_depth {
+                        LoadOp::Clear(1.0)
+                    } else {
+                        LoadOp::Load
+                    },
                     store: depth_store,
                 }),
                 stencil_ops: None,
@@ -753,7 +855,11 @@ impl Renderer {
             depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
                 view: depth_view,
                 depth_ops: Some(Operations {
-                    load: if clear_depth { LoadOp::Clear(1.0) } else { LoadOp::Load },
+                    load: if clear_depth {
+                        LoadOp::Clear(1.0)
+                    } else {
+                        LoadOp::Load
+                    },
                     store: StoreOp::Store,
                 }),
                 stencil_ops: None,
@@ -805,8 +911,20 @@ impl Renderer {
     /// Binds pipeline, texture, and shared quad buffers once for a render pass.
     /// Returns the previously bound (texture_id, shader_id) so the caller can
     /// track state and skip redundant calls between batches.
-    pub fn bind_pass_state(&self, r_pass: &mut RenderPass<'_>, texture_id: Option<usize>, shader_id: Option<usize>, replace_blend: bool) {
-        self.bind_pass_state_with_watch_overlay(r_pass, texture_id, shader_id, replace_blend, false);
+    pub fn bind_pass_state(
+        &self,
+        r_pass: &mut RenderPass<'_>,
+        texture_id: Option<usize>,
+        shader_id: Option<usize>,
+        replace_blend: bool,
+    ) {
+        self.bind_pass_state_with_watch_overlay(
+            r_pass,
+            texture_id,
+            shader_id,
+            replace_blend,
+            false,
+        );
     }
 
     pub fn bind_pass_state_with_watch_overlay(
@@ -1038,9 +1156,11 @@ impl Renderer {
         }
         self.last_camera[s] = view_proj;
         let offset = (slot * self.camera_slot_stride) as u64;
-        self.gpu
-            .queue
-            .write_buffer(&self.camera_buffer, offset, bytemuck::bytes_of(&CameraUniform { view_proj }));
+        self.gpu.queue.write_buffer(
+            &self.camera_buffer,
+            offset,
+            bytemuck::bytes_of(&CameraUniform { view_proj }),
+        );
     }
 
     /// Returns the byte stride between camera slots (aligned to GPU requirements)
@@ -1063,15 +1183,45 @@ impl Renderer {
     /// Accepts per-batch instance slices to avoid an intermediate Vec — writes
     /// directly into the wgpu staging buffer via `write_buffer_with`.
     pub fn upload_shared_instances_batched(&mut self, batch_slices: &[&[instance::Instance]]) {
+        self.upload_instances(batch_slices, None);
+    }
+
+    /// Encode reusable instance uploads before any render pass in this encoder.
+    /// The encoder must be submitted for the upload slots to become available again.
+    pub fn upload_shared_instances_with_encoder(
+        &mut self,
+        batch_slices: &[&[instance::Instance]],
+        encoder: &mut CommandEncoder,
+    ) {
+        self.upload_instances(batch_slices, Some(encoder));
+    }
+
+    pub fn instance_upload_metrics(&self) -> InstanceUploadMetrics {
+        self.instance_upload_pool
+            .as_ref()
+            .map(instance_upload::InstanceUploadPool::metrics)
+            .unwrap_or_default()
+    }
+
+    fn upload_instances(
+        &mut self,
+        batch_slices: &[&[instance::Instance]],
+        encoder: Option<&mut CommandEncoder>,
+    ) {
         let inst_size = std::mem::size_of::<instance::Instance>();
         let total_instances: usize = batch_slices.iter().map(|s| s.len()).sum();
         if total_instances == 0 {
             return;
         }
         let required_bytes = (total_instances * inst_size) as u64;
-        let needs_recreate = self.shared_instance_buffer.as_ref().is_none_or(|b| b.size() < required_bytes);
+        let needs_recreate = self
+            .shared_instance_buffer
+            .as_ref()
+            .is_none_or(|b| b.size() < required_bytes);
         if needs_recreate {
-            let alloc = required_bytes.next_power_of_two().max((1024 * inst_size) as u64);
+            let alloc = required_bytes
+                .next_power_of_two()
+                .max((1024 * inst_size) as u64);
             self.shared_instance_buffer = Some(self.gpu.device.create_buffer(&BufferDescriptor {
                 label: Some("Shared Instance Buffer"),
                 size: alloc,
@@ -1080,10 +1230,15 @@ impl Renderer {
             }));
         }
         let buf = self.shared_instance_buffer.as_ref().unwrap();
-        if let Some(mut view) = self
-            .gpu
-            .queue
-            .write_buffer_with(buf, 0, wgpu::BufferSize::new(required_bytes).unwrap())
+        if let (Some(pool), Some(encoder)) = (&mut self.instance_upload_pool, encoder)
+            && pool.upload(&self.gpu.device, encoder, buf, batch_slices, required_bytes)
+        {
+            return;
+        }
+        if let Some(mut view) =
+            self.gpu
+                .queue
+                .write_buffer_with(buf, 0, wgpu::BufferSize::new(required_bytes).unwrap())
         {
             let mut offset = 0usize;
             for slice in batch_slices {
@@ -1103,7 +1258,12 @@ impl Renderer {
     }
 
     /// Create an offscreen render target
-    pub fn create_offscreen_target(&self, width: u32, height: u32, format: TextureFormat) -> OffscreenTarget {
+    pub fn create_offscreen_target(
+        &self,
+        width: u32,
+        height: u32,
+        format: TextureFormat,
+    ) -> OffscreenTarget {
         OffscreenTarget::new(&self.gpu.device, width, height, format)
     }
 
@@ -1114,27 +1274,32 @@ impl Renderer {
 
     /// Adds a new texture from image bytes & returns its id
     pub fn add_texture(&mut self, data: &[u8]) -> usize {
-        self.textures.insert(&self.gpu.device, &self.gpu.queue, data)
+        self.textures
+            .insert(&self.gpu.device, &self.gpu.queue, data)
     }
 
     /// Adds a new texture from image bytes with nearest-neighbor filtering & returns its id
     pub fn add_texture_nearest(&mut self, data: &[u8]) -> usize {
-        self.textures.insert_nearest(&self.gpu.device, &self.gpu.queue, data)
+        self.textures
+            .insert_nearest(&self.gpu.device, &self.gpu.queue, data)
     }
 
     /// Adds a texture from raw RGBA bytes & returns its id
     pub fn add_texture_raw(&mut self, w: u32, h: u32, data: &[u8]) -> usize {
-        self.textures.insert_raw_nearest(&self.gpu.device, &self.gpu.queue, w, h, data)
+        self.textures
+            .insert_raw_nearest(&self.gpu.device, &self.gpu.queue, w, h, data)
     }
 
     /// Replaces an existing texture with new image data
     pub fn update_texture(&mut self, index: usize, data: &[u8]) {
-        self.textures.replace(&self.gpu.device, &self.gpu.queue, index, data);
+        self.textures
+            .replace(&self.gpu.device, &self.gpu.queue, index, data);
     }
 
     /// Replaces an existing texture with raw RGBA bytes
     pub fn update_texture_raw(&mut self, index: usize, w: u32, h: u32, data: &[u8]) {
-        self.textures.replace_raw(&self.gpu.device, &self.gpu.queue, index, w, h, data);
+        self.textures
+            .replace_raw(&self.gpu.device, &self.gpu.queue, index, w, h, data);
     }
 
     /// Creates a uniform buffer and returns its id
@@ -1162,7 +1327,12 @@ impl Renderer {
     /// Returns the pipeline index for use in draw calls
     pub fn add_shader_with_uniforms(&mut self, wgsl_source: &str, uniform_ids: &[usize]) -> usize {
         let layouts = vec![self.uniforms.layout(); uniform_ids.len()];
-        self.pipelines
-            .add_custom(&self.gpu.device, self.surface_format, wgsl_source, &layouts, uniform_ids)
+        self.pipelines.add_custom(
+            &self.gpu.device,
+            self.surface_format,
+            wgsl_source,
+            &layouts,
+            uniform_ids,
+        )
     }
 }
