@@ -876,10 +876,16 @@ impl App {
 
 impl AppHandler<Renderer> for App {
     fn new_events(&mut self, _cause: StartCause) {
+        #[cfg(feature = "profiling")]
+        let wake = crate::profiling::describe_wakeup(_cause);
+        #[cfg(feature = "profiling")]
+        profiling::scope!("event_loop_wake", &wake);
         self.run_urgent_events();
     }
 
     fn about_to_wait(&mut self) {
+        #[cfg(feature = "profiling")]
+        profiling::scope!("event_loop_about_to_wait");
         self.run_urgent_events();
     }
 

@@ -30,6 +30,23 @@ pub fn start_puffin_server(bind: &str) {
 #[cfg(not(feature = "profiling"))]
 pub fn start_puffin_server(_bind: &str) {}
 
+#[cfg(feature = "profiling")]
+pub(crate) fn describe_wakeup(cause: egor_app::StartCause) -> String {
+    use egor_app::StartCause;
+    let now = web_time::Instant::now();
+    let (kind, start, deadline) = match cause {
+        StartCause::ResumeTimeReached { start, requested_resume } => ("timer", Some(start), Some(requested_resume)),
+        StartCause::WaitCancelled { start, requested_resume } => ("event", Some(start), requested_resume),
+        StartCause::Poll => ("poll", None, None),
+        StartCause::Init => ("init", None, None),
+    };
+    let waited_us = start.map(|start| now.saturating_duration_since(start).as_micros()).unwrap_or(0);
+    let late_us = deadline
+        .map(|deadline| now.saturating_duration_since(deadline).as_micros())
+        .unwrap_or(0);
+    format!("{kind} waited_us={waited_us} late_us={late_us}")
+}
+
 #[cfg(all(feature = "profiling", target_os = "windows"))]
 pub(crate) struct FrameCpuCycles(u64);
 
