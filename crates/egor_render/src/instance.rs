@@ -1,6 +1,6 @@
 use wgpu::{BufferAddress, VertexAttribute, VertexBufferLayout, VertexFormat, VertexStepMode};
 
-/// Per-instance data for 2D instanced drawing (80 bytes)
+/// Per-instance data for 2D instanced drawing (84 bytes)
 ///
 /// Uses a compact 2D affine representation instead of a full `mat4x4`:
 /// - `affine`: column-major 2×2 rotation+scale matrix `[col0.x, col0.y, col1.x, col1.y]`
@@ -18,6 +18,7 @@ pub struct Instance {
     /// Multiplies the alpha written to the optional watch-mode overlay target.
     /// `0.0` means server-owned/background, `1.0` means dynamic/client-owned.
     pub watch_overlay: f32,
+    pub texture_layer: f32,
 }
 
 impl Instance {
@@ -29,6 +30,7 @@ impl Instance {
             uv,
             outline_color: [0.0; 4],
             watch_overlay: 1.0,
+            texture_layer: 0.0,
         }
     }
 
@@ -46,7 +48,13 @@ impl Instance {
             uv,
             outline_color,
             watch_overlay: 1.0,
+            texture_layer: 0.0,
         }
+    }
+
+    pub fn with_texture_layer(mut self, layer: u32) -> Self {
+        self.texture_layer = layer as f32;
+        self
     }
 
     pub fn with_watch_overlay(mut self, watch_overlay: f32) -> Self {
@@ -90,6 +98,11 @@ impl Instance {
                     shader_location: 7,
                     format: VertexFormat::Float32x4,
                 },
+                VertexAttribute {
+                    offset: 80,
+                    shader_location: 9,
+                    format: VertexFormat::Float32,
+                },
                 // watch overlay factor
                 VertexAttribute {
                     offset: 76,
@@ -108,6 +121,7 @@ impl Instance {
             uv: [0.0, 0.0, 1.0, 1.0],
             outline_color: [0.0; 4],
             watch_overlay: 1.0,
+            texture_layer: 0.0,
         }
     }
 }

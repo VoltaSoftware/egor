@@ -3011,6 +3011,21 @@ impl<'a> Graphics<'a> {
         uvs: [f32; 4],
         color: [f32; 4],
     ) {
+        self.push_sprite_layer(tex_id, x, y, w, h, uvs, color, 0);
+    }
+
+    #[inline(always)]
+    pub fn push_sprite_layer(
+        &mut self,
+        tex_id: usize,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        uvs: [f32; 4],
+        color: [f32; 4],
+        layer: u32,
+    ) {
         self.batch.push_instance(
             egor_render::instance::Instance::new(
                 [w, 0.0, 0.0, h],
@@ -3018,6 +3033,7 @@ impl<'a> Graphics<'a> {
                 color,
                 uvs,
             )
+            .with_texture_layer(layer)
             .with_watch_overlay(self.batch.watch_overlay()),
             Some(tex_id),
             self.current_shader,
@@ -3043,6 +3059,20 @@ impl<'a> Graphics<'a> {
     /// first whenever the texture changes.
     #[inline(always)]
     pub fn push_tile(&mut self, x: f32, y: f32, w: f32, h: f32, depth: f32, uvs: [f32; 4]) {
+        self.push_tile_layer(x, y, w, h, depth, uvs, 0);
+    }
+
+    #[inline(always)]
+    pub fn push_tile_layer(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        depth: f32,
+        uvs: [f32; 4],
+        layer: u32,
+    ) {
         self.batch.push_instance_unchecked(
             egor_render::instance::Instance::new(
                 [w, 0.0, 0.0, h],
@@ -3050,6 +3080,7 @@ impl<'a> Graphics<'a> {
                 [1.0, 1.0, 1.0, 1.0],
                 uvs,
             )
+            .with_texture_layer(layer)
             .with_watch_overlay(self.batch.watch_overlay()),
         );
     }
@@ -3067,6 +3098,20 @@ impl<'a> Graphics<'a> {
         uvs: [f32; 4],
         color: [f32; 4],
     ) {
+        self.push_sprite_unchecked_layer(x, y, w, h, uvs, color, 0);
+    }
+
+    #[inline(always)]
+    pub fn push_sprite_unchecked_layer(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        uvs: [f32; 4],
+        color: [f32; 4],
+        layer: u32,
+    ) {
         self.batch.push_instance_unchecked(
             egor_render::instance::Instance::new(
                 [w, 0.0, 0.0, h],
@@ -3074,6 +3119,7 @@ impl<'a> Graphics<'a> {
                 color,
                 uvs,
             )
+            .with_texture_layer(layer)
             .with_watch_overlay(self.batch.watch_overlay()),
         );
     }
@@ -3092,6 +3138,21 @@ impl<'a> Graphics<'a> {
         color: [f32; 4],
         outline_color: [f32; 4],
     ) {
+        self.push_outlined_sprite_unchecked_layer(x, y, w, h, uvs, color, outline_color, 0);
+    }
+
+    #[inline(always)]
+    pub fn push_outlined_sprite_unchecked_layer(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        uvs: [f32; 4],
+        color: [f32; 4],
+        outline_color: [f32; 4],
+        layer: u32,
+    ) {
         self.batch.push_instance_unchecked(
             egor_render::instance::Instance::new_outlined(
                 [w, 0.0, 0.0, h],
@@ -3100,6 +3161,7 @@ impl<'a> Graphics<'a> {
                 uvs,
                 outline_color,
             )
+            .with_texture_layer(layer)
             .with_watch_overlay(self.batch.watch_overlay()),
         );
     }
@@ -3172,6 +3234,16 @@ impl<'a> Graphics<'a> {
     }
 
     /// Create a texture from raw RGBA8 pixel data.
+    pub fn add_texture_array_raw(
+        &mut self,
+        w: u32,
+        h: u32,
+        layers: u32,
+        data: &[u8],
+    ) -> Result<usize, String> {
+        self.renderer.add_texture_array_raw(w, h, layers, data)
+    }
+
     pub fn add_texture_raw(&mut self, w: u32, h: u32, data: &[u8]) -> usize {
         self.renderer.add_texture_raw(w, h, data)
     }
