@@ -430,6 +430,7 @@ pub struct RectangleBuilder<'a> {
     color: Color,
     uvs: [f32; 4],
     tex_id: Option<usize>,
+    texture_layer: u32,
     depth: f32,
 }
 
@@ -447,6 +448,7 @@ impl<'a> RectangleBuilder<'a> {
             color: Color::WHITE,
             uvs: [0.0, 0.0, 1.0, 1.0],
             tex_id: None,
+            texture_layer: 0,
             depth,
         }
     }
@@ -490,6 +492,11 @@ impl<'a> RectangleBuilder<'a> {
     }
     /// Custom UV coordinates as (u0, v0, u1, v1).
     /// Defaults to full texture coverage [0, 0, 1, 1]
+    pub fn texture_layer(mut self, layer: u32) -> Self {
+        self.texture_layer = layer;
+        self
+    }
+
     pub fn uv(mut self, coords: [f32; 4]) -> Self {
         self.uvs = coords;
         self
@@ -514,6 +521,7 @@ impl Drop for RectangleBuilder<'_> {
 
         self.batch.push_instance(
             Instance::new(affine, [center.x, center.y, self.depth], color, self.uvs)
+                .with_texture_layer(self.texture_layer)
                 .with_watch_overlay(self.batch.watch_overlay()),
             self.tex_id,
             self.shader_id,

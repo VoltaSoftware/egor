@@ -940,7 +940,7 @@ impl Renderer {
 
         let (pipeline, uniform_ids) = self
             .pipelines
-            .resolve_with_replace(shader_id, replace_blend, watch_overlay)
+            .resolve_with_replace(shader_id, replace_blend, watch_overlay, texture.is_array())
             .expect("watch overlay pipeline support should be checked before drawing");
         r_pass.set_pipeline(pipeline);
 
@@ -1014,16 +1014,21 @@ impl Renderer {
 
         batch.upload(&self.gpu.device, &self.gpu.queue);
 
+        let texture = self.textures.get(texture_id);
+        let texture_kind_changed =
+            self.textures.get(*current_texture).is_array() != texture.is_array();
         if *current_texture != texture_id {
-            let texture = self.textures.get(texture_id);
             texture.bind(r_pass, 0);
             *current_texture = texture_id;
         }
 
-        if *current_shader != shader_id || *current_replace_blend != replace_blend {
+        if texture_kind_changed
+            || *current_shader != shader_id
+            || *current_replace_blend != replace_blend
+        {
             let (pipeline, uniform_ids) = self
                 .pipelines
-                .resolve_with_replace(shader_id, replace_blend, watch_overlay)
+                .resolve_with_replace(shader_id, replace_blend, watch_overlay, texture.is_array())
                 .expect("watch mask pipeline support should be checked before drawing");
             r_pass.set_pipeline(pipeline);
             for (i, &uid) in uniform_ids.iter().enumerate() {
@@ -1109,16 +1114,21 @@ impl Renderer {
 
         batch.upload_geometry_only(&self.gpu.device, &self.gpu.queue);
 
+        let texture = self.textures.get(texture_id);
+        let texture_kind_changed =
+            self.textures.get(*current_texture).is_array() != texture.is_array();
         if *current_texture != texture_id {
-            let texture = self.textures.get(texture_id);
             texture.bind(r_pass, 0);
             *current_texture = texture_id;
         }
 
-        if *current_shader != shader_id || *current_replace_blend != replace_blend {
+        if texture_kind_changed
+            || *current_shader != shader_id
+            || *current_replace_blend != replace_blend
+        {
             let (pipeline, uniform_ids) = self
                 .pipelines
-                .resolve_with_replace(shader_id, replace_blend, watch_overlay)
+                .resolve_with_replace(shader_id, replace_blend, watch_overlay, texture.is_array())
                 .expect("watch mask pipeline support should be checked before drawing");
             r_pass.set_pipeline(pipeline);
             for (i, &uid) in uniform_ids.iter().enumerate() {
@@ -1290,6 +1300,18 @@ impl Renderer {
             .insert_raw_nearest(&self.gpu.device, &self.gpu.queue, w, h, data)
     }
 
+    /// Upload all layers in one texture array before issuing draws using its id.
+    pub fn add_texture_array_raw(
+        &mut self,
+        w: u32,
+        h: u32,
+        layers: u32,
+        data: &[u8],
+    ) -> Result<usize, String> {
+        self.textures
+            .insert_array_raw(&self.gpu.device, &self.gpu.queue, w, h, layers, data)
+    }
+
     /// Replaces an existing texture with new image data
     pub fn update_texture(&mut self, index: usize, data: &[u8]) {
         self.textures
@@ -1335,4 +1357,15 @@ impl Renderer {
             uniform_ids,
         )
     }
+}
+
+/// Expands the optional texture-sampling marker for a 2D or array pipeline.
+/// Both variants perform one texture lookup; selection happens per draw batch.
+pub fn prepare_texture_shader(source: &str, array: bool) -> String {
+    let sampling = if array {
+        "@group(0) @binding(2) var egor_texture: texture_2d_array<f32>;\n@group(0) @binding(1) var egor_sampler: sampler;\nfn egor_sample_texture(uv: vec2<f32>, layer: i32) -> vec4<f32> { return textureSampleLevel(egor_texture, egor_sampler, uv, layer, 0.0); }\nfn egor_texture_dimensions() -> vec2<u32> { return textureDimensions(egor_texture, 0); }"
+    } else {
+        "@group(0) @binding(0) var egor_texture: texture_2d<f32>;\n@group(0) @binding(1) var egor_sampler: sampler;\nfn egor_sample_texture(uv: vec2<f32>, layer: i32) -> vec4<f32> { return textureSampleLevel(egor_texture, egor_sampler, uv, 0.0); }\nfn egor_texture_dimensions() -> vec2<u32> { return textureDimensions(egor_texture, 0); }"
+    };
+    source.replace("// EGOR_TEXTURE_SAMPLING", sampling)
 }

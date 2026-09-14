@@ -1,7 +1,4 @@
-@group(0) @binding(0)
-var texture_binding: texture_2d<f32>;
-@group(0) @binding(1)
-var texture_sampler: sampler;
+// EGOR_TEXTURE_SAMPLING
 
 struct CameraUniform {
     view_proj: mat4x4<f32>,
@@ -22,6 +19,7 @@ struct InstanceInput {
     @location(6) uv: vec4<f32>,
     @location(7) outline_color: vec4<f32>,
     @location(8) watch_overlay: f32,
+    @location(9) texture_layer: f32,
 };
 
 struct VertexOutput {
@@ -31,6 +29,7 @@ struct VertexOutput {
     @location(2) @interpolate(flat) uv_rect: vec4<f32>,
     @location(3) @interpolate(flat) outline_color: vec4<f32>,
     @location(4) @interpolate(flat) watch_overlay: f32,
+    @location(5) @interpolate(flat) texture_layer: i32,
 };
 
 struct WatchFragmentOutput {
@@ -54,6 +53,7 @@ fn vs_main(vert: VertexInput, inst: InstanceInput) -> VertexOutput {
     out.uv_rect = inst.uv;
     out.outline_color = inst.outline_color;
     out.watch_overlay = inst.watch_overlay;
+    out.texture_layer = i32(inst.texture_layer);
     return out;
 }
 
@@ -64,12 +64,12 @@ fn inside(pos: vec2<f32>, lo: vec2<f32>, hi: vec2<f32>) -> f32 {
 
 fn fs_main_linear(input: VertexOutput) -> vec4<f32> {
     if input.outline_color.a > 0.0 {
-        let dims = vec2<f32>(textureDimensions(texture_binding, 0));
+        let dims = vec2<f32>(egor_texture_dimensions());
         let texel = 1.0 / dims;
         let glyph_min = input.uv_rect.xy + texel;
         let glyph_max = input.uv_rect.zw - texel;
         let uv = input.tex_coords;
-        let center = textureSampleLevel(texture_binding, texture_sampler, uv, 0.0);
+        let center = egor_sample_texture(uv, input.texture_layer);
         let c_in = inside(uv, glyph_min, glyph_max);
         if c_in > 0.5 && center.a > 0.004 {
             return center * input.color;
@@ -77,21 +77,21 @@ fn fs_main_linear(input: VertexOutput) -> vec4<f32> {
 
         var nb: f32 = 0.0;
         let n0 = uv + vec2<f32>(-texel.x, -texel.y);
-        nb = max(nb, textureSampleLevel(texture_binding, texture_sampler, n0, 0.0).a * inside(n0, glyph_min, glyph_max));
+        nb = max(nb, egor_sample_texture(n0, input.texture_layer).a * inside(n0, glyph_min, glyph_max));
         let n1 = uv + vec2<f32>( 0.0,     -texel.y);
-        nb = max(nb, textureSampleLevel(texture_binding, texture_sampler, n1, 0.0).a * inside(n1, glyph_min, glyph_max));
+        nb = max(nb, egor_sample_texture(n1, input.texture_layer).a * inside(n1, glyph_min, glyph_max));
         let n2 = uv + vec2<f32>( texel.x, -texel.y);
-        nb = max(nb, textureSampleLevel(texture_binding, texture_sampler, n2, 0.0).a * inside(n2, glyph_min, glyph_max));
+        nb = max(nb, egor_sample_texture(n2, input.texture_layer).a * inside(n2, glyph_min, glyph_max));
         let n3 = uv + vec2<f32>(-texel.x,  0.0);
-        nb = max(nb, textureSampleLevel(texture_binding, texture_sampler, n3, 0.0).a * inside(n3, glyph_min, glyph_max));
+        nb = max(nb, egor_sample_texture(n3, input.texture_layer).a * inside(n3, glyph_min, glyph_max));
         let n4 = uv + vec2<f32>( texel.x,  0.0);
-        nb = max(nb, textureSampleLevel(texture_binding, texture_sampler, n4, 0.0).a * inside(n4, glyph_min, glyph_max));
+        nb = max(nb, egor_sample_texture(n4, input.texture_layer).a * inside(n4, glyph_min, glyph_max));
         let n5 = uv + vec2<f32>(-texel.x,  texel.y);
-        nb = max(nb, textureSampleLevel(texture_binding, texture_sampler, n5, 0.0).a * inside(n5, glyph_min, glyph_max));
+        nb = max(nb, egor_sample_texture(n5, input.texture_layer).a * inside(n5, glyph_min, glyph_max));
         let n6 = uv + vec2<f32>( 0.0,      texel.y);
-        nb = max(nb, textureSampleLevel(texture_binding, texture_sampler, n6, 0.0).a * inside(n6, glyph_min, glyph_max));
+        nb = max(nb, egor_sample_texture(n6, input.texture_layer).a * inside(n6, glyph_min, glyph_max));
         let n7 = uv + vec2<f32>( texel.x,  texel.y);
-        nb = max(nb, textureSampleLevel(texture_binding, texture_sampler, n7, 0.0).a * inside(n7, glyph_min, glyph_max));
+        nb = max(nb, egor_sample_texture(n7, input.texture_layer).a * inside(n7, glyph_min, glyph_max));
 
         let outline_alpha = input.outline_color.a * nb;
         if outline_alpha > 0.004 {
@@ -101,7 +101,7 @@ fn fs_main_linear(input: VertexOutput) -> vec4<f32> {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
 
-    let color = textureSampleLevel(texture_binding, texture_sampler, input.tex_coords, 0.0) * input.color;
+    let color = egor_sample_texture(input.tex_coords, input.texture_layer) * input.color;
     if color.a < 0.004 {
         discard;
     }

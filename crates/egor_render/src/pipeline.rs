@@ -5,7 +5,7 @@ use wgpu::{
     BufferBindingType, ColorTargetState, ColorWrites, CompareFunction, DepthStencilState, Device,
     FragmentState, PipelineLayoutDescriptor, RenderPipeline, RenderPipelineDescriptor,
     SamplerBindingType, ShaderModuleDescriptor, ShaderSource, ShaderStages, StencilState,
-    TextureFormat, TextureSampleType, TextureViewDimension, VertexState, include_wgsl,
+    TextureFormat, TextureSampleType, TextureViewDimension, VertexState,
 };
 
 use crate::{instance::Instance, vertex::Vertex};
@@ -294,8 +294,8 @@ fn fs_main("#,
 }
 
 struct CompiledCustomPipeline {
-    pipeline: RenderPipeline,
-    watch_pipeline: Option<RenderPipeline>,
+    pipeline: [RenderPipeline; 2],
+    watch_pipeline: [Option<RenderPipeline>; 2],
 }
 
 /// One logical custom material. Its compiled pipeline may be shared with other
@@ -320,10 +320,10 @@ struct CustomPipelineKey {
 /// - Texture bind group layout (for sampling textures in shaders)
 /// - Camera bind group layout (for view/projection transforms)
 pub(crate) struct Pipelines {
-    primitive: RenderPipeline,
-    primitive_replace: RenderPipeline,
-    primitive_watch: Option<RenderPipeline>,
-    primitive_replace_watch: Option<RenderPipeline>,
+    primitive: [RenderPipeline; 2],
+    primitive_replace: [RenderPipeline; 2],
+    primitive_watch: [Option<RenderPipeline>; 2],
+    primitive_replace_watch: [Option<RenderPipeline>; 2],
     custom: Vec<CustomPipelineBinding>,
     compiled_custom: Vec<CompiledCustomPipeline>,
     custom_cache: HashMap<CustomPipelineKey, usize>,
@@ -342,27 +342,7 @@ impl Pipelines {
         let texture_layout = create_texture_bind_group_layout(device);
         let camera_layout = create_camera_bind_group_layout(device);
 
-        let primitive = create_primitive_pipeline(
-            device,
-            surface_format,
-            &texture_layout,
-            &camera_layout,
-            Some(BlendState::ALPHA_BLENDING),
-            true,
-            false,
-            false,
-        );
-        let primitive_replace = create_primitive_pipeline(
-            device,
-            surface_format,
-            &texture_layout,
-            &camera_layout,
-            None,
-            false,
-            true,
-            false,
-        );
-        let primitive_watch = watch_overlay_supported.then(|| {
+        let primitive = std::array::from_fn(|kind| {
             create_primitive_pipeline(
                 device,
                 surface_format,
@@ -371,10 +351,11 @@ impl Pipelines {
                 Some(BlendState::ALPHA_BLENDING),
                 true,
                 false,
-                true,
+                false,
+                kind == 1,
             )
         });
-        let primitive_replace_watch = watch_overlay_supported.then(|| {
+        let primitive_replace = std::array::from_fn(|kind| {
             create_primitive_pipeline(
                 device,
                 surface_format,
@@ -383,8 +364,39 @@ impl Pipelines {
                 None,
                 false,
                 true,
-                true,
+                false,
+                kind == 1,
             )
+        });
+        let primitive_watch = std::array::from_fn(|kind| {
+            watch_overlay_supported.then(|| {
+                create_primitive_pipeline(
+                    device,
+                    surface_format,
+                    &texture_layout,
+                    &camera_layout,
+                    Some(BlendState::ALPHA_BLENDING),
+                    true,
+                    false,
+                    true,
+                    kind == 1,
+                )
+            })
+        });
+        let primitive_replace_watch = std::array::from_fn(|kind| {
+            watch_overlay_supported.then(|| {
+                create_primitive_pipeline(
+                    device,
+                    surface_format,
+                    &texture_layout,
+                    &camera_layout,
+                    None,
+                    false,
+                    true,
+                    true,
+                    kind == 1,
+                )
+            })
         });
 
         Self {
@@ -427,26 +439,38 @@ impl Pipelines {
         let compiled_pipeline_id = if let Some(&id) = self.custom_cache.get(&cache_key) {
             id
         } else {
-            let pipeline = create_custom_pipeline(
-                device,
-                surface_format,
-                &self.texture_layout,
-                &self.camera_layout,
-                uniform_layouts,
-                wgsl_source,
-            );
-            let watch_pipeline = if self.watch_overlay_supported {
-                create_custom_watch_pipeline(
+            let build = |array| {
+                let source = crate::prepare_texture_shader(wgsl_source, array);
+                let pipeline = create_custom_pipeline(
                     device,
                     surface_format,
                     &self.texture_layout,
                     &self.camera_layout,
                     uniform_layouts,
-                    wgsl_source,
-                )
-            } else {
-                None
+                    &source,
+                );
+                let watch = if self.watch_overlay_supported {
+                    create_custom_watch_pipeline(
+                        device,
+                        surface_format,
+                        &self.texture_layout,
+                        &self.camera_layout,
+                        uniform_layouts,
+                        &source,
+                    )
+                } else {
+                    None
+                };
+                (pipeline, watch)
             };
+            let (normal, normal_watch) = build(false);
+            let (array, array_watch) = if wgsl_source.contains("// EGOR_TEXTURE_SAMPLING") {
+                build(true)
+            } else {
+                (normal.clone(), normal_watch.clone())
+            };
+            let pipeline = [normal, array];
+            let watch_pipeline = [normal_watch, array_watch];
 
             let id = self.compiled_custom.len();
             self.compiled_custom.push(CompiledCustomPipeline {
@@ -469,13 +493,15 @@ impl Pipelines {
         shader_id: Option<usize>,
         replace_blend: bool,
         watch_overlay: bool,
+        texture_array: bool,
     ) -> Option<(&RenderPipeline, &[usize])> {
+        let kind = usize::from(texture_array);
         if replace_blend && shader_id.is_none() {
             return Some((
                 if watch_overlay {
-                    self.primitive_replace_watch.as_ref()?
+                    self.primitive_replace_watch[kind].as_ref()?
                 } else {
-                    &self.primitive_replace
+                    &self.primitive_replace[kind]
                 },
                 &[],
             ));
@@ -483,17 +509,16 @@ impl Pipelines {
         if let Some(custom) = shader_id.and_then(|id| self.custom.get(id)) {
             let compiled = self.compiled_custom.get(custom.compiled_pipeline_id)?;
             if watch_overlay {
-                compiled
-                    .watch_pipeline
+                compiled.watch_pipeline[kind]
                     .as_ref()
                     .map(|pipeline| (pipeline, custom.uniform_ids.as_slice()))
             } else {
-                Some((&compiled.pipeline, &custom.uniform_ids))
+                Some((&compiled.pipeline[kind], &custom.uniform_ids))
             }
         } else if watch_overlay {
-            Some((self.primitive_watch.as_ref()?, &[]))
+            Some((self.primitive_watch[kind].as_ref()?, &[]))
         } else {
-            Some((&self.primitive, &[]))
+            Some((&self.primitive[kind], &[]))
         }
     }
 
@@ -504,18 +529,22 @@ impl Pipelines {
                     .custom
                     .get(id)
                     .and_then(|custom| self.compiled_custom.get(custom.compiled_pipeline_id))
-                    .is_some_and(|compiled| compiled.watch_pipeline.is_some()),
-                None => self.primitive_watch.is_some() && self.primitive_replace_watch.is_some(),
+                    .is_some_and(|compiled| compiled.watch_pipeline.iter().all(Option::is_some)),
+                None => {
+                    self.primitive_watch.iter().all(Option::is_some)
+                        && self.primitive_replace_watch.iter().all(Option::is_some)
+                }
             }
     }
 }
 
 /// Creates the bind group layout for texture sampling
 ///
-/// Defines two bindings:
+/// Defines the two texture views and their shared sampler:
 /// - Binding 0: 2D texture (fragment shader)
 /// - Binding 1: Sampler (fragment shader)
-fn create_texture_bind_group_layout(device: &Device) -> BindGroupLayout {
+/// - Binding 2: 2D array texture (fragment shader)
+pub(crate) fn create_texture_bind_group_layout(device: &Device) -> BindGroupLayout {
     device.create_bind_group_layout(&BindGroupLayoutDescriptor {
         label: Some("Texture Bind Group Layout"),
         entries: &[
@@ -533,6 +562,16 @@ fn create_texture_bind_group_layout(device: &Device) -> BindGroupLayout {
                 binding: 1,
                 visibility: ShaderStages::FRAGMENT,
                 ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 2,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
                 count: None,
             },
         ],
@@ -579,8 +618,13 @@ fn create_primitive_pipeline(
     depth_enabled: bool,
     replace: bool,
     watch_overlay: bool,
+    texture_array: bool,
 ) -> RenderPipeline {
-    let shader = device.create_shader_module(include_wgsl!("../shader.wgsl"));
+    let source = crate::prepare_texture_shader(include_str!("../shader.wgsl"), texture_array);
+    let shader = device.create_shader_module(ShaderModuleDescriptor {
+        label: None,
+        source: ShaderSource::Wgsl(source.into()),
+    });
     let fragment_entry_point = match (
         replace,
         surface_needs_srgb_encode(surface_format),
@@ -878,20 +922,20 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         assert_eq!(pipelines.custom.len(), 2);
 
         let (first_pipeline, first_uniforms) = pipelines
-            .resolve_with_replace(Some(first), false, false)
+            .resolve_with_replace(Some(first), false, false, false)
             .expect("first custom pipeline should resolve");
         let (second_pipeline, second_uniforms) = pipelines
-            .resolve_with_replace(Some(second), false, false)
+            .resolve_with_replace(Some(second), false, false, false)
             .expect("second custom pipeline should resolve");
         assert_eq!(first_pipeline, second_pipeline);
         assert_eq!(first_uniforms, &[4]);
         assert_eq!(second_uniforms, &[9]);
 
         let (first_watch_pipeline, _) = pipelines
-            .resolve_with_replace(Some(first), false, true)
+            .resolve_with_replace(Some(first), false, true, false)
             .expect("first custom watch pipeline should resolve");
         let (second_watch_pipeline, _) = pipelines
-            .resolve_with_replace(Some(second), false, true)
+            .resolve_with_replace(Some(second), false, true, false)
             .expect("second custom watch pipeline should resolve");
         assert_eq!(first_watch_pipeline, second_watch_pipeline);
     }

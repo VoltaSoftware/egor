@@ -75,7 +75,7 @@ pub mod render {
         text::Align,
     };
     pub use egor_render::{
-        MemoryHints, RendererBackendPreference,
+        MemoryHints, RendererBackendPreference, prepare_texture_shader,
         target::{OffscreenTarget, RenderTarget},
         vertex::Vertex,
     };
