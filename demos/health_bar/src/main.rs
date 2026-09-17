@@ -61,8 +61,6 @@ fn main() {
                 .size(20.0)
                 .color(Color::WHITE);
 
-            gfx.text(&format!("FPS: {}", timer.fps))
-                .at(vec2(10.0, 10.0))
-                .color(Color::WHITE);
+            gfx.text(&format!("FPS: {}", timer.fps)).at(vec2(10.0, 10.0)).color(Color::WHITE);
         });
 }

@@ -1,7 +1,6 @@
 use wgpu::{
-    Adapter, CommandEncoder, CompositeAlphaMode, CurrentSurfaceTexture, Device, DownlevelFlags,
-    Extent3d, Instance, PresentMode, Surface, SurfaceConfiguration, SurfaceTarget, Texture,
-    TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView,
+    Adapter, CommandEncoder, CompositeAlphaMode, CurrentSurfaceTexture, Device, DownlevelFlags, Extent3d, Instance, PresentMode, Surface,
+    SurfaceConfiguration, SurfaceTarget, Texture, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView,
     TextureViewDescriptor, WindowHandle,
 };
 
@@ -44,10 +43,7 @@ impl std::fmt::Display for BackbufferError {
             }
             Self::CreateSurface(error) => write!(f, "failed to create surface: {error}"),
             Self::UnsupportedSurface { width, height } => {
-                write!(
-                    f,
-                    "surface has no compatible default config for {width}x{height}"
-                )
+                write!(f, "surface has no compatible default config for {width}x{height}")
             }
             Self::Configure(error) => write!(f, "failed to configure surface: {error}"),
         }
@@ -89,15 +85,9 @@ fn android_gl_fallback_surface_format() -> TextureFormat {
     TextureFormat::Rgba8Unorm
 }
 
-fn android_gl_fallback_surface_config(
-    w: u32,
-    h: u32,
-) -> Result<(SurfaceConfiguration, TextureFormat, bool), BackbufferError> {
+fn android_gl_fallback_surface_config(w: u32, h: u32) -> Result<(SurfaceConfiguration, TextureFormat, bool), BackbufferError> {
     if w == 0 || h == 0 {
-        return Err(BackbufferError::ZeroSize {
-            width: w,
-            height: h,
-        });
+        return Err(BackbufferError::ZeroSize { width: w, height: h });
     }
 
     let format = android_gl_fallback_surface_format();
@@ -132,20 +122,13 @@ pub(crate) fn surface_config(
     h: u32,
 ) -> Result<(SurfaceConfiguration, TextureFormat, bool), BackbufferError> {
     if w == 0 || h == 0 {
-        return Err(BackbufferError::ZeroSize {
-            width: w,
-            height: h,
-        });
+        return Err(BackbufferError::ZeroSize { width: w, height: h });
     }
 
     let caps = surface.get_capabilities(adapter);
-    let mut config =
-        surface
-            .get_default_config(adapter, w, h)
-            .ok_or(BackbufferError::UnsupportedSurface {
-                width: w,
-                height: h,
-            })?;
+    let mut config = surface
+        .get_default_config(adapter, w, h)
+        .ok_or(BackbufferError::UnsupportedSurface { width: w, height: h })?;
     config.present_mode = vsync_present_mode();
     config.desired_maximum_frame_latency = DESIRED_MAXIMUM_FRAME_LATENCY;
     if cfg!(debug_assertions) {
@@ -234,8 +217,7 @@ impl Backbuffer {
         w: u32,
         h: u32,
     ) -> Self {
-        Self::try_new(instance, adapter, device, window, w, h)
-            .expect("failed to create egor backbuffer")
+        Self::try_new(instance, adapter, device, window, w, h).expect("failed to create egor backbuffer")
     }
 
     pub fn try_new(
@@ -261,8 +243,7 @@ impl Backbuffer {
         h: u32,
     ) -> Result<Self, BackbufferError> {
         log::info!("[egor] backbuffer init: building surface config");
-        let (config, view_format, surface_copy_src) =
-            surface_config_with_android_gl_fallback(&surface, adapter, w, h)?;
+        let (config, view_format, surface_copy_src) = surface_config_with_android_gl_fallback(&surface, adapter, w, h)?;
         if cfg!(debug_assertions) {
             log::info!(
                 "[egor] backbuffer init: configuring surface format={:?} view_format={:?} present_mode={:?} frame_latency={} usage={:?} copy_src={}",
@@ -293,11 +274,7 @@ impl Backbuffer {
         self.last_acquire_failure
     }
 
-    fn configure_surface(
-        surface: &Surface<'_>,
-        device: &Device,
-        config: &SurfaceConfiguration,
-    ) -> Result<(), BackbufferError> {
+    fn configure_surface(surface: &Surface<'_>, device: &Device, config: &SurfaceConfiguration) -> Result<(), BackbufferError> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let _ = device.poll(PollType::wait_indefinitely());
@@ -328,9 +305,7 @@ impl Backbuffer {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn get_current_texture(&self) -> CurrentSurfaceTexture {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.surface.get_current_texture()
-        })) {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.surface.get_current_texture())) {
             Ok(texture) => texture,
             Err(payload) => {
                 let panic_message = panic_payload_message(payload);
@@ -383,8 +358,7 @@ impl RenderTarget for Backbuffer {
         }
 
         match self.get_current_texture() {
-            CurrentSurfaceTexture::Success(surface_texture)
-            | CurrentSurfaceTexture::Suboptimal(surface_texture) => {
+            CurrentSurfaceTexture::Success(surface_texture) | CurrentSurfaceTexture::Suboptimal(surface_texture) => {
                 self.record_acquire_success();
                 let view = surface_texture.texture.create_view(&TextureViewDescriptor {
                     format: Some(self.view_format),
@@ -436,11 +410,7 @@ impl RenderTarget for Backbuffer {
     }
 
     fn set_vsync(&mut self, device: &Device, on: bool) {
-        let present_mode = if on {
-            vsync_present_mode()
-        } else {
-            PresentMode::AutoNoVsync
-        };
+        let present_mode = if on { vsync_present_mode() } else { PresentMode::AutoNoVsync };
         if self.config.present_mode == present_mode {
             return;
         }
@@ -518,8 +488,7 @@ impl OffscreenTarget {
             view_formats: &[],
         });
 
-        let (depth_texture, depth_view) =
-            crate::Renderer::create_depth_texture(device, width, height);
+        let (depth_texture, depth_view) = crate::Renderer::create_depth_texture(device, width, height);
 
         let render_view = render_texture.create_view(&Default::default());
         let sample_view = sample_texture.create_view(&Default::default());
