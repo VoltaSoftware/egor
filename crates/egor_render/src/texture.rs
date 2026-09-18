@@ -1,8 +1,7 @@
 use wgpu::{
-    BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindingResource, Device,
-    Extent3d, FilterMode, Origin3d, Queue, RenderPass, Sampler, SamplerDescriptor,
-    TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect, TextureDescriptor,
-    TextureDimension, TextureFormat, TextureUsages, TextureView, TextureViewDimension,
+    BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindingResource, Device, Extent3d, FilterMode, Origin3d, Queue,
+    RenderPass, Sampler, SamplerDescriptor, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect, TextureDescriptor,
+    TextureDimension, TextureFormat, TextureUsages, TextureView, TextureViewDescriptor, TextureViewDimension,
 };
 
 use crate::target::OffscreenTarget;
@@ -27,13 +26,7 @@ pub(crate) struct Texture {
 }
 
 impl Texture {
-    fn create_bind_group(
-        device: &Device,
-        layout: &BindGroupLayout,
-        view: &TextureView,
-        array_view: &TextureView,
-        sampler: &Sampler,
-    ) -> BindGroup {
+    fn create_bind_group(device: &Device, layout: &BindGroupLayout, view: &TextureView, sampler: &Sampler) -> BindGroup {
         device.create_bind_group(&BindGroupDescriptor {
             label: None,
             layout,
@@ -45,10 +38,6 @@ impl Texture {
                 BindGroupEntry {
                     binding: 1,
                     resource: BindingResource::Sampler(sampler),
-                },
-                BindGroupEntry {
-                    binding: 2,
-                    resource: BindingResource::TextureView(array_view),
                 },
             ],
         })
@@ -86,16 +75,7 @@ impl Texture {
         {
             let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
             let texture_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                Self::from_trusted_bytes(
-                    device,
-                    queue,
-                    layout,
-                    sampler,
-                    data,
-                    width,
-                    height,
-                    Some("Egor Texture"),
-                )
+                Self::from_trusted_bytes(device, queue, layout, sampler, data, width, height, Some("Egor Texture"))
             }));
 
             let texture = match texture_result {
@@ -138,34 +118,18 @@ impl Texture {
 
         #[cfg(target_arch = "wasm32")]
         {
-            Self::from_trusted_bytes(
-                device,
-                queue,
-                layout,
-                sampler,
-                data,
-                width,
-                height,
-                Some("Egor Texture"),
-            )
+            Self::from_trusted_bytes(device, queue, layout, sampler, data, width, height, Some("Egor Texture"))
         }
     }
 
-    fn validate_upload(
-        device: &Device,
-        data: &[u8],
-        width: u32,
-        height: u32,
-    ) -> Result<(), String> {
+    fn validate_upload(device: &Device, data: &[u8], width: u32, height: u32) -> Result<(), String> {
         if width == 0 || height == 0 {
             return Err(format!("zero-sized texture {width}x{height}"));
         }
 
         let max_dimension = device.limits().max_texture_dimension_2d;
         if width > max_dimension || height > max_dimension {
-            return Err(format!(
-                "texture {width}x{height} exceeds max dimension {max_dimension}"
-            ));
+            return Err(format!("texture {width}x{height} exceeds max dimension {max_dimension}"));
         }
 
         let expected_len = (width as usize)
@@ -193,9 +157,7 @@ impl Texture {
         height: u32,
         label: Option<&str>,
     ) -> Self {
-        Self::from_array_bytes(
-            device, queue, layout, sampler, data, width, height, 1, label,
-        )
+        Self::from_array_bytes(device, queue, layout, sampler, data, width, height, 1, label)
     }
 
     fn from_array_bytes(
@@ -214,7 +176,7 @@ impl Texture {
             size: Extent3d {
                 width,
                 height,
-                depth_or_array_layers: layers,
+                depth_or_array_layers: Self::storage_layer_count(device, width, height, layers),
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -243,22 +205,33 @@ impl Texture {
                 depth_or_array_layers: layers,
             },
         );
-        // Only the view matching the selected shader variant is sampled. GLES
-        // cannot reinterpret ordinary 2D storage as array storage.
-        let view = texture.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(TextureViewDimension::D2),
-            array_layer_count: Some(1),
-            ..Default::default()
-        });
-        let array_view = texture.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(TextureViewDimension::D2Array),
+        // GLES cannot reinterpret ordinary 2D storage as array storage. Create
+        // only the view that matches the texture's actual storage target; the
+        // pipeline variant uses the corresponding bind-group layout.
+        let view_dimension = if layers > 1 {
+            TextureViewDimension::D2Array
+        } else {
+            TextureViewDimension::D2
+        };
+        let view = texture.create_view(&TextureViewDescriptor {
+            dimension: Some(view_dimension),
+            array_layer_count: Some(layers),
             ..Default::default()
         });
 
         Self {
-            bind_group: Self::create_bind_group(device, layout, &view, &array_view, sampler),
+            bind_group: Self::create_bind_group(device, layout, &view, sampler),
             is_array: layers > 1,
         }
+    }
+
+    fn storage_layer_count(device: &Device, width: u32, height: u32, layers: u32) -> u32 {
+        // wgpu's GLES backend infers cube storage for square textures with a
+        // multiple of six layers. Reserve an unused layer to keep array storage
+        // on desktop GL, Android GLES and WebGL2. Uploads and views expose only
+        // the requested layers; other backends keep the original allocation.
+        let needs_padding = layers > 1 && layers.is_multiple_of(6) && width == height && device.adapter_info().backend == wgpu::Backend::Gl;
+        layers + u32::from(needs_padding)
     }
 
     /// Creates a bindable texture from an existing GPU texture view.
@@ -266,19 +239,10 @@ impl Texture {
     /// This does not allocate or upload image data.
     /// It wraps a view produced elsewhere (an offscreen render target)
     /// and builds the bind group required for sampling in shaders
-    fn from_view(
-        texture: &wgpu::Texture,
-        device: &Device,
-        layout: &BindGroupLayout,
-        sampler: &Sampler,
-    ) -> Self {
+    fn from_view(texture: &wgpu::Texture, device: &Device, layout: &BindGroupLayout, sampler: &Sampler) -> Self {
         let view = texture.create_view(&Default::default());
-        let array_view = texture.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(TextureViewDimension::D2Array),
-            ..Default::default()
-        });
         Self {
-            bind_group: Self::create_bind_group(device, layout, &view, &array_view, sampler),
+            bind_group: Self::create_bind_group(device, layout, &view, sampler),
             is_array: false,
         }
     }
@@ -286,21 +250,8 @@ impl Texture {
     /// Creates a 1×1 white fallback texture
     ///
     /// Used when no valid texture is provided for a draw call
-    fn create_default(
-        device: &Device,
-        queue: &Queue,
-        layout: &BindGroupLayout,
-        sampler: &Sampler,
-    ) -> Self {
-        Self::from_bytes(
-            device,
-            queue,
-            layout,
-            sampler,
-            &[255u8, 255, 255, 255],
-            1,
-            1,
-        )
+    fn create_default(device: &Device, queue: &Queue, layout: &BindGroupLayout, sampler: &Sampler) -> Self {
+        Self::from_bytes(device, queue, layout, sampler, &[255u8, 255, 255, 255], 1, 1)
     }
 
     /// Binds this texture at the given index in the render pass
@@ -316,7 +267,7 @@ impl Texture {
 }
 
 pub(crate) struct Textures {
-    layout: BindGroupLayout,
+    layouts: [BindGroupLayout; 2],
     default_sampler: Sampler,
     nearest_sampler: Sampler,
     default_texture: Texture,
@@ -325,7 +276,7 @@ pub(crate) struct Textures {
 
 impl Textures {
     pub fn new(device: &Device, queue: &Queue) -> Self {
-        let layout = crate::pipeline::create_texture_bind_group_layout(device);
+        let layouts = std::array::from_fn(|kind| crate::pipeline::create_texture_bind_group_layout(device, kind == 1));
 
         let default_sampler = device.create_sampler(&SamplerDescriptor {
             mag_filter: FilterMode::Linear,
@@ -339,10 +290,10 @@ impl Textures {
             ..Default::default()
         });
 
-        let default_texture = Texture::create_default(device, queue, &layout, &default_sampler);
+        let default_texture = Texture::create_default(device, queue, &layouts[0], &default_sampler);
 
         Self {
-            layout,
+            layouts,
             default_sampler,
             nearest_sampler,
             default_texture,
@@ -357,8 +308,7 @@ impl Textures {
     }
 
     pub fn get(&self, id: Option<usize>) -> &Texture {
-        id.and_then(|i| self.store.get(i))
-            .unwrap_or(&self.default_texture)
+        id.and_then(|i| self.store.get(i)).unwrap_or(&self.default_texture)
     }
 
     pub fn insert(&mut self, device: &Device, queue: &Queue, data: &[u8]) -> usize {
@@ -366,19 +316,12 @@ impl Textures {
         self.insert_raw(device, queue, w, h, &img)
     }
 
-    pub fn insert_raw(
-        &mut self,
-        device: &Device,
-        queue: &Queue,
-        w: u32,
-        h: u32,
-        data: &[u8],
-    ) -> usize {
+    pub fn insert_raw(&mut self, device: &Device, queue: &Queue, w: u32, h: u32, data: &[u8]) -> usize {
         let id = self.store.len();
         self.store.push(Texture::from_bytes(
             device,
             queue,
-            &self.layout,
+            &self.layouts[0],
             &self.default_sampler,
             data,
             w,
@@ -387,19 +330,12 @@ impl Textures {
         id
     }
 
-    pub fn insert_raw_nearest(
-        &mut self,
-        device: &Device,
-        queue: &Queue,
-        w: u32,
-        h: u32,
-        data: &[u8],
-    ) -> usize {
+    pub fn insert_raw_nearest(&mut self, device: &Device, queue: &Queue, w: u32, h: u32, data: &[u8]) -> usize {
         let id = self.store.len();
         self.store.push(Texture::from_bytes(
             device,
             queue,
-            &self.layout,
+            &self.layouts[0],
             &self.nearest_sampler,
             data,
             w,
@@ -408,18 +344,14 @@ impl Textures {
         id
     }
 
-    pub fn insert_array_raw(
-        &mut self,
-        device: &Device,
-        queue: &Queue,
-        w: u32,
-        h: u32,
-        layers: u32,
-        data: &[u8],
-    ) -> Result<usize, String> {
+    pub fn insert_array_raw(&mut self, device: &Device, queue: &Queue, w: u32, h: u32, layers: u32, data: &[u8]) -> Result<usize, String> {
         Texture::validate_upload(device, data, w, h)?;
-        if layers == 0 || layers > device.limits().max_texture_array_layers {
-            return Err(format!("Invalid texture array layer count {layers}"));
+        let storage_layers = Texture::storage_layer_count(device, w, h, layers);
+        let max_layers = device.limits().max_texture_array_layers;
+        if layers == 0 || storage_layers > max_layers {
+            return Err(format!(
+                "Texture array with {layers} layers requires {storage_layers} storage layers; device limit is {max_layers}"
+            ));
         }
         let expected = (w as usize)
             .checked_mul(h as usize)
@@ -427,15 +359,12 @@ impl Textures {
             .and_then(|n| n.checked_mul(4))
             .ok_or("Texture array size overflow")?;
         if data.len() != expected {
-            return Err(format!(
-                "Texture array needs {expected} bytes, got {}",
-                data.len()
-            ));
+            return Err(format!("Texture array needs {expected} bytes, got {}", data.len()));
         }
         let texture = Texture::from_array_bytes(
             device,
             queue,
-            &self.layout,
+            &self.layouts[usize::from(layers > 1)],
             &self.nearest_sampler,
             data,
             w,
@@ -453,24 +382,8 @@ impl Textures {
         self.replace_raw(device, queue, id, w, h, &img);
     }
 
-    pub fn replace_raw(
-        &mut self,
-        device: &Device,
-        queue: &Queue,
-        id: usize,
-        w: u32,
-        h: u32,
-        data: &[u8],
-    ) {
-        self.store[id] = Texture::from_bytes(
-            device,
-            queue,
-            &self.layout,
-            &self.default_sampler,
-            data,
-            w,
-            h,
-        );
+    pub fn replace_raw(&mut self, device: &Device, queue: &Queue, id: usize, w: u32, h: u32, data: &[u8]) {
+        self.store[id] = Texture::from_bytes(device, queue, &self.layouts[0], &self.default_sampler, data, w, h);
     }
 
     pub fn insert_nearest(&mut self, device: &Device, queue: &Queue, data: &[u8]) -> usize {
@@ -479,7 +392,7 @@ impl Textures {
         self.store.push(Texture::from_bytes(
             device,
             queue,
-            &self.layout,
+            &self.layouts[0],
             &self.nearest_sampler,
             &img,
             w,
@@ -493,7 +406,7 @@ impl Textures {
         self.store.push(Texture::from_view(
             offscreen.texture(),
             device,
-            &self.layout,
+            &self.layouts[0],
             &self.default_sampler,
         ));
         id

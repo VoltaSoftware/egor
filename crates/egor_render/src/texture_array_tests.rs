@@ -6,34 +6,27 @@ use wgpu::util::DeviceExt;
 #[test]
 #[ignore = "requires a real GPU; run with WGPU_BACKEND=vulkan or gl"]
 fn array_pages_render_in_one_draw() {
+    for layers in [1, 3, 6, 12] {
+        render_array_pages(layers);
+    }
+}
+
+fn render_array_pages(layers: u32) {
     pollster::block_on(async {
-        let gpu =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let gpu = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = gpu.request_adapter(&Default::default()).await.unwrap();
         println!("{:?}", adapter.get_info());
         let (device, queue) = adapter.request_device(&Default::default()).await.unwrap();
         // Exercise the actual pipeline layout, default/watch shaders and upload path.
-        let _pipelines =
-            crate::pipeline::Pipelines::new(&device, TextureFormat::Rgba8UnormSrgb, true);
+        let _pipelines = crate::pipeline::Pipelines::new(&device, TextureFormat::Rgba8UnormSrgb, true);
         let mut textures = Textures::new(&device, &queue);
-        let colors = [
-            [255u8, 0, 0, 255],
-            [0, 255, 0, 255],
-            [0, 0, 255, 255],
-            [255, 255, 0, 255],
-        ];
-        let pixels = colors[..3]
-            .iter()
-            .flat_map(|c| c.repeat(64))
+        let colors = [[255u8, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [255, 255, 0, 255]];
+        let sampled_layers = [0, 1.min(layers - 1), layers - 1];
+        let pixels = (0..layers)
+            .flat_map(|page| colors[page as usize % 3].repeat(64))
             .collect::<Vec<_>>();
-        let id = textures
-            .insert_array_raw(&device, &queue, 8, 8, 3, &pixels)
-            .unwrap();
-        assert!(
-            textures
-                .insert_array_raw(&device, &queue, 8, 8, 4, &pixels)
-                .is_err()
-        );
+        let id = textures.insert_array_raw(&device, &queue, 8, 8, layers, &pixels).unwrap();
+        assert!(textures.insert_array_raw(&device, &queue, 8, 8, layers + 1, &pixels).is_err());
         let normal_id = textures.insert_raw_nearest(&device, &queue, 8, 8, &colors[3].repeat(64));
         let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
@@ -50,9 +43,7 @@ fn array_pages_render_in_one_draw() {
         });
         let camera = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: bytemuck::cast_slice(&[
-                1f32, 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
-            ]),
+            contents: bytemuck::cast_slice(&[1f32, 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.]),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let camera_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -71,7 +62,7 @@ fn array_pages_render_in_one_draw() {
             });
             let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: None,
-                bind_group_layouts: &[Some(&textures.layout), Some(&camera_layout)],
+                bind_group_layouts: &[Some(&textures.layouts[usize::from(array)]), Some(&camera_layout)],
                 immediate_size: 0,
             });
             let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -114,13 +105,8 @@ fn array_pages_render_in_one_draw() {
         });
         let instances = (0..4)
             .map(|page| {
-                Instance::new(
-                    [0.5, 0., 0., 2.],
-                    [-0.75 + page as f32 * 0.5, 0., 0.],
-                    [1.; 4],
-                    [0., 0., 1., 1.],
-                )
-                .with_texture_layer(page % 3)
+                Instance::new([0.5, 0., 0., 2.], [-0.75 + page as f32 * 0.5, 0., 0.], [1.; 4], [0., 0., 1., 1.])
+                    .with_texture_layer(sampled_layers.get(page).copied().unwrap_or(0))
             })
             .collect::<Vec<_>>();
         let instances = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -167,7 +153,7 @@ fn array_pages_render_in_one_draw() {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&pipelines[1]);
+            pass.set_pipeline(&pipelines[usize::from(layers > 1)]);
             textures.get(Some(id)).bind(&mut pass, 0);
             pass.set_bind_group(1, &camera_bind, &[]);
             pass.set_vertex_buffer(0, vertices.slice(..));
@@ -198,10 +184,20 @@ fn array_pages_render_in_one_draw() {
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         rx.recv().unwrap().unwrap();
         let data = readback.slice(..).get_mapped_range().unwrap();
-        for (page, color) in colors.iter().enumerate() {
+        let expected = [
+            colors[sampled_layers[0] as usize % 3],
+            colors[sampled_layers[1] as usize % 3],
+            colors[sampled_layers[2] as usize % 3],
+            colors[3],
+        ];
+        for (page, color) in expected.iter().enumerate() {
             for y in 0..32 {
                 for x in page * 32..page * 32 + 32 {
-                    assert_eq!(&data[y * 512 + x * 4..y * 512 + x * 4 + 4], color);
+                    assert_eq!(
+                        &data[y * 512 + x * 4..y * 512 + x * 4 + 4],
+                        color,
+                        "{layers} layers, output column {page} at ({x}, {y})"
+                    );
                 }
             }
         }
