@@ -66,10 +66,7 @@ impl InstanceUploadPool {
         batches: &[&[Instance]],
         size: u64,
     ) -> bool {
-        let available = self
-            .slots
-            .iter()
-            .position(|slot| slot.state.load(Ordering::Acquire) != PENDING);
+        let available = self.slots.iter().position(|slot| slot.state.load(Ordering::Acquire) != PENDING);
         let index = if let Some(index) = available {
             index
         } else if self.slots.len() < MAX_SLOTS {
@@ -95,8 +92,7 @@ impl InstanceUploadPool {
             for batch in batches {
                 let bytes = bytemuck::cast_slice::<Instance, u8>(batch);
                 if !bytes.is_empty() {
-                    view.slice(offset..offset + bytes.len())
-                        .copy_from_slice(bytes);
+                    view.slice(offset..offset + bytes.len()).copy_from_slice(bytes);
                     offset += bytes.len();
                 }
             }
@@ -106,10 +102,7 @@ impl InstanceUploadPool {
         slot.state.store(PENDING, Ordering::Release);
         let state = Arc::clone(&slot.state);
         encoder.map_buffer_on_submit(&slot.buffer, MapMode::Write, .., move |result| {
-            state.store(
-                if result.is_ok() { READY } else { FAILED },
-                Ordering::Release,
-            );
+            state.store(if result.is_ok() { READY } else { FAILED }, Ordering::Release);
         });
         true
     }
@@ -127,8 +120,7 @@ mod tests {
         let instance = wgpu::Instance::new(desc);
         let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
         assert_eq!(adapter.get_info().backend, wgpu::Backend::Gl);
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
         let mut pool = InstanceUploadPool::default();
         for round in 0..8 {
             let multiplier = if round < 4 { 1 } else { 5 };
@@ -155,13 +147,7 @@ mod tests {
                 });
                 let mut encoder = device.create_command_encoder(&Default::default());
                 let split = values.len() / 2;
-                assert!(pool.upload(
-                    &device,
-                    &mut encoder,
-                    &target,
-                    &[&values[..split], &values[split..]],
-                    size
-                ));
+                assert!(pool.upload(&device, &mut encoder, &target, &[&values[..split], &values[split..]], size));
                 encoder.copy_buffer_to_buffer(&target, 0, &output, 0, size);
                 encoder.map_buffer_on_submit(&output, MapMode::Read, .., Result::unwrap);
                 commands.push(encoder.finish());

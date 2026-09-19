@@ -157,16 +157,12 @@ fn main() {
             }
 
             if timer.frame == 0 {
-                state.map.load_tileset(
-                    gfx,
-                    include_bytes!("../assets/otsp_tiles_01.png"),
-                    "otsp_tiles_01.png",
-                );
-                state.map.load_tileset(
-                    gfx,
-                    include_bytes!("../assets/otsp_walls_01.png"),
-                    "otsp_walls_01.png",
-                );
+                state
+                    .map
+                    .load_tileset(gfx, include_bytes!("../assets/otsp_tiles_01.png"), "otsp_tiles_01.png");
+                state
+                    .map
+                    .load_tileset(gfx, include_bytes!("../assets/otsp_walls_01.png"), "otsp_walls_01.png");
                 state.player_tex = gfx.load_texture(include_bytes!("../assets/soldier.png"));
                 state.enemy_tex = gfx.load_texture(include_bytes!("../assets/zombie.png"));
                 let mut minimap = gfx.create_offscreen(200, 200);
@@ -190,43 +186,29 @@ fn main() {
                     gfx.clear(Color::BLACK);
 
                     gfx.camera().set_zoom(0.15);
-                    gfx.camera()
-                        .center(state.player.rect.center(), vec2(200.0, 200.0));
+                    gfx.camera().center(state.player.rect.center(), vec2(200.0, 200.0));
 
                     for e in &state.enemies {
-                        gfx.rect()
-                            .at(e.rect.position)
-                            .color(Color::RED)
-                            .size(Vec2::splat(48.0));
+                        gfx.rect().at(e.rect.position).color(Color::RED).size(Vec2::splat(48.0));
                     }
 
-                    gfx.rect()
-                        .at(state.player.rect.position)
-                        .color(Color::GREEN)
-                        .texture(41);
+                    gfx.rect().at(state.player.rect.position).color(Color::GREEN).texture(41);
 
                     for b in &state.bullets {
-                        gfx.rect()
-                            .at(b.rect.position)
-                            .size(Vec2::splat(16.0))
-                            .color(Color::WHITE);
+                        gfx.rect().at(b.rect.position).size(Vec2::splat(16.0)).color(Color::WHITE);
                     }
                 });
             }
             let screen_half = screen_size / 2.0;
-            let position = state.player.rect.position - screen_half
-                + Into::<Vec2>::into(input.mouse_position());
+            let position = state.player.rect.position - screen_half + Into::<Vec2>::into(input.mouse_position());
 
-            let dx = input.keys_held(&[KeyCode::KeyD, KeyCode::ArrowRight]) as i8
-                - input.keys_held(&[KeyCode::KeyA, KeyCode::ArrowLeft]) as i8;
-            let dy = input.keys_held(&[KeyCode::KeyS, KeyCode::ArrowDown]) as i8
-                - input.keys_held(&[KeyCode::KeyW, KeyCode::ArrowUp]) as i8;
+            let dx =
+                input.keys_held(&[KeyCode::KeyD, KeyCode::ArrowRight]) as i8 - input.keys_held(&[KeyCode::KeyA, KeyCode::ArrowLeft]) as i8;
+            let dy =
+                input.keys_held(&[KeyCode::KeyS, KeyCode::ArrowDown]) as i8 - input.keys_held(&[KeyCode::KeyW, KeyCode::ArrowUp]) as i8;
             let moving = dx != 0 || dy != 0;
 
-            state
-                .player
-                .rect
-                .translate(vec2(dx as f32, dy as f32) * 200.0 * timer.delta);
+            state.player.rect.translate(vec2(dx as f32, dy as f32) * 200.0 * timer.delta);
 
             gfx.camera().center(state.player.rect.position, screen_size);
             gfx.clear(Color::WHITE);
@@ -234,11 +216,9 @@ fn main() {
 
             state.fire_cd -= timer.delta;
             if input.mouse_held(MouseButton::Left) && state.fire_cd <= 0.0 {
-                state.bullets.extend(spawn_bullets(
-                    state.player.rect.center(),
-                    position,
-                    state.spread,
-                ));
+                state
+                    .bullets
+                    .extend(spawn_bullets(state.player.rect.center(), position, state.spread));
                 state.fire_cd = 1.0 / state.fire_rate;
             }
 
@@ -247,11 +227,7 @@ fn main() {
                 e.rect.translate(dir * e.speed * timer.delta);
             }
 
-            state.kills += handle_bullet_hits(
-                &mut state.bullets,
-                &mut state.enemies,
-                state.player.rect.position,
-            );
+            state.kills += handle_bullet_hits(&mut state.bullets, &mut state.enemies, state.player.rect.position);
 
             for b in &mut state.bullets {
                 b.rect.translate(b.vel * timer.delta);
@@ -273,11 +249,7 @@ fn main() {
                 gfx.rect()
                     .with(&e.rect)
                     .rotate(angle)
-                    .color(if e.flash > 0.0 {
-                        Color::RED
-                    } else {
-                        Color::WHITE
-                    })
+                    .color(if e.flash > 0.0 { Color::RED } else { Color::WHITE })
                     .texture(state.enemy_tex)
                     .uv(state.enemy_anim.uv());
             }
@@ -300,11 +272,7 @@ fn main() {
             gfx.rect()
                 .with(&state.player.rect)
                 .rotate(angle)
-                .color(if state.player.flash > 0.0 {
-                    Color::RED
-                } else {
-                    Color::WHITE
-                })
+                .color(if state.player.flash > 0.0 { Color::RED } else { Color::WHITE })
                 .texture(state.player_tex)
                 .uv(uv);
 
@@ -318,10 +286,7 @@ fn main() {
                 state.enemies = spawn_wave(
                     state.player.rect.position,
                     (state.wave + 2) * 3,
-                    (
-                        50. + state.wave as f32 * 3.0,
-                        125. + state.wave as f32 * 3.0,
-                    ),
+                    (50. + state.wave as f32 * 3.0, 125. + state.wave as f32 * 3.0),
                     state.hp,
                 );
             }
@@ -330,10 +295,7 @@ fn main() {
                 let screen_pos = vec2(screen_size.x - 210.0, 10.0);
                 let world_pos = gfx.camera().screen_to_world(screen_pos);
 
-                gfx.rect()
-                    .at(world_pos)
-                    .size(vec2(200.0, 200.0))
-                    .texture(state.minimap_tex);
+                gfx.rect().at(world_pos).size(vec2(200.0, 200.0)).texture(state.minimap_tex);
             }
 
             Window::new("Debug").show(egui_ctx, |ui| {

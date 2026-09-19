@@ -58,9 +58,7 @@ pub mod app {
 }
 
 pub mod input {
-    pub use egor_app::input::{
-        Input, KeyCode, MouseButton, TextInputEvent, Touch, TouchPhase, TouchSource,
-    };
+    pub use egor_app::input::{Input, KeyCode, MouseButton, TextInputEvent, Touch, TouchPhase, TouchSource};
 }
 
 pub mod time {

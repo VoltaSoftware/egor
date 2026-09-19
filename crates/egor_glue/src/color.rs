@@ -21,12 +21,8 @@ impl Color {
 }
 
 impl Color {
-    pub const BLACK: Color = Self {
-        inner: AlphaColor::BLACK,
-    };
-    pub const WHITE: Color = Self {
-        inner: AlphaColor::WHITE,
-    };
+    pub const BLACK: Color = Self { inner: AlphaColor::BLACK };
+    pub const WHITE: Color = Self { inner: AlphaColor::WHITE };
     pub const TRANSPARENT: Color = Self {
         inner: AlphaColor::TRANSPARENT,
     };

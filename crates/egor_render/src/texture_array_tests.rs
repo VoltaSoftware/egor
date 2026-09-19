@@ -13,8 +13,7 @@ fn array_pages_render_in_one_draw() {
 
 fn render_array_pages(layers: u32) {
     pollster::block_on(async {
-        let gpu =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let gpu = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = gpu.request_adapter(&Default::default()).await.unwrap();
         println!("{:?}", adapter.get_info());
         let (device, queue) = adapter
@@ -25,27 +24,15 @@ fn render_array_pages(layers: u32) {
             .await
             .unwrap();
         // Exercise the actual pipeline layout, default/watch shaders and upload path.
-        let _pipelines =
-            crate::pipeline::Pipelines::new(&device, TextureFormat::Rgba8UnormSrgb, true);
+        let _pipelines = crate::pipeline::Pipelines::new(&device, TextureFormat::Rgba8UnormSrgb, true);
         let mut textures = Textures::new(&device, &queue);
-        let colors = [
-            [255u8, 0, 0, 255],
-            [0, 255, 0, 255],
-            [0, 0, 255, 255],
-            [255, 255, 0, 255],
-        ];
+        let colors = [[255u8, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [255, 255, 0, 255]];
         let sampled_layers = [0, 1.min(layers - 1), layers - 1];
         let pixels = (0..layers)
             .flat_map(|page| colors[page as usize % 3].repeat(64))
             .collect::<Vec<_>>();
-        let id = textures
-            .insert_array_raw(&device, &queue, 8, 8, layers, &pixels)
-            .unwrap();
-        assert!(
-            textures
-                .insert_array_raw(&device, &queue, 8, 8, layers + 1, &pixels)
-                .is_err()
-        );
+        let id = textures.insert_array_raw(&device, &queue, 8, 8, layers, &pixels).unwrap();
+        assert!(textures.insert_array_raw(&device, &queue, 8, 8, layers + 1, &pixels).is_err());
         let normal_id = textures.insert_raw_nearest(&device, &queue, 8, 8, &colors[3].repeat(64));
         let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
@@ -62,9 +49,7 @@ fn render_array_pages(layers: u32) {
         });
         let camera = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: bytemuck::cast_slice(&[
-                1f32, 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
-            ]),
+            contents: bytemuck::cast_slice(&[1f32, 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.]),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let camera_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -83,10 +68,7 @@ fn render_array_pages(layers: u32) {
             });
             let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: None,
-                bind_group_layouts: &[
-                    Some(&textures.layouts[usize::from(array)]),
-                    Some(&camera_layout),
-                ],
+                bind_group_layouts: &[Some(&textures.layouts[usize::from(array)]), Some(&camera_layout)],
                 immediate_size: 0,
             });
             let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -129,13 +111,8 @@ fn render_array_pages(layers: u32) {
         });
         let instances = (0..4)
             .map(|page| {
-                Instance::new(
-                    [0.5, 0., 0., 2.],
-                    [-0.75 + page as f32 * 0.5, 0., 0.],
-                    [1.; 4],
-                    [0., 0., 1., 1.],
-                )
-                .with_texture_layer(sampled_layers.get(page).copied().unwrap_or(0))
+                Instance::new([0.5, 0., 0., 2.], [-0.75 + page as f32 * 0.5, 0., 0.], [1.; 4], [0., 0., 1., 1.])
+                    .with_texture_layer(sampled_layers.get(page).copied().unwrap_or(0))
             })
             .collect::<Vec<_>>();
         let instances = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
