@@ -32,6 +32,17 @@
 | Web (WASM) | WebGPU, WebGL2           | ✅ Working |
 | Android    | Vulkan, OpenGL           | ✅ Working |
 
+### Linux OpenGL in this fork
+
+The workspace pins the matching wgpu fork in `Cargo.toml`. Applications consuming this egor fork must copy its `[patch.crates-io]` entries into their own workspace manifest. They include the EGL display, X11 visual, and GLSL capability fixes used by the renderer.
+
+The native regression test requires OpenGL, Vulkan, and a running display. It presents frames, resizes the window, and switches between both backends:
+
+```bash
+cargo test -p egor_render --test linux_gl_surface -- --ignored --nocapture
+EGOR_TEST_WINDOW_SYSTEM=x11 cargo test -p egor_render --test linux_gl_surface -- --ignored --nocapture
+```
+
 ## Getting Started
 
 Add **egor** to your project:

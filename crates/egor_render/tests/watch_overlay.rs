@@ -13,7 +13,11 @@ use winit::{event_loop::EventLoop, window::Window};
 fn watch_overlay_preserves_transparency_behind_foreground() {
     let event_loop = EventLoop::builder().with_any_thread(true).build().unwrap();
     #[allow(deprecated)]
-    let window = Arc::new(event_loop.create_window(Window::default_attributes().with_visible(false)).unwrap());
+    let window = Arc::new(
+        event_loop
+            .create_window(Window::default_attributes().with_visible(false))
+            .unwrap(),
+    );
     let mut renderer = pollster::block_on(Renderer::new(window, &wgpu::MemoryHints::default()));
     assert!(renderer.supports_watch_overlay_capture());
     renderer.upload_camera_matrix([
@@ -57,10 +61,21 @@ fn watch_overlay_preserves_transparency_behind_foreground() {
     // opaque black foreground at pixel 2, and translucent red at pixel 3.
     let mut batch = GeometryBatch::default();
     batch.push_instance(
-        Instance::new([1.5, 0.0, 0.0, 2.0], [0.25, 0.0, -0.5], [0.2, 0.7, 0.3, 1.0], [0.0, 0.0, 1.0, 1.0]).with_watch_overlay(0.0),
+        Instance::new(
+            [1.5, 0.0, 0.0, 2.0],
+            [0.25, 0.0, -0.5],
+            [0.2, 0.7, 0.3, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+        )
+        .with_watch_overlay(0.0),
     );
     for (x, color) in [(0.25, [0.0, 0.0, 0.0, 1.0]), (0.75, [1.0, 0.0, 0.0, 0.5])] {
-        batch.push_instance(Instance::new([0.5, 0.0, 0.0, 2.0], [x, 0.0, -0.5], color, [0.0, 0.0, 1.0, 1.0]));
+        batch.push_instance(Instance::new(
+            [0.5, 0.0, 0.0, 2.0],
+            [x, 0.0, -0.5],
+            color,
+            [0.0, 0.0, 1.0, 1.0],
+        ));
     }
 
     let mut encoder = device.create_command_encoder(&Default::default());
@@ -115,13 +130,21 @@ fn watch_overlay_preserves_transparency_behind_foreground() {
         .unwrap();
     rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
     let pixels = readback.slice(..).get_mapped_range().unwrap();
-    assert_eq!(&pixels[..4], &[0, 0, 0, 0], "undrawn background must reveal the server map");
+    assert_eq!(
+        &pixels[..4],
+        &[0, 0, 0, 0],
+        "undrawn background must reveal the server map"
+    );
     assert_eq!(
         &pixels[4..8],
         &[0, 0, 0, 0],
         "server-owned terrain must be omitted from the overlay"
     );
-    assert_eq!(&pixels[8..12], &[0, 0, 0, 255], "black foreground must remain opaque");
+    assert_eq!(
+        &pixels[8..12],
+        &[0, 0, 0, 255],
+        "black foreground must remain opaque"
+    );
     assert!(
         pixels[12].abs_diff(128) <= 1 && pixels[15].abs_diff(128) <= 1,
         "translucent foreground must retain its alpha: {:?}",

@@ -90,7 +90,12 @@ impl Player {
     }
 
     fn render(&self, gfx: &mut Graphics) {
-        draw_circle(gfx, self.cell.center, self.cell.radius, Color::new([0.0, 0.0, 0.55, 1.0]));
+        draw_circle(
+            gfx,
+            self.cell.center,
+            self.cell.radius,
+            Color::new([0.0, 0.0, 0.55, 1.0]),
+        );
     }
 }
 
@@ -111,7 +116,13 @@ impl Creature {
         }
     }
 
-    fn update(&mut self, food: &mut [Food], player: &mut Option<Player>, opps: &mut [Creature], dt: f32) {
+    fn update(
+        &mut self,
+        food: &mut [Food],
+        player: &mut Option<Player>,
+        opps: &mut [Creature],
+        dt: f32,
+    ) {
         if let Some(p) = player {
             self.speed -= self.cell.try_absorb(&mut p.cell).unwrap_or(0.0);
             p.speed -= p.cell.try_absorb(&mut self.cell).unwrap_or(0.0);
@@ -133,7 +144,12 @@ impl Creature {
     }
 
     fn render(&self, gfx: &mut Graphics) {
-        draw_circle(gfx, self.cell.center, self.cell.radius, Color::new([1.0, 0.65, 0.0, 1.0]));
+        draw_circle(
+            gfx,
+            self.cell.center,
+            self.cell.radius,
+            Color::new([1.0, 0.65, 0.0, 1.0]),
+        );
     }
 }
 
@@ -225,7 +241,10 @@ impl Game {
         gfx.clear(Color::new([0.53, 0.81, 0.98, 1.0]));
         match self.state {
             GameState::Playing => {
-                gfx.rect().at(Vec2::ZERO).size(self.world.bounds).color(Color::WHITE);
+                gfx.rect()
+                    .at(Vec2::ZERO)
+                    .size(self.world.bounds)
+                    .color(Color::WHITE);
 
                 for f in &self.world.food {
                     f.render(gfx);
@@ -282,7 +301,11 @@ impl Game {
 }
 
 fn draw_circle(gfx: &mut Graphics, center: Vec2, radius: f32, color: Color) {
-    gfx.polygon().at(center).radius(radius).segments(32).color(color);
+    gfx.polygon()
+        .at(center)
+        .radius(radius)
+        .segments(32)
+        .color(color);
 }
 
 fn main() {

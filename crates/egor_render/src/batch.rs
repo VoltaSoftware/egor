@@ -1,4 +1,7 @@
-use wgpu::{Buffer, BufferDescriptor, BufferUsages, COPY_BUFFER_ALIGNMENT, Device, IndexFormat, Queue, RenderPass};
+use wgpu::{
+    Buffer, BufferDescriptor, BufferUsages, COPY_BUFFER_ALIGNMENT, Device, IndexFormat, Queue,
+    RenderPass,
+};
 
 use crate::{instance::Instance, vertex::Vertex};
 
@@ -31,7 +34,8 @@ impl Default for GeometryBatch {
 impl GeometryBatch {
     pub const DEFAULT_INDICES_PER_VERT: usize = 6;
     pub const DEFAULT_MAX_VERTICES: usize = 128 as usize;
-    pub const DEFAULT_MAX_INDICES: usize = Self::DEFAULT_MAX_VERTICES * Self::DEFAULT_INDICES_PER_VERT;
+    pub const DEFAULT_MAX_INDICES: usize =
+        Self::DEFAULT_MAX_VERTICES * Self::DEFAULT_INDICES_PER_VERT;
 
     // Creates a new batch with specified max vert/idx counts
     pub fn new(max_verticies: usize, max_indices: usize) -> Self {
@@ -54,7 +58,8 @@ impl GeometryBatch {
 
     // Returns true if adding verts/indices would exceed max allowed
     pub fn would_overflow(&self, vert_count: usize, idx_count: usize) -> bool {
-        self.vertices.len() + vert_count > self.max_verticies || self.indices.len() + idx_count > self.max_indices
+        self.vertices.len() + vert_count > self.max_verticies
+            || self.indices.len() + idx_count > self.max_indices
     }
 
     /// Reserves space for `vert_count` + `idx_count`
@@ -62,7 +67,11 @@ impl GeometryBatch {
     /// Returns mutable slices to the new ranges and the base vertex offset.
     /// Returns `None` if this would exceed `u16` limits.
     /// Marks buffers dirty
-    pub fn try_allocate(&mut self, vert_count: usize, idx_count: usize) -> Option<(&mut [Vertex], &mut [u16], u16)> {
+    pub fn try_allocate(
+        &mut self,
+        vert_count: usize,
+        idx_count: usize,
+    ) -> Option<(&mut [Vertex], &mut [u16], u16)> {
         if self.would_overflow(vert_count, idx_count) {
             return None;
         }
@@ -76,7 +85,11 @@ impl GeometryBatch {
         self.vertices_dirty = true;
         self.indices_dirty = true;
 
-        Some((&mut self.vertices[v_start..], &mut self.indices[i_start..], v_start as u16))
+        Some((
+            &mut self.vertices[v_start..],
+            &mut self.indices[i_start..],
+            v_start as u16,
+        ))
     }
 
     /// Adds vertices/indices, returns false if it would overflow
@@ -167,11 +180,14 @@ impl GeometryBatch {
 
         if self.instances_dirty && !self.instances.is_empty() {
             let required_bytes = (self.instances.len() * std::mem::size_of::<Instance>()) as u64;
-            let needs_recreate = self.instance_buffer.as_ref().is_none_or(|b| b.size() < required_bytes);
+            let needs_recreate = self
+                .instance_buffer
+                .as_ref()
+                .is_none_or(|b| b.size() < required_bytes);
             if needs_recreate {
-                let alloc = required_bytes
-                    .next_power_of_two()
-                    .max((Self::INITIAL_INSTANCE_CAPACITY * std::mem::size_of::<Instance>()) as u64);
+                let alloc = required_bytes.next_power_of_two().max(
+                    (Self::INITIAL_INSTANCE_CAPACITY * std::mem::size_of::<Instance>()) as u64,
+                );
                 self.instance_buffer = Some(device.create_buffer(&BufferDescriptor {
                     label: Some("GeometryBatch Instance Buffer"),
                     size: alloc,
@@ -179,7 +195,11 @@ impl GeometryBatch {
                     mapped_at_creation: false,
                 }));
             }
-            queue.write_buffer(self.instance_buffer.as_ref().unwrap(), 0, bytemuck::cast_slice(&self.instances));
+            queue.write_buffer(
+                self.instance_buffer.as_ref().unwrap(),
+                0,
+                bytemuck::cast_slice(&self.instances),
+            );
             self.instances_dirty = false;
         }
     }
@@ -195,7 +215,11 @@ impl GeometryBatch {
                     mapped_at_creation: false,
                 }));
             }
-            queue.write_buffer(self.vertex_buffer.as_ref().unwrap(), 0, bytemuck::cast_slice(&self.vertices));
+            queue.write_buffer(
+                self.vertex_buffer.as_ref().unwrap(),
+                0,
+                bytemuck::cast_slice(&self.vertices),
+            );
             self.vertices_dirty = false;
         }
 
@@ -214,7 +238,11 @@ impl GeometryBatch {
             if needs_padding {
                 self.indices.push(0);
             }
-            queue.write_buffer(self.index_buffer.as_ref().unwrap(), 0, bytemuck::cast_slice(&self.indices));
+            queue.write_buffer(
+                self.index_buffer.as_ref().unwrap(),
+                0,
+                bytemuck::cast_slice(&self.indices),
+            );
             if needs_padding {
                 self.indices.pop();
             }

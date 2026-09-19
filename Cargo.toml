@@ -14,6 +14,11 @@ exclude = ["media/"]
 members = ["xtask", "crates/*", "demos/*"]
 resolver = "2"
 
+[patch.crates-io]
+wgpu = { git = "https://github.com/LegendsOfTaria/wgpu", rev = "98c1a781276b81d5a8b55fbb02f790aaba9de4ef" }
+naga = { git = "https://github.com/LegendsOfTaria/wgpu", rev = "98c1a781276b81d5a8b55fbb02f790aaba9de4ef" }
+naga-types = { git = "https://github.com/LegendsOfTaria/wgpu", rev = "98c1a781276b81d5a8b55fbb02f790aaba9de4ef" }
+
 [features]
 default = []
 log = ["egor_app/log"]
