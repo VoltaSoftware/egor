@@ -16,7 +16,13 @@ fn render_array_pages(layers: u32) {
         let gpu = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = gpu.request_adapter(&Default::default()).await.unwrap();
         println!("{:?}", adapter.get_info());
-        let (device, queue) = adapter.request_device(&Default::default()).await.unwrap();
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                required_limits: adapter.limits(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         // Exercise the actual pipeline layout, default/watch shaders and upload path.
         let _pipelines = crate::pipeline::Pipelines::new(&device, TextureFormat::Rgba8UnormSrgb, true);
         let mut textures = Textures::new(&device, &queue);

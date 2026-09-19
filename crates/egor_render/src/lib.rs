@@ -1,4 +1,6 @@
 pub mod batch;
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+mod display;
 pub mod frame;
 pub mod instance;
 mod instance_upload;
@@ -263,6 +265,8 @@ impl Renderer {
     ) -> Result<Self, RendererInitError> {
         log::info!("[egor] renderer init: creating wgpu instance");
         let mut desc = renderer_instance_descriptor();
+        #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+        let window = display::attach_to_instance(&mut desc, window.into());
         match backend_preference {
             RendererBackendPreference::Auto => {
                 log::info!("[egor] renderer init: enabled backend set: auto");
