@@ -1,6 +1,7 @@
 use wgpu::{
-    BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType, Buffer,
-    BufferBindingType, BufferUsages, Device, Queue, ShaderStages,
+    BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
+    BindGroupLayoutEntry, BindingType, Buffer, BufferBindingType, BufferUsages, Device, Queue,
+    ShaderStages,
     util::{BufferInitDescriptor, DeviceExt},
 };
 
@@ -49,7 +50,10 @@ impl Uniforms {
             }],
         });
 
-        Self { layout, store: Vec::new() }
+        Self {
+            layout,
+            store: Vec::new(),
+        }
     }
 
     pub fn bind_group(&self, uniform_id: usize) -> &BindGroup {
