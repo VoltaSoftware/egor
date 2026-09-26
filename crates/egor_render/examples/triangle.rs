@@ -28,7 +28,8 @@ impl ApplicationHandler for MinimalApp {
         let window = Arc::new(event_loop.create_window(Default::default()).unwrap());
         let size = window.inner_size();
 
-        let mut renderer = pollster::block_on(Renderer::new(window.clone(), &MemoryHints::Performance));
+        let mut renderer =
+            pollster::block_on(Renderer::new(window.clone(), &MemoryHints::Performance));
         let backbuffer = renderer
             .take_startup_backbuffer(size.width, size.height)
             .unwrap_or_else(|| {
@@ -48,7 +49,12 @@ impl ApplicationHandler for MinimalApp {
         self.backbuffer = Some(backbuffer);
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _window_id: winit::window::WindowId, event: WindowEvent) {
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: winit::window::WindowId,
+        event: WindowEvent,
+    ) {
         if let Some(r) = self.renderer.as_mut() {
             match event {
                 WindowEvent::RedrawRequested => {
@@ -66,7 +72,9 @@ impl ApplicationHandler for MinimalApp {
                     ];
                     let indices = [0, 1, 2];
 
-                    if let Some((batch_verts, batch_indices, base)) = self.batch.try_allocate(vertices.len(), indices.len()) {
+                    if let Some((batch_verts, batch_indices, base)) =
+                        self.batch.try_allocate(vertices.len(), indices.len())
+                    {
                         batch_verts.copy_from_slice(&vertices);
                         batch_indices.copy_from_slice(&indices.map(|i| i + base));
                     }

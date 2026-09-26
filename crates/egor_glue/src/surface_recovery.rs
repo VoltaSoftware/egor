@@ -52,7 +52,10 @@ impl SurfaceRecoveryState {
         self.device_lost_reported = false;
     }
 
-    pub(crate) fn record_surface_failure(&mut self, failure: SurfaceFailure) -> SurfaceRecoveryAction {
+    pub(crate) fn record_surface_failure(
+        &mut self,
+        failure: SurfaceFailure,
+    ) -> SurfaceRecoveryAction {
         match failure {
             SurfaceFailure::ZeroSizedSurface => {
                 self.reset_surface_create_failures();
@@ -71,7 +74,8 @@ impl SurfaceRecoveryState {
                 self.bump_acquire_failures();
                 SurfaceRecoveryAction::RecreateBackbuffer
             }
-            SurfaceFailure::Acquire(SurfaceAcquireFailure::Validation) | SurfaceFailure::AcquirePanic => {
+            SurfaceFailure::Acquire(SurfaceAcquireFailure::Validation)
+            | SurfaceFailure::AcquirePanic => {
                 self.reset_surface_create_failures();
                 self.bump_acquire_failures();
                 if self.consecutive_acquire_failures > 1 {
@@ -85,7 +89,9 @@ impl SurfaceRecoveryState {
                 self.bump_acquire_failures();
                 SurfaceRecoveryAction::RecreateBackbuffer
             }
-            SurfaceFailure::Acquire(SurfaceAcquireFailure::Timeout | SurfaceAcquireFailure::Occluded) => {
+            SurfaceFailure::Acquire(
+                SurfaceAcquireFailure::Timeout | SurfaceAcquireFailure::Occluded,
+            ) => {
                 self.reset_surface_create_failures();
                 self.bump_acquire_failures();
                 SurfaceRecoveryAction::SkipFrame
@@ -105,7 +111,8 @@ impl SurfaceRecoveryState {
 
     fn bump_surface_create_failures(&mut self) {
         self.bump_acquire_failures();
-        self.consecutive_surface_create_failures = self.consecutive_surface_create_failures.saturating_add(1);
+        self.consecutive_surface_create_failures =
+            self.consecutive_surface_create_failures.saturating_add(1);
     }
 
     fn reset_surface_create_failures(&mut self) {
@@ -132,7 +139,10 @@ pub(crate) fn frame_interval_for_fps(fps: u16) -> Duration {
     Duration::from_nanos((1_000_000_000u64 + fps / 2) / fps)
 }
 
-pub(crate) fn retry_interval_for_refresh(native_refresh_rate_fps: Option<u16>, consecutive_failures: u32) -> Duration {
+pub(crate) fn retry_interval_for_refresh(
+    native_refresh_rate_fps: Option<u16>,
+    consecutive_failures: u32,
+) -> Duration {
     if consecutive_failures > 3 {
         return Duration::from_millis(100);
     }
@@ -142,7 +152,10 @@ pub(crate) fn retry_interval_for_refresh(native_refresh_rate_fps: Option<u16>, c
         .unwrap_or_else(|| Duration::from_millis(16))
 }
 
-pub(crate) fn max_frame_interval(first: Option<Duration>, second: Option<Duration>) -> Option<Duration> {
+pub(crate) fn max_frame_interval(
+    first: Option<Duration>,
+    second: Option<Duration>,
+) -> Option<Duration> {
     match (first, second) {
         (Some(first), Some(second)) => Some(first.max(second)),
         (Some(interval), None) | (None, Some(interval)) => Some(interval),
@@ -194,23 +207,33 @@ mod tests {
         fn inject(&mut self, fault: InjectedFault) -> InjectedRecoveryOutcome {
             match fault {
                 InjectedFault::SurfaceAcquire(failure) => {
-                    let action = self.state.record_surface_failure(SurfaceFailure::Acquire(failure));
+                    let action = self
+                        .state
+                        .record_surface_failure(SurfaceFailure::Acquire(failure));
                     self.record_surface_action(action)
                 }
                 InjectedFault::AcquirePanic => {
-                    let action = self.state.record_surface_failure(SurfaceFailure::AcquirePanic);
+                    let action = self
+                        .state
+                        .record_surface_failure(SurfaceFailure::AcquirePanic);
                     self.record_surface_action(action)
                 }
                 InjectedFault::ConfigureFailed => {
-                    let action = self.state.record_surface_failure(SurfaceFailure::ConfigureFailed);
+                    let action = self
+                        .state
+                        .record_surface_failure(SurfaceFailure::ConfigureFailed);
                     self.record_surface_action(action)
                 }
                 InjectedFault::BackbufferCreateFailed => {
-                    let action = self.state.record_surface_failure(SurfaceFailure::BackbufferCreateFailed);
+                    let action = self
+                        .state
+                        .record_surface_failure(SurfaceFailure::BackbufferCreateFailed);
                     self.record_surface_action(action)
                 }
                 InjectedFault::ZeroSizedSurface => {
-                    let action = self.state.record_surface_failure(SurfaceFailure::ZeroSizedSurface);
+                    let action = self
+                        .state
+                        .record_surface_failure(SurfaceFailure::ZeroSizedSurface);
                     self.record_surface_action(action)
                 }
                 InjectedFault::DeviceLost
@@ -234,7 +257,10 @@ mod tests {
             }
         }
 
-        fn record_surface_action(&mut self, action: SurfaceRecoveryAction) -> InjectedRecoveryOutcome {
+        fn record_surface_action(
+            &mut self,
+            action: SurfaceRecoveryAction,
+        ) -> InjectedRecoveryOutcome {
             match action {
                 SurfaceRecoveryAction::SkipFrame => {
                     self.skipped_frame_count += 1;
@@ -244,7 +270,9 @@ mod tests {
                     self.wait_resize_count += 1;
                     InjectedRecoveryOutcome::WaitForResize
                 }
-                SurfaceRecoveryAction::WaitForSurfaceChange => InjectedRecoveryOutcome::WaitForSurfaceChange,
+                SurfaceRecoveryAction::WaitForSurfaceChange => {
+                    InjectedRecoveryOutcome::WaitForSurfaceChange
+                }
                 SurfaceRecoveryAction::RecreateBackbuffer => {
                     self.backbuffer_recreate_count += 1;
                     InjectedRecoveryOutcome::RecreateBackbuffer
@@ -262,7 +290,10 @@ mod tests {
 
     #[test]
     fn timeout_and_occluded_skip_without_recreating() {
-        for failure in [SurfaceAcquireFailure::Timeout, SurfaceAcquireFailure::Occluded] {
+        for failure in [
+            SurfaceAcquireFailure::Timeout,
+            SurfaceAcquireFailure::Occluded,
+        ] {
             let mut state = SurfaceRecoveryState::new();
 
             let action = state.record_surface_failure(SurfaceFailure::Acquire(failure));
@@ -276,7 +307,8 @@ mod tests {
     fn outdated_surface_recreates_backbuffer_immediately() {
         let mut state = SurfaceRecoveryState::new();
 
-        let action = state.record_surface_failure(SurfaceFailure::Acquire(SurfaceAcquireFailure::Outdated));
+        let action =
+            state.record_surface_failure(SurfaceFailure::Acquire(SurfaceAcquireFailure::Outdated));
 
         assert_eq!(action, SurfaceRecoveryAction::RecreateBackbuffer);
         assert_eq!(state.consecutive_acquire_failures(), 1);
@@ -286,7 +318,8 @@ mod tests {
     fn lost_surface_recreates_backbuffer_immediately() {
         let mut state = SurfaceRecoveryState::new();
 
-        let action = state.record_surface_failure(SurfaceFailure::Acquire(SurfaceAcquireFailure::Lost));
+        let action =
+            state.record_surface_failure(SurfaceFailure::Acquire(SurfaceAcquireFailure::Lost));
 
         assert_eq!(action, SurfaceRecoveryAction::RecreateBackbuffer);
         assert_eq!(state.consecutive_acquire_failures(), 1);
@@ -296,8 +329,10 @@ mod tests {
     fn validation_gets_one_retry_before_backbuffer_recreate() {
         let mut state = SurfaceRecoveryState::new();
 
-        let first = state.record_surface_failure(SurfaceFailure::Acquire(SurfaceAcquireFailure::Validation));
-        let second = state.record_surface_failure(SurfaceFailure::Acquire(SurfaceAcquireFailure::Validation));
+        let first = state
+            .record_surface_failure(SurfaceFailure::Acquire(SurfaceAcquireFailure::Validation));
+        let second = state
+            .record_surface_failure(SurfaceFailure::Acquire(SurfaceAcquireFailure::Validation));
 
         assert_eq!(first, SurfaceRecoveryAction::SkipFrame);
         assert_eq!(second, SurfaceRecoveryAction::RecreateBackbuffer);
@@ -396,10 +431,22 @@ mod tests {
 
     #[test]
     fn retry_interval_matches_refresh_rate_then_backs_off() {
-        assert_eq!(retry_interval_for_refresh(Some(120), 1), Duration::from_nanos(8_333_333));
-        assert_eq!(retry_interval_for_refresh(Some(60), 3), Duration::from_nanos(16_666_667));
-        assert_eq!(retry_interval_for_refresh(Some(120), 4), Duration::from_millis(100));
-        assert_eq!(retry_interval_for_refresh(None, 1), Duration::from_millis(16));
+        assert_eq!(
+            retry_interval_for_refresh(Some(120), 1),
+            Duration::from_nanos(8_333_333)
+        );
+        assert_eq!(
+            retry_interval_for_refresh(Some(60), 3),
+            Duration::from_nanos(16_666_667)
+        );
+        assert_eq!(
+            retry_interval_for_refresh(Some(120), 4),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            retry_interval_for_refresh(None, 1),
+            Duration::from_millis(16)
+        );
     }
 
     #[test]
@@ -429,18 +476,21 @@ mod tests {
         let mut state = SurfaceRecoveryState::new();
 
         assert_eq!(
-            state.record_surface_failure(SurfaceFailure::Acquire(SurfaceAcquireFailure::Validation)),
+            state
+                .record_surface_failure(SurfaceFailure::Acquire(SurfaceAcquireFailure::Validation)),
             SurfaceRecoveryAction::SkipFrame
         );
         assert_eq!(
-            state.record_surface_failure(SurfaceFailure::Acquire(SurfaceAcquireFailure::Validation)),
+            state
+                .record_surface_failure(SurfaceFailure::Acquire(SurfaceAcquireFailure::Validation)),
             SurfaceRecoveryAction::RecreateBackbuffer
         );
 
         state.record_frame_acquired();
 
         assert_eq!(
-            state.record_surface_failure(SurfaceFailure::Acquire(SurfaceAcquireFailure::Validation)),
+            state
+                .record_surface_failure(SurfaceFailure::Acquire(SurfaceAcquireFailure::Validation)),
             SurfaceRecoveryAction::SkipFrame
         );
         assert_eq!(state.consecutive_acquire_failures(), 1);
@@ -469,7 +519,8 @@ mod tests {
         let mut state = SurfaceRecoveryState::new();
 
         for expected_count in 1..=8 {
-            let action = state.record_surface_failure(SurfaceFailure::Acquire(SurfaceAcquireFailure::Occluded));
+            let action = state
+                .record_surface_failure(SurfaceFailure::Acquire(SurfaceAcquireFailure::Occluded));
             assert_eq!(action, SurfaceRecoveryAction::SkipFrame);
             assert_eq!(state.consecutive_acquire_failures(), expected_count);
         }
@@ -483,7 +534,10 @@ mod tests {
     #[test]
     fn max_frame_interval_prefers_slower_interval() {
         assert_eq!(
-            max_frame_interval(Some(Duration::from_millis(8)), Some(Duration::from_millis(100))),
+            max_frame_interval(
+                Some(Duration::from_millis(8)),
+                Some(Duration::from_millis(100))
+            ),
             Some(Duration::from_millis(100))
         );
         assert_eq!(
@@ -502,22 +556,38 @@ mod tests {
         let mut harness = FaultRecoveryHarness::default();
 
         assert_eq!(
-            harness.inject(InjectedFault::SurfaceAcquire(SurfaceAcquireFailure::Occluded)),
+            harness.inject(InjectedFault::SurfaceAcquire(
+                SurfaceAcquireFailure::Occluded
+            )),
             InjectedRecoveryOutcome::SkipFrame
         );
         assert_eq!(
-            harness.inject(InjectedFault::SurfaceAcquire(SurfaceAcquireFailure::Validation)),
+            harness.inject(InjectedFault::SurfaceAcquire(
+                SurfaceAcquireFailure::Validation
+            )),
             InjectedRecoveryOutcome::RecreateBackbuffer
         );
-        assert_eq!(harness.inject(InjectedFault::DeviceLost), InjectedRecoveryOutcome::RecreateRenderer);
-        assert_eq!(harness.inject(InjectedFault::DeviceLost), InjectedRecoveryOutcome::RecreateRenderer);
+        assert_eq!(
+            harness.inject(InjectedFault::DeviceLost),
+            InjectedRecoveryOutcome::RecreateRenderer
+        );
+        assert_eq!(
+            harness.inject(InjectedFault::DeviceLost),
+            InjectedRecoveryOutcome::RecreateRenderer
+        );
 
         assert_eq!(harness.renderer_recreate_count, 1);
         assert_eq!(harness.backbuffer_recreate_count, 1);
         assert_eq!(harness.skipped_frame_count, 1);
 
-        assert_eq!(harness.inject(InjectedFault::FrameAcquired), InjectedRecoveryOutcome::FrameAcquired);
-        assert_eq!(harness.inject(InjectedFault::DeviceLost), InjectedRecoveryOutcome::RecreateRenderer);
+        assert_eq!(
+            harness.inject(InjectedFault::FrameAcquired),
+            InjectedRecoveryOutcome::FrameAcquired
+        );
+        assert_eq!(
+            harness.inject(InjectedFault::DeviceLost),
+            InjectedRecoveryOutcome::RecreateRenderer
+        );
         assert_eq!(harness.renderer_recreate_count, 2);
     }
 
@@ -531,7 +601,10 @@ mod tests {
         ] {
             let mut harness = FaultRecoveryHarness::default();
 
-            assert_eq!(harness.inject(fault), InjectedRecoveryOutcome::RecreateRenderer);
+            assert_eq!(
+                harness.inject(fault),
+                InjectedRecoveryOutcome::RecreateRenderer
+            );
             assert_eq!(harness.renderer_recreate_count, 1);
             assert!(harness.renderer_recreate_pending);
         }
@@ -542,8 +615,14 @@ mod tests {
         let mut harness = FaultRecoveryHarness::default();
 
         let sequence = [
-            (InjectedFault::ZeroSizedSurface, InjectedRecoveryOutcome::WaitForResize),
-            (InjectedFault::BackbufferCreateFailed, InjectedRecoveryOutcome::SkipFrame),
+            (
+                InjectedFault::ZeroSizedSurface,
+                InjectedRecoveryOutcome::WaitForResize,
+            ),
+            (
+                InjectedFault::BackbufferCreateFailed,
+                InjectedRecoveryOutcome::SkipFrame,
+            ),
             (
                 InjectedFault::SurfaceAcquire(SurfaceAcquireFailure::Timeout),
                 InjectedRecoveryOutcome::SkipFrame,
@@ -556,8 +635,14 @@ mod tests {
                 InjectedFault::SurfaceAcquire(SurfaceAcquireFailure::Lost),
                 InjectedRecoveryOutcome::RecreateBackbuffer,
             ),
-            (InjectedFault::AcquirePanic, InjectedRecoveryOutcome::RecreateBackbuffer),
-            (InjectedFault::ConfigureFailed, InjectedRecoveryOutcome::SkipFrame),
+            (
+                InjectedFault::AcquirePanic,
+                InjectedRecoveryOutcome::RecreateBackbuffer,
+            ),
+            (
+                InjectedFault::ConfigureFailed,
+                InjectedRecoveryOutcome::SkipFrame,
+            ),
         ];
 
         for (fault, expected) in sequence {
