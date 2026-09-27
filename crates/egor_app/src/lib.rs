@@ -1,3 +1,5 @@
+#[cfg(not(any(target_arch = "wasm32", target_os = "ios", target_os = "android")))]
+mod desktop_frame_pacer;
 pub mod input;
 pub mod time;
 #[cfg(target_arch = "wasm32")]
@@ -229,6 +231,8 @@ pub struct AppRunner<R: 'static, H: AppHandler<R> + 'static> {
     timer: FrameTimer,
     #[cfg(target_arch = "wasm32")]
     web_frame_pacer: web_frame_pacer::WebFramePacer,
+    #[cfg(not(any(target_arch = "wasm32", target_os = "ios", target_os = "android")))]
+    desktop_frame_pacer: desktop_frame_pacer::DesktopFramePacer,
     config: AppConfig,
 }
 
@@ -238,6 +242,8 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
         self.timer.reset_next_update();
         #[cfg(target_arch = "wasm32")]
         self.web_frame_pacer.reset();
+        #[cfg(not(any(target_arch = "wasm32", target_os = "ios", target_os = "android")))]
+        self.desktop_frame_pacer.reset();
 
         if let (Some(window), Some(resource), Some(handler)) = (
             self.window.clone(),
@@ -315,6 +321,8 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
         self.timer.reset_next_update();
         #[cfg(target_arch = "wasm32")]
         self.web_frame_pacer.reset();
+        #[cfg(not(any(target_arch = "wasm32", target_os = "ios", target_os = "android")))]
+        self.desktop_frame_pacer.reset();
         self.input.force_release_all_input_state();
         if let Some(handler) = self.handler.as_mut() {
             handler.suspended();
@@ -391,6 +399,12 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
                     self.timer.reset_next_update();
                     #[cfg(target_arch = "wasm32")]
                     self.web_frame_pacer.reset();
+                    #[cfg(not(any(
+                        target_arch = "wasm32",
+                        target_os = "ios",
+                        target_os = "android"
+                    )))]
+                    self.desktop_frame_pacer.reset();
                 }
 
                 if recreate_window {
@@ -403,7 +417,16 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
                     return;
                 }
 
-                #[cfg(not(target_arch = "wasm32"))]
+                #[cfg(not(any(target_arch = "wasm32", target_os = "ios", target_os = "android")))]
+                if self.config.control_flow == ControlFlow::Poll {
+                    let interval = Self::poll_frame_interval_for_handler(handler, window);
+                    let deadline = self
+                        .desktop_frame_pacer
+                        .next_deadline(frame_started_at, interval);
+                    self.queued_poll_redraw = deadline.is_some();
+                    self.queued_poll_redraw_at = deadline;
+                }
+                #[cfg(any(target_os = "ios", target_os = "android"))]
                 if self.config.control_flow == ControlFlow::Poll {
                     if let Some(interval) = Self::poll_frame_interval_for_handler(handler, window) {
                         self.queued_poll_redraw = true;
@@ -422,6 +445,12 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
                 self.timer.reset_next_update();
                 #[cfg(target_arch = "wasm32")]
                 self.web_frame_pacer.reset();
+                #[cfg(not(any(
+                    target_arch = "wasm32",
+                    target_os = "ios",
+                    target_os = "android"
+                )))]
+                self.desktop_frame_pacer.reset();
                 if !focused {
                     self.input.force_release_all_input_state();
                 }
@@ -430,6 +459,12 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
                 self.timer.reset_next_update();
                 #[cfg(target_arch = "wasm32")]
                 self.web_frame_pacer.reset();
+                #[cfg(not(any(
+                    target_arch = "wasm32",
+                    target_os = "ios",
+                    target_os = "android"
+                )))]
+                self.desktop_frame_pacer.reset();
             }
             WindowEvent::KeyboardInput { event, .. } => self.input.update_key(event),
             WindowEvent::MouseInput { button, state, .. } => {
@@ -642,6 +677,8 @@ impl<R, H: AppHandler<R> + 'static> AppRunner<R, H> {
             timer: FrameTimer::default(),
             #[cfg(target_arch = "wasm32")]
             web_frame_pacer: web_frame_pacer::WebFramePacer::default(),
+            #[cfg(not(any(target_arch = "wasm32", target_os = "ios", target_os = "android")))]
+            desktop_frame_pacer: desktop_frame_pacer::DesktopFramePacer::default(),
             config,
         }
     }
@@ -718,6 +755,8 @@ impl<R, H: AppHandler<R> + 'static> AppRunner<R, H> {
         self.queued_poll_redraw_at = None;
         #[cfg(target_arch = "wasm32")]
         self.web_frame_pacer.reset();
+        #[cfg(not(any(target_arch = "wasm32", target_os = "ios", target_os = "android")))]
+        self.desktop_frame_pacer.reset();
         handler.before_resource_recreate();
         Some(handler)
     }
