@@ -446,7 +446,6 @@ pub struct App {
     surface_acquire_retry_interval: Option<Duration>,
     surface_recovery: SurfaceRecoveryState,
     waiting_for_surface_change: bool,
-    window_focused: bool,
     hidden_window: bool,
     surface_occluded: bool,
     app_suspended: bool,
@@ -495,7 +494,6 @@ impl App {
             surface_acquire_retry_interval: None,
             surface_recovery: SurfaceRecoveryState::new(),
             waiting_for_surface_change: false,
-            window_focused: true,
             hidden_window: false,
             surface_occluded: false,
             app_suspended: false,
@@ -961,7 +959,6 @@ impl AppHandler<Renderer> for App {
     fn on_window_event(&mut self, _window: &Window, event: &WindowEvent) {
         match event {
             WindowEvent::Focused(focused) => {
-                self.window_focused = *focused;
                 if *focused {
                     #[cfg(not(target_os = "android"))]
                     {
@@ -1101,14 +1098,10 @@ impl AppHandler<Renderer> for App {
                 self.vsync,
             )
         });
-        // Visible desktop/web windows keep their normal frame rate when focus
-        // moves elsewhere (including to an HTML input). Preserve mobile focus
-        // throttling; occlusion and minimized/suspended handling still save power.
-        let focus_throttled =
-            cfg!(any(target_os = "android", target_os = "ios")) && !self.window_focused;
-        let background_interval = (!self.hidden_window
-            && (focus_throttled || self.surface_occluded))
-            .then_some(Duration::from_millis(100));
+        // Focus loss alone never throttles rendering. Hidden/occluded windows
+        // and the existing minimized/suspended paths handle background power saving.
+        let background_interval =
+            (!self.hidden_window && self.surface_occluded).then_some(Duration::from_millis(100));
 
         max_frame_interval(
             max_frame_interval(self.surface_acquire_retry_interval, fps_limit_interval),
