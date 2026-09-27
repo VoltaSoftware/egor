@@ -3329,12 +3329,27 @@ impl<'a> Graphics<'a> {
     /// Create a managed offscreen render target and return its store index.
     /// Also registers it as a drawable texture, returning `(store_id, egor_texture_id)`.
     pub fn create_managed_render_target(&mut self, width: u32, height: u32) -> (usize, usize) {
+        self.create_managed_render_target_with_filter(
+            width,
+            height,
+            egor_render::wgpu::FilterMode::Linear,
+        )
+    }
+
+    /// Create a drawable render target with an explicit sampling filter.
+    /// Use nearest-neighbor for pixel-art UI and linear for smoothly scaled imagery.
+    pub fn create_managed_render_target_with_filter(
+        &mut self,
+        width: u32,
+        height: u32,
+        filter: egor_render::wgpu::FilterMode,
+    ) -> (usize, usize) {
         let store_id =
             self.render_targets
                 .create(self.renderer.device(), width, height, self.target_format);
         let tex_id = self
             .renderer
-            .add_offscreen_texture(self.render_targets.get_mut(store_id));
+            .add_offscreen_texture_with_filter(self.render_targets.get_mut(store_id), filter);
         (store_id, tex_id)
     }
 
@@ -3346,10 +3361,26 @@ impl<'a> Graphics<'a> {
         width: u32,
         height: u32,
     ) -> usize {
+        self.resize_managed_render_target_with_filter(
+            store_id,
+            width,
+            height,
+            egor_render::wgpu::FilterMode::Linear,
+        )
+    }
+
+    /// Resize and re-register a render target with an explicit sampling filter.
+    pub fn resize_managed_render_target_with_filter(
+        &mut self,
+        store_id: usize,
+        width: u32,
+        height: u32,
+        filter: egor_render::wgpu::FilterMode,
+    ) -> usize {
         self.render_targets
             .resize(self.renderer.device(), store_id, width, height);
         self.renderer
-            .add_offscreen_texture(self.render_targets.get_mut(store_id))
+            .add_offscreen_texture_with_filter(self.render_targets.get_mut(store_id), filter)
     }
 
     /// Direct subsequent draw commands to a managed offscreen render target.

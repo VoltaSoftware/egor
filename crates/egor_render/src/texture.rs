@@ -500,13 +500,21 @@ impl Textures {
         id
     }
 
-    pub fn insert_offscreen(&mut self, device: &Device, offscreen: &OffscreenTarget) -> usize {
+    pub fn insert_offscreen(
+        &mut self,
+        device: &Device,
+        offscreen: &OffscreenTarget,
+        filter: FilterMode,
+    ) -> usize {
         let id = self.store.len();
         self.store.push(Texture::from_view(
             offscreen.texture(),
             device,
             &self.layouts[0],
-            &self.default_sampler,
+            match filter {
+                FilterMode::Nearest => &self.nearest_sampler,
+                FilterMode::Linear => &self.default_sampler,
+            },
         ));
         id
     }
