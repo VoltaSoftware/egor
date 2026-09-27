@@ -3224,6 +3224,10 @@ impl<'a> Graphics<'a> {
     ///
     /// Returns a texture ID that can be used with `.texture(id)` on primitives.
     /// Typically called once during initialization (when `timer.frame == 0`).
+    pub fn linear_texture_variant(&mut self, id: usize) -> usize {
+        self.renderer.linear_texture_variant(id)
+    }
+
     pub fn load_texture(&mut self, data: &[u8]) -> usize {
         self.renderer.add_texture(data)
     }

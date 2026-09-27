@@ -1296,6 +1296,11 @@ impl Renderer {
             .insert_offscreen(&self.gpu.device, offscreen, filter)
     }
 
+    /// Return a cached linear-filtered binding without modifying the source texture.
+    pub fn linear_texture_variant(&mut self, id: usize) -> usize {
+        self.textures.linear_variant(&self.gpu.device, id)
+    }
+
     /// Adds a new texture from image bytes & returns its id
     pub fn add_texture(&mut self, data: &[u8]) -> usize {
         self.textures
