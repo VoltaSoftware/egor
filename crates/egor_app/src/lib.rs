@@ -517,12 +517,20 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
             }
         } else if self.config.control_flow == ControlFlow::Poll {
             let poll_frame_interval = self.poll_frame_interval();
-            if poll_frame_interval.is_none()
-                && should_request_poll_redraw_manually()
+            if should_request_poll_redraw_manually()
                 && let Some(window) = &self.window
             {
-                window.request_redraw();
-                event_loop.set_control_flow(ControlFlow::Wait);
+                if let Some(interval) = poll_frame_interval {
+                    // A timer wakeup does not request a redraw. Retain its deadline
+                    // so the queued path above requests a frame when it expires.
+                    let redraw_at = Instant::now() + interval;
+                    self.queued_poll_redraw = true;
+                    self.queued_poll_redraw_at = Some(redraw_at);
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(redraw_at));
+                } else {
+                    window.request_redraw();
+                    event_loop.set_control_flow(ControlFlow::Wait);
+                }
             } else {
                 event_loop.set_control_flow(platform_control_flow(
                     self.config.control_flow,

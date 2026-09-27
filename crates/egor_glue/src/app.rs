@@ -1101,8 +1101,12 @@ impl AppHandler<Renderer> for App {
                 self.vsync,
             )
         });
+        // On web, focus belongs to the canvas: typing into an HTML input blurs
+        // it without backgrounding the page. Winit reports page visibility via
+        // Occluded, so only native windows should throttle on focus loss.
+        let focus_throttled = !cfg!(target_arch = "wasm32") && !self.window_focused;
         let background_interval = (!self.hidden_window
-            && (!self.window_focused || self.surface_occluded))
+            && (focus_throttled || self.surface_occluded))
             .then_some(Duration::from_millis(100));
 
         max_frame_interval(
