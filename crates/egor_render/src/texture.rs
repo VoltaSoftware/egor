@@ -24,6 +24,8 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
 /// Wraps a `wgpu::Texture`, its view, sampler, & bind group
 pub(crate) struct Texture {
     bind_group: BindGroup,
+    view: TextureView,
+    linear_variant: Option<usize>,
     is_array: bool,
 }
 
@@ -255,6 +257,8 @@ impl Texture {
 
         Self {
             bind_group: Self::create_bind_group(device, layout, &view, sampler),
+            view,
+            linear_variant: None,
             is_array: layers > 1,
         }
     }
@@ -285,6 +289,8 @@ impl Texture {
         let view = texture.create_view(&Default::default());
         Self {
             bind_group: Self::create_bind_group(device, layout, &view, sampler),
+            view,
+            linear_variant: None,
             is_array: false,
         }
     }
@@ -356,6 +362,30 @@ impl Textures {
             default_texture,
             store: Vec::new(),
         }
+    }
+
+    /// Cache another binding to the same GPU image, without changing the original
+    /// sampler or duplicating pixel storage. A different ID also splits draw batches.
+    pub fn linear_variant(&mut self, device: &Device, id: usize) -> usize {
+        if let Some(variant) = self.store[id].linear_variant {
+            return variant;
+        }
+        let source = &self.store[id];
+        let variant_id = self.store.len();
+        let variant = Texture {
+            bind_group: Texture::create_bind_group(
+                device,
+                &self.layouts[usize::from(source.is_array)],
+                &source.view,
+                &self.default_sampler,
+            ),
+            view: source.view.clone(),
+            linear_variant: Some(variant_id),
+            is_array: source.is_array,
+        };
+        self.store[id].linear_variant = Some(variant_id);
+        self.store.push(variant);
+        variant_id
     }
 
     fn decode_rgba(data: &[u8]) -> (u32, u32, image::RgbaImage) {
@@ -500,13 +530,21 @@ impl Textures {
         id
     }
 
-    pub fn insert_offscreen(&mut self, device: &Device, offscreen: &OffscreenTarget) -> usize {
+    pub fn insert_offscreen(
+        &mut self,
+        device: &Device,
+        offscreen: &OffscreenTarget,
+        filter: FilterMode,
+    ) -> usize {
         let id = self.store.len();
         self.store.push(Texture::from_view(
             offscreen.texture(),
             device,
             &self.layouts[0],
-            &self.default_sampler,
+            match filter {
+                FilterMode::Nearest => &self.nearest_sampler,
+                FilterMode::Linear => &self.default_sampler,
+            },
         ));
         id
     }

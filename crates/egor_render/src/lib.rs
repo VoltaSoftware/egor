@@ -1283,7 +1283,22 @@ impl Renderer {
 
     /// Adds an offscreen target texture & returns its id
     pub fn add_offscreen_texture(&mut self, offscreen: &mut OffscreenTarget) -> usize {
-        self.textures.insert_offscreen(&self.gpu.device, offscreen)
+        self.add_offscreen_texture_with_filter(offscreen, wgpu::FilterMode::Linear)
+    }
+
+    /// Adds an offscreen texture with an explicit sampling filter.
+    pub fn add_offscreen_texture_with_filter(
+        &mut self,
+        offscreen: &mut OffscreenTarget,
+        filter: wgpu::FilterMode,
+    ) -> usize {
+        self.textures
+            .insert_offscreen(&self.gpu.device, offscreen, filter)
+    }
+
+    /// Return a cached linear-filtered binding without modifying the source texture.
+    pub fn linear_texture_variant(&mut self, id: usize) -> usize {
+        self.textures.linear_variant(&self.gpu.device, id)
     }
 
     /// Adds a new texture from image bytes & returns its id

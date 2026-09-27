@@ -74,6 +74,7 @@ pub mod render {
         primitives::{Anchor, BorderRadii},
         text::Align,
     };
+    pub use egor_render::wgpu::FilterMode;
     pub use egor_render::{
         MemoryHints, RendererBackendPreference, prepare_texture_shader,
         target::{OffscreenTarget, RenderTarget},
