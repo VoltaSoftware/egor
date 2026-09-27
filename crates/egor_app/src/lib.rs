@@ -1,5 +1,7 @@
 pub mod input;
 pub mod time;
+#[cfg(target_arch = "wasm32")]
+mod web_frame_pacer;
 
 #[cfg(all(
     target_os = "android",
@@ -225,6 +227,8 @@ pub struct AppRunner<R: 'static, H: AppHandler<R> + 'static> {
     queued_poll_redraw_at: Option<Instant>,
     input: Input,
     timer: FrameTimer,
+    #[cfg(target_arch = "wasm32")]
+    web_frame_pacer: web_frame_pacer::WebFramePacer,
     config: AppConfig,
 }
 
@@ -232,6 +236,8 @@ pub struct AppRunner<R: 'static, H: AppHandler<R> + 'static> {
 impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, H> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         self.timer.reset_next_update();
+        #[cfg(target_arch = "wasm32")]
+        self.web_frame_pacer.reset();
 
         if let (Some(window), Some(resource), Some(handler)) = (
             self.window.clone(),
@@ -307,6 +313,8 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
         self.timer.reset_next_update();
+        #[cfg(target_arch = "wasm32")]
+        self.web_frame_pacer.reset();
         self.input.force_release_all_input_state();
         if let Some(handler) = self.handler.as_mut() {
             handler.suspended();
@@ -343,6 +351,19 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
                     return;
                 };
 
+                #[cfg(target_arch = "wasm32")]
+                if self.config.control_flow == ControlFlow::Poll
+                    && !self.web_frame_pacer.should_render(
+                        Instant::now(),
+                        Self::poll_frame_interval_for_handler(handler, window),
+                    )
+                {
+                    // Keep pending input and the last accepted frame timestamp.
+                    // about_to_wait queues the next browser animation frame.
+                    return;
+                }
+
+                #[cfg(not(target_arch = "wasm32"))]
                 if self.config.control_flow == ControlFlow::Poll
                     && self.queued_poll_redraw
                     && let Some(redraw_at) = self.queued_poll_redraw_at
@@ -357,6 +378,7 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
                     self.queued_poll_redraw_at = None;
                 }
 
+                #[cfg(not(target_arch = "wasm32"))]
                 let frame_started_at = Instant::now();
                 self.timer.update();
                 handler.frame(window, resource, &mut self.input, &self.timer);
@@ -367,6 +389,8 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
 
                 if reset_frame_timer {
                     self.timer.reset_next_update();
+                    #[cfg(target_arch = "wasm32")]
+                    self.web_frame_pacer.reset();
                 }
 
                 if recreate_window {
@@ -379,6 +403,7 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
                     return;
                 }
 
+                #[cfg(not(target_arch = "wasm32"))]
                 if self.config.control_flow == ControlFlow::Poll {
                     if let Some(interval) = Self::poll_frame_interval_for_handler(handler, window) {
                         self.queued_poll_redraw = true;
@@ -395,12 +420,16 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
             }
             WindowEvent::Focused(focused) => {
                 self.timer.reset_next_update();
+                #[cfg(target_arch = "wasm32")]
+                self.web_frame_pacer.reset();
                 if !focused {
                     self.input.force_release_all_input_state();
                 }
             }
             WindowEvent::Occluded(_) => {
                 self.timer.reset_next_update();
+                #[cfg(target_arch = "wasm32")]
+                self.web_frame_pacer.reset();
             }
             WindowEvent::KeyboardInput { event, .. } => self.input.update_key(event),
             WindowEvent::MouseInput { button, state, .. } => {
@@ -436,6 +465,7 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
 
         handler.on_ready(window, &mut resource);
         self.timer.reset_next_update();
+        #[cfg(not(target_arch = "wasm32"))]
         let frame_started_at = Instant::now();
         #[cfg(not(target_os = "android"))]
         handler.frame(window, &mut resource, &mut self.input, &self.timer);
@@ -457,6 +487,7 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
             return;
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
         if self.config.control_flow == ControlFlow::Poll {
             if let Some(interval) = Self::poll_frame_interval_for_handler(&handler, window) {
                 self.queued_poll_redraw = true;
@@ -470,6 +501,8 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
 
         self.resource = Some(resource);
         self.handler = Some(handler);
+        #[cfg(target_arch = "wasm32")]
+        window.request_redraw();
     }
 
     fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
@@ -479,6 +512,21 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(target_arch = "wasm32")]
+        if self.config.control_flow == ControlFlow::Poll {
+            if self.resource.is_some() {
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            // request_redraw is rAF on web. Wait for it instead of scheduling
+            // an additional timer or polling the browser's main thread.
+            event_loop.set_control_flow(ControlFlow::Wait);
+            if let Some(handler) = self.handler.as_mut() {
+                handler.about_to_wait();
+            }
+            return;
+        }
         // Invisible Win32 windows do not receive WM_PAINT. Drive the same
         // paced frame path explicitly without ever showing/activating them.
         if !self.config.visible
@@ -592,6 +640,8 @@ impl<R, H: AppHandler<R> + 'static> AppRunner<R, H> {
             queued_poll_redraw_at: None,
             input,
             timer: FrameTimer::default(),
+            #[cfg(target_arch = "wasm32")]
+            web_frame_pacer: web_frame_pacer::WebFramePacer::default(),
             config,
         }
     }
@@ -666,6 +716,8 @@ impl<R, H: AppHandler<R> + 'static> AppRunner<R, H> {
         self.resource = None;
         self.queued_poll_redraw = false;
         self.queued_poll_redraw_at = None;
+        #[cfg(target_arch = "wasm32")]
+        self.web_frame_pacer.reset();
         handler.before_resource_recreate();
         Some(handler)
     }
