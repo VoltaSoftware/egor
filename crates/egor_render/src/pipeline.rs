@@ -31,7 +31,7 @@ fn egor_linear_to_srgb(color: vec4<f32>) -> vec4<f32> {
 }
 "#;
 
-fn surface_needs_srgb_encode(surface_format: TextureFormat) -> bool {
+pub(crate) fn surface_needs_srgb_encode(surface_format: TextureFormat) -> bool {
     surface_format.add_srgb_suffix() != surface_format
 }
 
@@ -153,6 +153,18 @@ fn wrap_custom_shader_for_srgb_output(wgsl_source: &str) -> Cow<'_, str> {
     Cow::Owned(wrapped)
 }
 
+/// The WGSL egor compiles for a custom shader's normal pipeline on `surface_format`.
+pub(crate) fn custom_shader_source(
+    wgsl_source: &str,
+    surface_format: TextureFormat,
+) -> Cow<'_, str> {
+    if surface_needs_srgb_encode(surface_format) {
+        wrap_custom_shader_for_srgb_output(wgsl_source)
+    } else {
+        Cow::Borrowed(wgsl_source)
+    }
+}
+
 fn first_fragment_argument_name(params: &str) -> Option<String> {
     let first = params
         .split(',')
@@ -162,7 +174,7 @@ fn first_fragment_argument_name(params: &str) -> Option<String> {
     Some(name.trim().to_owned())
 }
 
-fn wrap_custom_shader_for_watch_output(
+pub(crate) fn wrap_custom_shader_for_watch_output(
     wgsl_source: &str,
     encode_srgb: bool,
 ) -> Option<Cow<'_, str>> {
@@ -712,11 +724,7 @@ fn create_custom_pipeline(
     extra_layouts: &[&BindGroupLayout],
     wgsl_source: &str,
 ) -> RenderPipeline {
-    let wgsl_source = if surface_needs_srgb_encode(surface_format) {
-        wrap_custom_shader_for_srgb_output(wgsl_source)
-    } else {
-        Cow::Borrowed(wgsl_source)
-    };
+    let wgsl_source = custom_shader_source(wgsl_source, surface_format);
     let shader = device.create_shader_module(ShaderModuleDescriptor {
         label: Some("Custom Shader"),
         source: ShaderSource::Wgsl(wgsl_source),

@@ -5,6 +5,8 @@ pub mod frame;
 pub mod instance;
 mod instance_upload;
 mod pipeline;
+#[cfg(feature = "shader-check")]
+pub mod shader_check;
 pub mod target;
 mod texture;
 mod uniforms;
