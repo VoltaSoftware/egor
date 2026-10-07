@@ -13,7 +13,6 @@ use naga::back::{glsl, hlsl, msl, spv};
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 use wgpu::{Device, DeviceDescriptor, Limits, TextureFormat};
 
-use crate::REQUIRED_MAX_TEXTURE_DIMENSION_2D;
 use crate::pipeline::{
     Pipelines, custom_shader_source, surface_needs_srgb_encode, wrap_custom_shader_for_watch_output,
 };
@@ -27,10 +26,8 @@ const SURFACE_FORMATS: [TextureFormat; 2] =
 /// uniform buffers of `uniform_sizes` bytes, bound from `@group(2)` up. An empty list means the shader is
 /// valid everywhere.
 pub fn check_custom_shader(wgsl_source: &str, uniform_sizes: &[u64]) -> Vec<String> {
-    let mut required_limits = Limits::downlevel_webgl2_defaults();
-    required_limits.max_texture_dimension_2d = REQUIRED_MAX_TEXTURE_DIMENSION_2D;
     let (device, _queue) = Device::noop(&DeviceDescriptor {
-        required_limits,
+        required_limits: Limits::downlevel_webgl2_defaults(),
         ..Default::default()
     });
     let wgpu_errors = Arc::new(Mutex::new(Vec::new()));
