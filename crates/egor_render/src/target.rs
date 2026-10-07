@@ -18,6 +18,18 @@ const DESIRED_MAXIMUM_FRAME_LATENCY: u32 = 1;
 #[cfg(not(target_os = "android"))]
 const DESIRED_MAXIMUM_FRAME_LATENCY: u32 = 2;
 
+/// The largest size with the same aspect ratio that `device` can render to. A window bigger than the
+/// GPU's texture limit renders at this lower resolution and is scaled up to fill the window.
+pub fn fit_to_texture_limit(device: &Device, w: u32, h: u32) -> (u32, u32) {
+    let max = device.limits().max_texture_dimension_2d;
+    if w <= max && h <= max {
+        return (w, h);
+    }
+    let scale = f64::from(max) / f64::from(w.max(h));
+    let fit = |side: u32| ((f64::from(side) * scale) as u32).clamp(1, max);
+    (fit(w), fit(h))
+}
+
 #[cfg(target_os = "android")]
 fn vsync_present_mode() -> PresentMode {
     PresentMode::AutoVsync
@@ -223,6 +235,8 @@ pub struct Backbuffer {
     view_format: TextureFormat,
     surface_copy_src: bool,
     last_acquire_failure: Option<SurfaceAcquireFailure>,
+    /// The size the surface was asked for; the config holds it fitted to the texture limit.
+    window_size: (u32, u32),
 }
 
 impl Backbuffer {
@@ -261,8 +275,9 @@ impl Backbuffer {
         h: u32,
     ) -> Result<Self, BackbufferError> {
         log::info!("[egor] backbuffer init: building surface config");
+        let (fit_w, fit_h) = fit_to_texture_limit(device, w, h);
         let (config, view_format, surface_copy_src) =
-            surface_config_with_android_gl_fallback(&surface, adapter, w, h)?;
+            surface_config_with_android_gl_fallback(&surface, adapter, fit_w, fit_h)?;
         if cfg!(debug_assertions) {
             log::info!(
                 "[egor] backbuffer init: configuring surface format={:?} view_format={:?} present_mode={:?} frame_latency={} usage={:?} copy_src={}",
@@ -282,7 +297,15 @@ impl Backbuffer {
             view_format,
             surface_copy_src,
             last_acquire_failure: None,
+            window_size: (w, h),
         })
+    }
+
+    /// Drawn pixels per window pixel: 1 normally, below 1 when the window is bigger than the GPU's texture
+    /// limit and the frame is scaled up to fill it. Multiply the window's scale factor by this to get
+    /// drawn pixels per logical pixel.
+    pub fn render_scale(&self) -> f32 {
+        self.config.width as f32 / self.window_size.0.max(1) as f32
     }
 
     pub fn supports_copy_src(&self) -> bool {
@@ -378,6 +401,14 @@ impl RenderTarget for Backbuffer {
                 let (cw, ch) = canvas;
                 if cw > 0 && ch > 0 && (cw != self.config.width || ch != self.config.height) {
                     self.resize(device, cw, ch);
+                    // A size fitted to the texture limit can match the current config; configure
+                    // again so the canvas backing store matches the frame instead of showing it in
+                    // a corner.
+                    if (cw, ch) != self.size()
+                        && let Err(error) = self.reconfigure(device)
+                    {
+                        log::warn!("[egor] surface canvas configure failed: {error:?}");
+                    }
                 }
             }
         }
@@ -394,7 +425,7 @@ impl RenderTarget for Backbuffer {
             }
             CurrentSurfaceTexture::Outdated => {
                 self.record_acquire_failure(SurfaceAcquireFailure::Outdated);
-                self.resize(device, self.config.width, self.config.height);
+                self.resize(device, self.window_size.0, self.window_size.1);
                 None
             }
             CurrentSurfaceTexture::Lost => {
@@ -426,10 +457,12 @@ impl RenderTarget for Backbuffer {
         if w == 0 || h == 0 {
             return;
         }
-        if self.config.width == w && self.config.height == h {
+        self.window_size = (w, h);
+        let (fit_w, fit_h) = fit_to_texture_limit(device, w, h);
+        if self.config.width == fit_w && self.config.height == fit_h {
             return;
         }
-        (self.config.width, self.config.height) = (w, h);
+        (self.config.width, self.config.height) = (fit_w, fit_h);
         if let Err(error) = self.reconfigure(device) {
             log::warn!("[egor] surface resize configure failed: {error:?}");
         }
@@ -589,5 +622,22 @@ impl RenderTarget for OffscreenTarget {
         }
         // recreate the texture with new dimensions
         *self = Self::new(device, w, h, self.format);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit_to_texture_limit;
+
+    #[test]
+    fn fits_windows_beyond_the_texture_limit_keeping_aspect_ratio() {
+        let (device, _queue) = wgpu::Device::noop(&wgpu::DeviceDescriptor {
+            required_limits: wgpu::Limits::downlevel_webgl2_defaults(),
+            ..Default::default()
+        });
+        assert_eq!(fit_to_texture_limit(&device, 1920, 1080), (1920, 1080));
+        assert_eq!(fit_to_texture_limit(&device, 2048, 2048), (2048, 2048));
+        assert_eq!(fit_to_texture_limit(&device, 2560, 1440), (2048, 1152));
+        assert_eq!(fit_to_texture_limit(&device, 1440, 3200), (921, 2048));
     }
 }
