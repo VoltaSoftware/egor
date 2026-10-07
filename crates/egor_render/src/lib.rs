@@ -116,10 +116,6 @@ pub enum RendererInitError {
     CreateSurface(String),
     RequestAdapter(String),
     RequestDevice(String),
-    AdapterLimit {
-        max_texture_dimension_2d: u32,
-        required: u32,
-    },
     SurfaceConfig(target::BackbufferError),
 }
 
@@ -131,13 +127,6 @@ impl std::fmt::Display for RendererInitError {
             }
             Self::RequestAdapter(error) => write!(f, "failed to request GPU adapter: {error}"),
             Self::RequestDevice(error) => write!(f, "failed to request GPU device: {error}"),
-            Self::AdapterLimit {
-                max_texture_dimension_2d,
-                required,
-            } => write!(
-                f,
-                "adapter max_texture_dimension_2d {max_texture_dimension_2d} is below required {required}"
-            ),
             Self::SurfaceConfig(error) => write!(f, "failed to determine surface config: {error}"),
         }
     }
@@ -174,8 +163,6 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
         .or_else(|| payload.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "unknown panic".to_string())
 }
-
-const REQUIRED_MAX_TEXTURE_DIMENSION_2D: u32 = 4096;
 
 fn format_supports_usages(adapter: &Adapter, format: TextureFormat, usages: TextureUsages) -> bool {
     adapter
@@ -363,20 +350,11 @@ impl Renderer {
         };
 
         let adapter_limits = adapter.limits();
-        if adapter_limits.max_texture_dimension_2d < REQUIRED_MAX_TEXTURE_DIMENSION_2D {
-            return Err(RendererInitError::AdapterLimit {
-                max_texture_dimension_2d: adapter_limits.max_texture_dimension_2d,
-                required: REQUIRED_MAX_TEXTURE_DIMENSION_2D,
-            });
-        }
         #[cfg(target_arch = "wasm32")]
-        let mut required_limits =
-            wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter_limits.clone());
+        let required_limits =
+            wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter_limits);
         #[cfg(not(target_arch = "wasm32"))]
-        let mut required_limits = adapter_limits;
-        required_limits.max_texture_dimension_2d = required_limits
-            .max_texture_dimension_2d
-            .max(REQUIRED_MAX_TEXTURE_DIMENSION_2D);
+        let required_limits = adapter_limits;
         log::info!("[egor] renderer init: requesting device");
         let (device, queue) = adapter
             .request_device(&DeviceDescriptor {
