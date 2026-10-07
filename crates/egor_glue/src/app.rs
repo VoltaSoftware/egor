@@ -292,6 +292,7 @@ pub struct AppControl<'a> {
     requested_native_refresh_rate_fps: Option<Option<u16>>,
     requested_renderer_backend: Option<RendererBackendPreference>,
     gpu_device_recreated: bool,
+    render_scale: f32,
 }
 
 impl<'a> AppControl<'a> {
@@ -370,6 +371,13 @@ impl<'a> AppControl<'a> {
     /// Returns the window's DPI scale factor
     pub fn scale_factor(&self) -> f64 {
         self.window.scale_factor()
+    }
+
+    /// Drawn pixels per logical pixel. Equals [`Self::scale_factor`] unless the window is bigger than
+    /// the GPU can render, in which case the frame is drawn smaller and scaled up to fill the window.
+    /// Use this, not [`Self::scale_factor`], to convert between logical and drawn pixels.
+    pub fn render_scale_factor(&self) -> f64 {
+        self.window.scale_factor() * f64::from(self.render_scale)
     }
 }
 
@@ -855,9 +863,13 @@ impl App {
 
         self.backbuffer = Some(backbuffer);
         self.waiting_for_surface_change = false;
-        renderer.ensure_depth_size(size.width, size.height);
+        let (w, h) = self
+            .backbuffer
+            .as_ref()
+            .map_or((size.width, size.height), |b| b.size());
+        renderer.ensure_depth_size(w, h);
         if let Some(text_renderer) = self.text_renderer.as_mut() {
-            text_renderer.resize(size.width, size.height, renderer.queue());
+            text_renderer.resize(w, h, renderer.queue());
         }
 
         log::warn!(
@@ -1076,7 +1088,12 @@ impl AppHandler<Renderer> for App {
         self.text_renderer = Some(TextRenderer::new(device, renderer.queue(), format));
         if self.prewarm_watch_capture && renderer.supports_watch_overlay_capture() {
             let size = window_surface_size(window);
-            self.prepare_watch_renderer(renderer, format, size.width.max(1), size.height.max(1));
+            let (w, h) = egor_render::target::fit_to_texture_limit(
+                renderer.device(),
+                size.width.max(1),
+                size.height.max(1),
+            );
+            self.prepare_watch_renderer(renderer, format, w, h);
         }
         if let Some(fps_limit) = self.fps_limit {
             set_native_preferred_fps(window, fps_limit);
@@ -1252,6 +1269,7 @@ impl AppHandler<Renderer> for App {
 
         let (w, h) = backbuffer.size();
         renderer.ensure_depth_size(w, h);
+        let render_scale = backbuffer.render_scale();
         let (device, queue) = (renderer.device().clone(), renderer.queue().clone());
         let format = backbuffer.format();
         let text_renderer = self.text_renderer.as_mut().unwrap();
@@ -1279,6 +1297,7 @@ impl AppHandler<Renderer> for App {
                     requested_native_refresh_rate_fps: None,
                     requested_renderer_backend: None,
                     gpu_device_recreated,
+                    render_scale,
                 },
                 gfx: Graphics::new(
                     renderer,
@@ -2049,6 +2068,8 @@ impl AppHandler<Renderer> for App {
         if let Some(backbuffer) = self.backbuffer.as_mut() {
             backbuffer.resize(renderer.device(), w, h);
         }
+        // The backbuffer fits the window to the texture limit; size everything else to match it.
+        let (w, h) = self.backbuffer.as_ref().map_or((w, h), |b| b.size());
         renderer.ensure_depth_size(w, h);
         if let Some(text_renderer) = self.text_renderer.as_mut() {
             text_renderer.resize(w, h, renderer.queue());
