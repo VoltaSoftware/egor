@@ -14,9 +14,12 @@ webgl = ["wgpu/webgl"]
 angle = ["wgpu/angle"]
 gles = ["wgpu/gles"]
 vulkan = ["wgpu/vulkan"]
+# Offline custom shader checks for asset tooling, see `shader_check`.
+shader-check = ["dep:naga", "wgpu/noop", "wgpu/wgsl"]
 
 [dependencies]
 bytemuck = "1.25.2"
+naga = { version = "30.0.1", optional = true, default-features = false, features = ["wgsl-in", "spv-out", "glsl-out", "msl-out", "hlsl-out"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 log = "0.4"
 
