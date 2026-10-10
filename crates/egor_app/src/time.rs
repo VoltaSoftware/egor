@@ -135,6 +135,10 @@ pub struct FrameTimer {
     frame_count: u32,
     /// Time in seconds since the last frame
     pub delta: f32,
+    /// How long this frame stayed on screen as far as the CPU can tell, for FPS statistics:
+    /// whole display refreshes under vsync, the measured interval otherwise. Advance the game
+    /// with `delta`, which also carries vsync catch-up.
+    pub frame_time: f32,
     /// Frames per second, updated once per second
     pub fps: u32,
     /// Total number of frames rendered since start
@@ -156,6 +160,7 @@ impl Default for FrameTimer {
             accumulator: 0.0,
             frame_count: 0,
             delta: 0.0,
+            frame_time: 0.0,
             fps: 0,
             frame: 0,
         }
@@ -174,6 +179,7 @@ impl FrameTimer {
 
     fn reset_stats_after_discontinuity(&mut self) {
         self.delta = 0.0;
+        self.frame_time = 0.0;
         self.accumulator = 0.0;
         self.frame_count = 0;
     }
@@ -201,13 +207,18 @@ impl FrameTimer {
             measured
         };
 
-        self.delta = match pacing {
+        (self.delta, self.frame_time) = match pacing {
             FramePacing::Vsync { refresh_hz } if !reset && refresh_hz > 0.0 => {
-                self.vsync_clock.delta(measured, refresh_hz) as f32
+                let step = self.vsync_clock.delta(measured, refresh_hz);
+                // Vsync keeps every frame on screen for whole refreshes; the clock's catch-up is
+                // not screen time.
+                let shown = (step * refresh_hz).round().max(1.0) / refresh_hz;
+                (step as f32, shown as f32)
             }
             _ => {
                 self.vsync_clock.restart();
-                if reset { 0.0 } else { measured as f32 }
+                let delta = if reset { 0.0 } else { measured as f32 };
+                (delta, delta)
             }
         };
 
