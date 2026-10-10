@@ -111,7 +111,7 @@ fn refresh_rate_fps(window: &Window, native_refresh_rate_fps: Option<u16>) -> Op
     })
 }
 
-/// The rate frames arrive at under vsync, as a hint for locking frame deltas to it.
+/// The rate frames arrive at under vsync, as the OS reports it.
 fn vsync_refresh_hz(
     window: &Window,
     native_refresh_rate_fps: Option<u16>,
@@ -1151,14 +1151,16 @@ impl AppHandler<Renderer> for App {
     }
 
     fn frame_pacing(&self, window: &Window) -> FramePacing {
-        // A software FPS cap, surface retries and occlusion set frame times themselves.
+        // A software FPS cap, surface retries and occlusion set frame times themselves. Without a
+        // refresh rate from the OS (browsers do not report one) the measured time is used.
         if !hardware_vsync_enabled(self.vsync, self.fps_limit)
             || self.poll_frame_interval(window).is_some()
         {
             return FramePacing::Unlocked;
         }
-        FramePacing::Vsync {
-            refresh_hz: vsync_refresh_hz(window, self.native_refresh_rate_fps, self.fps_limit),
+        match vsync_refresh_hz(window, self.native_refresh_rate_fps, self.fps_limit) {
+            Some(refresh_hz) => FramePacing::Vsync { refresh_hz },
+            None => FramePacing::Unlocked,
         }
     }
 
