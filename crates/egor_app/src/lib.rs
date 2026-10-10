@@ -13,7 +13,10 @@ compile_error!(
     "On Android, enable either the `android-native-activity` or `android-game-activity` feature for egor_app"
 );
 
-use crate::{input::Input, time::FrameTimer};
+use crate::{
+    input::Input,
+    time::{FramePacing, FrameTimer},
+};
 use std::sync::Arc;
 use web_time::{Duration, Instant};
 #[cfg(target_os = "android")]
@@ -203,6 +206,11 @@ pub trait AppHandler<R> {
     fn poll_frame_interval(&self, _window: &Window) -> Option<Duration> {
         None
     }
+    /// How presented frames are paced, which decides whether frame deltas lock to the display
+    /// refresh. See [`FramePacing`].
+    fn frame_pacing(&self, _window: &Window) -> FramePacing {
+        FramePacing::Unlocked
+    }
     /// Called when the event loop is shutting down
     fn exiting(&mut self) {}
     /// Called when the OS signals memory pressure (mobile platforms)
@@ -388,7 +396,7 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
 
                 #[cfg(not(target_arch = "wasm32"))]
                 let frame_started_at = Instant::now();
-                self.timer.update();
+                self.timer.update(handler.frame_pacing(window));
                 handler.frame(window, resource, &mut self.input, &self.timer);
                 let recreate_window = handler.window_recreate_requested();
                 let recreate_resource = handler.resource_recreate_requested();
