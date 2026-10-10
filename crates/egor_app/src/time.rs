@@ -76,66 +76,95 @@ pub enum FramePacing {
 
 const COMMON_REFRESH_HZ: [f64; 8] = [60.0, 75.0, 90.0, 100.0, 120.0, 144.0, 165.0, 240.0];
 /// Frames averaged to measure the exact refresh period (about two seconds at 120 Hz).
-const PERIOD_AVERAGE_FRAMES: f64 = 256.0;
+const PERIOD_AVERAGE_FRAMES: u32 = 256;
 const SETTLE_FRAMES: u32 = 30;
 /// The measured frame rate must be this close to the refresh rate before deltas are locked to it.
 const REFRESH_MATCH_TOLERANCE: f64 = 0.02;
-/// Longer gaps are stalls, not missed refreshes; they pass through unchanged.
+/// The most a locked frame may differ from one refresh while game time catches up with wall time.
+const CATCH_UP_RATE: f64 = 0.05;
+/// Game time is never allowed further than this from wall time.
+const MAX_CARRY_REFRESHES: f64 = 3.0;
+/// Longer gaps are stalls, not missed refreshes; they pass through with any time still owed.
 const MAX_LOCKED_DELTA_SECS: f64 = 0.1;
 
-/// Turns measured frame intervals into whole display refreshes while vsync paces the frames.
+/// Advances game time by one display refresh per frame while vsync paces the frames.
 ///
 /// With vsync the CPU blocks until the swapchain returns an image, and that wait moves with the
 /// compositor's timing: one frame can measure two refreshes and the next almost none while the
 /// display still shows one new frame per refresh. Animating with those intervals makes motion
-/// step unevenly on a steady display. This clock advances by whole refreshes instead and carries
-/// the difference, so game time stays within a few refreshes of wall time and a frame the
-/// display really repeated still catches up.
+/// step unevenly on a steady display. This clock gives every frame one refresh and carries the
+/// difference to wall time, paying it back a few percent per frame. A refresh the display really
+/// repeated is then caught up smoothly instead of as a jump, and game time stays within a few
+/// refreshes of wall time.
 #[derive(Default)]
 struct VsyncClock {
-    average_interval: f64,
+    /// Measured refresh period. It survives restarts, since the display does not change when the
+    /// window loses focus or the app resumes.
+    period: f64,
+    period_samples: u32,
+    refresh_hint: Option<f64>,
+    /// Frames since the last restart.
     frames: u32,
     /// Wall time not yet given to the game (negative when the game is ahead).
     carry: f64,
 }
 
 impl VsyncClock {
-    fn reset(&mut self) {
-        *self = Self::default();
+    /// Drops the carry after a discontinuity, keeping the measured period.
+    fn restart(&mut self) {
+        self.frames = 0;
+        self.carry = 0.0;
     }
 
     fn delta(&mut self, measured: f64, refresh_hz: Option<f64>) -> f64 {
         if measured > MAX_LOCKED_DELTA_SECS {
-            self.reset();
-            return measured;
+            let step = (measured + self.carry).max(0.0);
+            self.restart();
+            return step;
         }
+        let refresh_hz = refresh_hz.filter(|hz| *hz > 0.0);
+        if refresh_hz != self.refresh_hint {
+            // A newly reported display: start from its rate and refine it from there.
+            self.refresh_hint = refresh_hz;
+            if let Some(hz) = refresh_hz {
+                self.period = 1.0 / hz;
+                self.period_samples = PERIOD_AVERAGE_FRAMES;
+            }
+        }
+        // Once the period is known, a late acquire, the quick one after it, or a burst of frames
+        // must not drag the estimate, so samples are limited to half to one and a half refreshes.
+        let sample = if self.period_samples >= PERIOD_AVERAGE_FRAMES {
+            measured.clamp(0.5 * self.period, 1.5 * self.period)
+        } else {
+            measured
+        };
+        self.period_samples = (self.period_samples + 1).min(PERIOD_AVERAGE_FRAMES);
+        self.period += (sample - self.period) / f64::from(self.period_samples);
         self.frames = self.frames.saturating_add(1);
-        self.average_interval +=
-            (measured - self.average_interval) / f64::from(self.frames).min(PERIOD_AVERAGE_FRAMES);
+        self.carry += measured;
 
-        let refresh_hz = refresh_hz
-            .filter(|hz| *hz > 0.0)
-            .unwrap_or_else(|| nearest_common_refresh_hz(self.average_interval));
         // Only lock while frames really arrive once per refresh. A game that cannot keep up,
         // a variable-refresh display below its maximum, or a wrong refresh hint all fail this
-        // check and keep the measured interval.
-        let keeps_refresh =
-            (self.average_interval * refresh_hz - 1.0).abs() <= REFRESH_MATCH_TOLERANCE;
+        // check and keep the measured interval, plus any time still owed to the game.
+        let nominal_hz = refresh_hz.unwrap_or_else(|| nearest_common_refresh_hz(self.period));
+        let keeps_refresh = (self.period * nominal_hz - 1.0).abs() <= REFRESH_MATCH_TOLERANCE;
         if self.frames < SETTLE_FRAMES || !keeps_refresh {
-            self.carry = 0.0;
-            return measured;
+            let step = self.carry.max(0.0);
+            self.carry -= step;
+            return step;
         }
 
-        let period = self.average_interval;
-        self.carry += measured;
-        let mut refreshes = (self.carry / period).floor().max(1.0);
-        if self.carry - refreshes * period < -2.0 * period {
-            // A burst of quick frames (an empty swapchain after a resize) must not run the game
-            // ahead of wall time without bound, so hold it back instead of advancing a refresh.
-            refreshes = (self.carry / period + 2.0).floor().max(0.0);
+        let mut step = self.carry.clamp(
+            self.period * (1.0 - CATCH_UP_RATE),
+            self.period * (1.0 + CATCH_UP_RATE),
+        );
+        let remaining = self.carry - step;
+        let max_carry = MAX_CARRY_REFRESHES * self.period;
+        if remaining.abs() > max_carry {
+            step += remaining - max_carry.copysign(remaining);
         }
-        self.carry -= refreshes * period;
-        refreshes * period
+        self.carry -= step;
+        step
     }
 }
 
@@ -229,7 +258,7 @@ impl FrameTimer {
                 self.vsync_clock.delta(measured, refresh_hz) as f32
             }
             _ => {
-                self.vsync_clock.reset();
+                self.vsync_clock.restart();
                 if reset { 0.0 } else { measured as f32 }
             }
         };
@@ -268,8 +297,12 @@ mod tests {
     #[test]
     fn acquire_jitter_on_a_steady_display_advances_one_refresh_per_frame() {
         let mut clock = settled_clock();
-        let mut uneven = 0;
-        for _ in 0..200 {
+        for round in 0..400 {
+            if round == 200 {
+                // Focus changes restart the clock; the measured period must carry over so the
+                // clock relocks without catching up.
+                clock.restart();
+            }
             // A late acquire followed by an immediate one, as FIFO does when the compositor
             // releases buffers unevenly while still showing a new frame every refresh.
             for measured in [
@@ -279,20 +312,22 @@ mod tests {
                 1.4 * PERIOD,
                 0.6 * PERIOD,
             ] {
-                if (clock.delta(measured, HINT) - PERIOD).abs() > PERIOD * 0.01 {
-                    uneven += 1;
+                let step = clock.delta(measured, HINT);
+                if clock.frames >= SETTLE_FRAMES {
+                    assert!(
+                        (step / PERIOD - 1.0).abs() <= CATCH_UP_RATE + 0.01,
+                        "round {round}: step of {:.2} refreshes",
+                        step / PERIOD
+                    );
                 }
             }
         }
-        // Only the first late frame can be taken as a repeat before the carry absorbs it.
-        assert!(uneven <= 2, "{uneven} uneven steps");
     }
 
     #[test]
     fn repeated_refreshes_and_bursts_keep_game_time_near_wall_time() {
         let mut clock = settled_clock();
         let (mut wall, mut game) = (0.0, 0.0);
-        let mut pattern = Vec::new();
         for i in 0..2000 {
             // The display drops a refresh now and then, and a resize lets frames through at once.
             let measured = match i % 500 {
@@ -300,13 +335,20 @@ mod tests {
                 400..=405 => 0.05 * PERIOD,
                 _ => PERIOD,
             };
-            pattern.push(measured);
-        }
-        for measured in pattern {
             wall += measured;
             game += clock.delta(measured, HINT);
-            assert!((game - wall).abs() <= 3.0 * PERIOD, "drift {}", game - wall);
+            assert!(
+                (game - wall).abs() <= (MAX_CARRY_REFRESHES + 0.1) * PERIOD,
+                "drift {}",
+                game - wall
+            );
         }
+        // Once the display is steady again, the carry is paid back.
+        for _ in 0..200 {
+            wall += PERIOD;
+            game += clock.delta(PERIOD, HINT);
+        }
+        assert!((game - wall).abs() < 0.01 * PERIOD, "drift {}", game - wall);
     }
 
     #[test]
@@ -317,6 +359,6 @@ mod tests {
             assert_eq!(clock.delta(PERIOD, Some(60.0)), PERIOD);
         }
         let mut clock = settled_clock();
-        assert_eq!(clock.delta(0.5, HINT), 0.5);
+        assert!((clock.delta(0.5, HINT) - 0.5).abs() < 1e-9);
     }
 }
