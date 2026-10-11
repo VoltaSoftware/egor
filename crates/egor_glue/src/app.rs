@@ -1625,7 +1625,6 @@ impl AppHandler<Renderer> for App {
             profiling::scope!("render_pass");
             if has_rt_overrides {
                 // Multi-pass rendering: split ONLY on render_target changes.
-                let mut current_rt: Option<usize> = None;
                 let mut first_pass_on_backbuffer = true;
                 let mut initialized_render_targets: Vec<usize> = Vec::new();
 
@@ -1638,19 +1637,9 @@ impl AppHandler<Renderer> for App {
                         batch_end += 1;
                     }
 
-                    // Handle render-target transition
-                    if current_rt != group_rt {
-                        if let Some(prev_rt) = current_rt {
-                            self.render_targets
-                                .get(prev_rt)
-                                .copy_to_sample(&mut frame.encoder);
-                        }
-                        current_rt = group_rt;
-                    }
-
                     let (view, depth_view, is_first) = if let Some(rt_id) = group_rt {
                         let rt = self.render_targets.get(rt_id);
-                        let view = rt.render_view();
+                        let view = rt.view();
                         let dv = rt.offscreen_depth_view();
                         let is_first = !initialized_render_targets.contains(&rt_id);
                         if is_first {
@@ -1799,13 +1788,6 @@ impl AppHandler<Renderer> for App {
                     }
 
                     batch_start = batch_end;
-                }
-
-                // Copy the last offscreen target if it was active
-                if let Some(prev_rt) = current_rt {
-                    self.render_targets
-                        .get(prev_rt)
-                        .copy_to_sample(&mut frame.encoder);
                 }
 
                 if batches.is_empty() {

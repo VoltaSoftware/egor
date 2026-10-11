@@ -2892,7 +2892,7 @@ impl<'a> Graphics<'a> {
         {
             let mut r_pass = self.renderer.begin_render_pass_with_depth(
                 &mut encoder,
-                target.render_view(),
+                target.view(),
                 target.offscreen_depth_view(),
                 true,
             );
@@ -2944,8 +2944,6 @@ impl<'a> Graphics<'a> {
                 );
             }
         }
-
-        target.copy_to_sample(&mut encoder);
 
         let _ = self.renderer.queue().submit(Some(encoder.finish()));
 

@@ -1,8 +1,8 @@
 use wgpu::{
-    Adapter, CommandEncoder, CompositeAlphaMode, CurrentSurfaceTexture, Device, DownlevelFlags,
-    Extent3d, Instance, PresentMode, Surface, SurfaceConfiguration, SurfaceTarget, Texture,
-    TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView,
-    TextureViewDescriptor, WindowHandle,
+    Adapter, CompositeAlphaMode, CurrentSurfaceTexture, Device, DownlevelFlags, Extent3d, Instance,
+    PresentMode, Surface, SurfaceConfiguration, SurfaceTarget, Texture, TextureDescriptor,
+    TextureDimension, TextureFormat, TextureUsages, TextureView, TextureViewDescriptor,
+    WindowHandle,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -504,12 +504,14 @@ impl Backbuffer {
     }
 }
 
-/// Renders to an offscreen texture that can be read back or used as a texture
+/// Renders to an offscreen texture that can be read back or used as a texture.
+///
+/// Draws that sample the target run in later passes than the ones rendering into it, so the
+/// texture is sampled directly instead of being copied every frame. A target cannot be drawn
+/// into itself.
 pub struct OffscreenTarget {
-    render_texture: Texture,
-    render_view: TextureView,
-    sample_texture: Texture,
-    sample_view: TextureView,
+    texture: Texture,
+    view: TextureView,
     _depth_texture: Texture,
     depth_view: TextureView,
     format: TextureFormat,
@@ -521,8 +523,8 @@ impl OffscreenTarget {
     pub fn new(device: &Device, width: u32, height: u32, format: TextureFormat) -> Self {
         let width = width.max(1);
         let height = height.max(1);
-        let render_texture = device.create_texture(&TextureDescriptor {
-            label: Some("Offscreen Render Texture"),
+        let texture = device.create_texture(&TextureDescriptor {
+            label: Some("Offscreen Texture"),
             size: Extent3d {
                 width,
                 height,
@@ -532,36 +534,20 @@ impl OffscreenTarget {
             sample_count: 1,
             dimension: TextureDimension::D2,
             format,
-            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-
-        let sample_texture = device.create_texture(&TextureDescriptor {
-            label: Some("Offscreen Sample Texture"),
-            size: Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format,
-            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            usage: TextureUsages::RENDER_ATTACHMENT
+                | TextureUsages::TEXTURE_BINDING
+                | TextureUsages::COPY_SRC,
             view_formats: &[],
         });
 
         let (depth_texture, depth_view) =
             crate::Renderer::create_depth_texture(device, width, height);
 
-        let render_view = render_texture.create_view(&Default::default());
-        let sample_view = sample_texture.create_view(&Default::default());
+        let view = texture.create_view(&Default::default());
 
         Self {
-            render_texture,
-            render_view,
-            sample_texture,
-            sample_view,
+            texture,
+            view,
             _depth_texture: depth_texture,
             depth_view,
             format,
@@ -571,32 +557,15 @@ impl OffscreenTarget {
     }
 
     pub fn texture(&self) -> &Texture {
-        &self.sample_texture
+        &self.texture
     }
 
     pub fn view(&self) -> &TextureView {
-        &self.sample_view
-    }
-
-    pub fn render_view(&self) -> &TextureView {
-        &self.render_view
+        &self.view
     }
 
     pub fn offscreen_depth_view(&self) -> &TextureView {
         &self.depth_view
-    }
-
-    /// Copy render texture into sample texture so it can be sampled
-    pub fn copy_to_sample(&self, encoder: &mut CommandEncoder) {
-        encoder.copy_texture_to_texture(
-            self.render_texture.as_image_copy(),
-            self.sample_texture.as_image_copy(),
-            Extent3d {
-                width: self.width,
-                height: self.height,
-                depth_or_array_layers: 1,
-            },
-        );
     }
 }
 
@@ -611,7 +580,7 @@ impl RenderTarget for OffscreenTarget {
 
     fn acquire(&mut self, _: &Device) -> Option<(TextureView, Option<Presentable>)> {
         // no presentation needed for offscreen targets
-        Some((self.render_view.clone(), None))
+        Some((self.view.clone(), None))
     }
 
     fn resize(&mut self, device: &Device, w: u32, h: u32) {
