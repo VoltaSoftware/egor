@@ -4,7 +4,7 @@ use web_time::{Duration, Instant};
 
 use crate::{
     graphics::{Graphics, RenderTargetStore, ScreenCaptureState},
-    primitives::PrimitiveBatch,
+    primitives::{BatchEntry, PrimitiveBatch},
     profile_new_frame,
     surface_recovery::{
         DeviceLossAction, SurfaceFailure, SurfaceRecoveryAction, SurfaceRecoveryState,
@@ -169,6 +169,104 @@ fn window_surface_size(window: &Window) -> PhysicalSize<u32> {
     {
         window.inner_size()
     }
+}
+
+/// Draws the batches in `range` that belong to `target` into an open pass and
+/// returns the number of draw calls issued.
+#[allow(clippy::too_many_arguments)]
+fn draw_batches<'a>(
+    renderer: &'a Renderer,
+    r_pass: &mut egor_render::RenderPass<'a>,
+    batches: &mut [BatchEntry],
+    range: std::ops::Range<usize>,
+    target: Option<usize>,
+    (target_w, target_h): (u32, u32),
+    camera_slot_stride: u32,
+    instance_byte_offsets: &[u64],
+    watch_pass: bool,
+) -> u32 {
+    let Some(first) = batches[range.clone()]
+        .iter()
+        .find(|batch| batch.render_target == target)
+    else {
+        return 0;
+    };
+    renderer.bind_pass_state_with_watch_overlay(
+        r_pass,
+        first.texture_id,
+        first.shader_id,
+        first.replace_blend,
+        watch_pass,
+    );
+    let mut cur_tex = first.texture_id;
+    let mut cur_shd = first.shader_id;
+    let mut cur_replace_blend = first.replace_blend;
+    let mut cur_cam_offset = u32::MAX;
+    let mut quad_bound = true;
+    let full_scissor = (0u32, 0u32, target_w.max(1), target_h.max(1));
+    let mut cur_scissor = (u32::MAX, u32::MAX, u32::MAX, u32::MAX);
+    let mut draw_calls = 0;
+
+    for idx in range {
+        let batch = &mut batches[idx];
+        if batch.render_target != target {
+            continue;
+        }
+        let target_scissor = match batch.scissor {
+            Some((sx, sy, sw, sh)) => {
+                let sx = sx.min(target_w.saturating_sub(1));
+                let sy = sy.min(target_h.saturating_sub(1));
+                let sw = sw.min(target_w - sx).max(1);
+                let sh = sh.min(target_h - sy).max(1);
+                (sx, sy, sw, sh)
+            }
+            None => full_scissor,
+        };
+        if cur_scissor != target_scissor {
+            r_pass.set_scissor_rect(
+                target_scissor.0,
+                target_scissor.1,
+                target_scissor.2,
+                target_scissor.3,
+            );
+            cur_scissor = target_scissor;
+        }
+        let offset = batch.camera_slot * camera_slot_stride;
+        draw_calls += if let Some(shared_buf) = renderer.shared_instance_buffer() {
+            renderer.draw_batch_shared_with_watch_overlay(
+                r_pass,
+                &mut batch.geometry,
+                batch.texture_id,
+                batch.shader_id,
+                batch.replace_blend,
+                offset,
+                &mut cur_tex,
+                &mut cur_shd,
+                &mut cur_replace_blend,
+                &mut cur_cam_offset,
+                &mut quad_bound,
+                shared_buf,
+                instance_byte_offsets[idx],
+                watch_pass,
+            )
+        } else {
+            renderer.draw_batch_with_watch_overlay(
+                r_pass,
+                &mut batch.geometry,
+                batch.texture_id,
+                batch.shader_id,
+                batch.replace_blend,
+                offset,
+                &mut cur_tex,
+                &mut cur_shd,
+                &mut cur_replace_blend,
+                &mut cur_cam_offset,
+                &mut quad_bound,
+                watch_pass,
+            )
+        };
+    }
+    draw_calls
 }
 
 struct CaptureFrameTarget {
@@ -1620,9 +1718,12 @@ impl AppHandler<Renderer> for App {
         {
             #[cfg(feature = "profiling")]
             profiling::scope!("render_pass");
+            // Offscreen targets render first, in submission order, so the backbuffer
+            // is drawn in one cleared pass that already samples this frame's target
+            // contents. Splitting the backbuffer around offscreen passes would load
+            // it back mid-frame, and tile-based mobile GPUs (Adreno under Chrome's
+            // WebGPU) can fill that load with another tile's leftover memory.
             if has_rt_overrides {
-                // Multi-pass rendering: split ONLY on render_target changes.
-                let mut first_pass_on_backbuffer = true;
                 let mut initialized_render_targets: Vec<usize> = Vec::new();
 
                 let mut batch_start = 0;
@@ -1633,276 +1734,84 @@ impl AppHandler<Renderer> for App {
                     {
                         batch_end += 1;
                     }
-
-                    let (view, depth_view, is_first) = if let Some(rt_id) = group_rt {
-                        let rt = self.render_targets.get(rt_id);
-                        let view = rt.view();
-                        let dv = rt.offscreen_depth_view();
-                        let is_first = !initialized_render_targets.contains(&rt_id);
-                        if is_first {
-                            initialized_render_targets.push(rt_id);
-                        }
-                        (view, dv, is_first)
-                    } else {
-                        let is_first = first_pass_on_backbuffer;
-                        if is_first {
-                            first_pass_on_backbuffer = false;
-                        }
-                        (main_view, main_depth_view, is_first)
-                    };
-
-                    let (rt_w, rt_h) = if let Some(rt_id) = group_rt {
-                        self.render_targets.get(rt_id).size()
-                    } else {
-                        (w, h)
-                    };
-
-                    {
-                        let watch_pass = use_watch_frame_target && group_rt.is_none();
-                        let mut r_pass = if is_first {
-                            if group_rt.is_some() {
-                                renderer.begin_render_pass_with_depth_clear_color(
-                                    &mut frame.encoder,
-                                    view,
-                                    depth_view,
-                                    egor_render::wgpu::Color::TRANSPARENT,
-                                    true,
-                                )
-                            } else if watch_pass {
-                                renderer.begin_render_pass_with_watch_overlay_depth_clear_color(
-                                    &mut frame.encoder,
-                                    view,
-                                    watch_overlay_view.expect("watch overlay view"),
-                                    depth_view,
-                                    renderer.clear_color(),
-                                    true,
-                                )
-                            } else {
-                                renderer.begin_render_pass_with_depth(
-                                    &mut frame.encoder,
-                                    view,
-                                    depth_view,
-                                    true,
-                                )
-                            }
-                        } else if watch_pass {
-                            renderer.begin_render_pass_load_with_watch_overlay_depth(
-                                &mut frame.encoder,
-                                view,
-                                watch_overlay_view.expect("watch overlay view"),
-                                depth_view,
-                            )
-                        } else {
-                            renderer.begin_render_pass_load_with_depth(
-                                &mut frame.encoder,
-                                view,
-                                depth_view,
-                            )
-                        };
-
-                        let first_batch = &batches[batch_start];
-                        renderer.bind_pass_state_with_watch_overlay(
-                            &mut r_pass,
-                            first_batch.texture_id,
-                            first_batch.shader_id,
-                            first_batch.replace_blend,
-                            watch_pass,
-                        );
-                        let mut cur_tex = first_batch.texture_id;
-                        let mut cur_shd = first_batch.shader_id;
-                        let mut cur_replace_blend = first_batch.replace_blend;
-                        let mut cur_cam_offset = u32::MAX;
-                        let mut quad_bound = true;
-                        let full_scissor = (0u32, 0u32, rt_w.max(1), rt_h.max(1));
-                        let mut cur_scissor = (u32::MAX, u32::MAX, u32::MAX, u32::MAX);
-
-                        for idx in batch_start..batch_end {
-                            let batch = &mut batches[idx];
-                            let target_scissor = match batch.scissor {
-                                Some((sx, sy, sw, sh)) => {
-                                    let sx = sx.min(rt_w.saturating_sub(1));
-                                    let sy = sy.min(rt_h.saturating_sub(1));
-                                    let sw = sw.min(rt_w - sx).max(1);
-                                    let sh = sh.min(rt_h - sy).max(1);
-                                    (sx, sy, sw, sh)
-                                }
-                                None => full_scissor,
-                            };
-                            if cur_scissor != target_scissor {
-                                r_pass.set_scissor_rect(
-                                    target_scissor.0,
-                                    target_scissor.1,
-                                    target_scissor.2,
-                                    target_scissor.3,
-                                );
-                                cur_scissor = target_scissor;
-                            }
-                            let offset = batch.camera_slot * stride;
-                            if let Some(shared_buf) = renderer.shared_instance_buffer() {
-                                frame_stats.draw_calls += renderer
-                                    .draw_batch_shared_with_watch_overlay(
-                                        &mut r_pass,
-                                        &mut batch.geometry,
-                                        batch.texture_id,
-                                        batch.shader_id,
-                                        batch.replace_blend,
-                                        offset,
-                                        &mut cur_tex,
-                                        &mut cur_shd,
-                                        &mut cur_replace_blend,
-                                        &mut cur_cam_offset,
-                                        &mut quad_bound,
-                                        shared_buf,
-                                        self.instance_byte_offsets[idx],
-                                        watch_pass,
-                                    );
-                            } else {
-                                frame_stats.draw_calls += renderer.draw_batch_with_watch_overlay(
-                                    &mut r_pass,
-                                    &mut batch.geometry,
-                                    batch.texture_id,
-                                    batch.shader_id,
-                                    batch.replace_blend,
-                                    offset,
-                                    &mut cur_tex,
-                                    &mut cur_shd,
-                                    &mut cur_replace_blend,
-                                    &mut cur_cam_offset,
-                                    &mut quad_bound,
-                                    watch_pass,
-                                );
-                            }
-                        }
-
-                        let is_last_group_for_target = batches[batch_end..]
-                            .iter()
-                            .all(|batch| batch.render_target != group_rt);
-                        if has_text && is_last_group_for_target {
-                            let layer =
-                                text_renderer.prepare(&device, &queue, rt_w, rt_h, group_rt);
-                            text_renderer.render(layer, &mut r_pass);
-                            frame_stats.draw_calls += 1;
-                        }
-                    }
-
+                    let group = batch_start..batch_end;
                     batch_start = batch_end;
-                }
+                    let Some(rt_id) = group_rt else {
+                        continue;
+                    };
 
-                if batches.is_empty() {
-                    let mut r_pass = if use_watch_frame_target {
-                        renderer.begin_render_pass_with_watch_overlay_depth_clear_color(
+                    let rt = self.render_targets.get(rt_id);
+                    let (rt_w, rt_h) = rt.size();
+                    let mut r_pass = if initialized_render_targets.contains(&rt_id) {
+                        renderer.begin_render_pass_load_with_depth(
                             &mut frame.encoder,
-                            main_view,
-                            watch_overlay_view.expect("watch overlay view"),
-                            main_depth_view,
-                            renderer.clear_color(),
-                            true,
+                            rt.view(),
+                            rt.offscreen_depth_view(),
                         )
                     } else {
-                        renderer.begin_render_pass_discard_depth(&mut frame.encoder, main_view)
+                        initialized_render_targets.push(rt_id);
+                        renderer.begin_render_pass_with_depth_clear_color(
+                            &mut frame.encoder,
+                            rt.view(),
+                            rt.offscreen_depth_view(),
+                            egor_render::wgpu::Color::TRANSPARENT,
+                            true,
+                        )
                     };
-                    if has_text {
-                        let layer = text_renderer.prepare(&device, &queue, w, h, None);
+                    frame_stats.draw_calls += draw_batches(
+                        renderer,
+                        &mut r_pass,
+                        &mut batches,
+                        group,
+                        group_rt,
+                        (rt_w, rt_h),
+                        stride,
+                        &self.instance_byte_offsets,
+                        false,
+                    );
+
+                    let is_last_group_for_target = batches[batch_end..]
+                        .iter()
+                        .all(|batch| batch.render_target != group_rt);
+                    if has_text && is_last_group_for_target {
+                        let layer = text_renderer.prepare(&device, &queue, rt_w, rt_h, group_rt);
                         text_renderer.render(layer, &mut r_pass);
                         frame_stats.draw_calls += 1;
                     }
                 }
-            } else {
-                // Single render pass (no render target overrides)
-                {
-                    let watch_pass = use_watch_frame_target;
-                    let mut r_pass = if watch_pass {
-                        renderer.begin_render_pass_with_watch_overlay_depth_clear_color(
-                            &mut frame.encoder,
-                            main_view,
-                            watch_overlay_view.expect("watch overlay view"),
-                            main_depth_view,
-                            renderer.clear_color(),
-                            true,
-                        )
-                    } else {
-                        renderer.begin_render_pass_discard_depth(&mut frame.encoder, main_view)
-                    };
+            }
 
-                    if let Some(first) = batches.first() {
-                        renderer.bind_pass_state_with_watch_overlay(
-                            &mut r_pass,
-                            first.texture_id,
-                            first.shader_id,
-                            first.replace_blend,
-                            watch_pass,
-                        );
-                        let mut cur_tex = first.texture_id;
-                        let mut cur_shd = first.shader_id;
-                        let mut cur_replace_blend = first.replace_blend;
-                        let mut cur_cam_offset = u32::MAX;
-                        let mut quad_bound = true;
-                        let full_scissor = (0u32, 0u32, w.max(1), h.max(1));
-                        let mut cur_scissor = (u32::MAX, u32::MAX, u32::MAX, u32::MAX);
+            {
+                let watch_pass = use_watch_frame_target;
+                let mut r_pass = if watch_pass {
+                    renderer.begin_render_pass_with_watch_overlay_depth_clear_color(
+                        &mut frame.encoder,
+                        main_view,
+                        watch_overlay_view.expect("watch overlay view"),
+                        main_depth_view,
+                        renderer.clear_color(),
+                        true,
+                    )
+                } else {
+                    renderer.begin_render_pass_discard_depth(&mut frame.encoder, main_view)
+                };
+                let batch_count = batches.len();
+                frame_stats.draw_calls += draw_batches(
+                    renderer,
+                    &mut r_pass,
+                    &mut batches,
+                    0..batch_count,
+                    None,
+                    (w, h),
+                    stride,
+                    &self.instance_byte_offsets,
+                    watch_pass,
+                );
 
-                        for (idx, batch) in batches.iter_mut().enumerate() {
-                            let target_scissor = match batch.scissor {
-                                Some((sx, sy, sw, sh)) => {
-                                    let sx = sx.min(w.saturating_sub(1));
-                                    let sy = sy.min(h.saturating_sub(1));
-                                    let sw = sw.min(w - sx).max(1);
-                                    let sh = sh.min(h - sy).max(1);
-                                    (sx, sy, sw, sh)
-                                }
-                                None => full_scissor,
-                            };
-                            if cur_scissor != target_scissor {
-                                r_pass.set_scissor_rect(
-                                    target_scissor.0,
-                                    target_scissor.1,
-                                    target_scissor.2,
-                                    target_scissor.3,
-                                );
-                                cur_scissor = target_scissor;
-                            }
-                            let offset = batch.camera_slot * stride;
-                            if let Some(shared_buf) = renderer.shared_instance_buffer() {
-                                frame_stats.draw_calls += renderer
-                                    .draw_batch_shared_with_watch_overlay(
-                                        &mut r_pass,
-                                        &mut batch.geometry,
-                                        batch.texture_id,
-                                        batch.shader_id,
-                                        batch.replace_blend,
-                                        offset,
-                                        &mut cur_tex,
-                                        &mut cur_shd,
-                                        &mut cur_replace_blend,
-                                        &mut cur_cam_offset,
-                                        &mut quad_bound,
-                                        shared_buf,
-                                        self.instance_byte_offsets[idx],
-                                        watch_pass,
-                                    );
-                            } else {
-                                frame_stats.draw_calls += renderer.draw_batch_with_watch_overlay(
-                                    &mut r_pass,
-                                    &mut batch.geometry,
-                                    batch.texture_id,
-                                    batch.shader_id,
-                                    batch.replace_blend,
-                                    offset,
-                                    &mut cur_tex,
-                                    &mut cur_shd,
-                                    &mut cur_replace_blend,
-                                    &mut cur_cam_offset,
-                                    &mut quad_bound,
-                                    watch_pass,
-                                );
-                            }
-                        }
-                    }
-
-                    if has_text {
-                        let layer = text_renderer.prepare(&device, &queue, w, h, None);
-                        text_renderer.render(layer, &mut r_pass);
-                        frame_stats.draw_calls += 1;
-                    }
+                if has_text {
+                    let layer = text_renderer.prepare(&device, &queue, w, h, None);
+                    text_renderer.render(layer, &mut r_pass);
+                    frame_stats.draw_calls += 1;
                 }
             }
             if has_text {
