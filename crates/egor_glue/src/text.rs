@@ -31,12 +31,21 @@ enum TextEffect {
     Outline { radius: f32, color: GlyphonColor },
 }
 
+/// Vertices and viewport for one render pass. glyphon uploads both with
+/// `queue.write_buffer`, which only lands at submit, so every pass in a frame
+/// needs its own; sharing one made each pass draw the last pass's text.
+struct TextLayer {
+    renderer: GlyphonRenderer,
+    viewport: Viewport,
+}
+
 pub struct TextRenderer {
     font_system: FontSystem,
     swash_cache: SwashCache,
+    cache: Cache,
     atlas: TextAtlas,
-    renderer: GlyphonRenderer,
-    viewport: Viewport,
+    layers: Vec<TextLayer>,
+    layers_used: usize,
     entries: Vec<TextEntry>,
     buffer_pool: Vec<Buffer>,
     loaded_fonts: HashMap<(u128, usize), String>,
@@ -49,27 +58,15 @@ impl TextRenderer {
         let font_system = new_font_system("en");
         let swash_cache = SwashCache::new();
         let cache = Cache::new(device);
-        let viewport = Viewport::new(device, &cache);
-        let mut atlas = TextAtlas::new(device, queue, &cache, format);
-        let renderer = GlyphonRenderer::new(
-            &mut atlas,
-            device,
-            Default::default(),
-            Some(DepthStencilState {
-                format: Renderer::DEPTH_FORMAT,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(CompareFunction::Always),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-        );
+        let atlas = TextAtlas::new(device, queue, &cache, format);
 
         Self {
             font_system,
             swash_cache,
+            cache,
             atlas,
-            renderer,
-            viewport,
+            layers: Vec::new(),
+            layers_used: 0,
             entries: Vec::new(),
             buffer_pool: Vec::new(),
             loaded_fonts: HashMap::new(),
@@ -108,7 +105,7 @@ impl TextRenderer {
         !self.entries.is_empty()
     }
 
-    /// Prepare the text renderer for drawing.
+    /// Prepare the text queued for `render_target` and return the layer to pass to `render`.
     /// Skipping this when `has_entries()` is false avoids glyphon overhead.
     pub(crate) fn prepare(
         &mut self,
@@ -117,8 +114,28 @@ impl TextRenderer {
         width: u32,
         height: u32,
         render_target: Option<usize>,
-    ) {
-        self.viewport.update(queue, Resolution { width, height });
+    ) -> usize {
+        if self.layers_used == self.layers.len() {
+            self.layers.push(TextLayer {
+                renderer: GlyphonRenderer::new(
+                    &mut self.atlas,
+                    device,
+                    Default::default(),
+                    Some(DepthStencilState {
+                        format: Renderer::DEPTH_FORMAT,
+                        depth_write_enabled: Some(false),
+                        depth_compare: Some(CompareFunction::Always),
+                        stencil: Default::default(),
+                        bias: Default::default(),
+                    }),
+                ),
+                viewport: Viewport::new(device, &self.cache),
+            });
+        }
+        let layer_index = self.layers_used;
+        self.layers_used += 1;
+        let layer = &mut self.layers[layer_index];
+        layer.viewport.update(queue, Resolution { width, height });
         let mut text_areas = Vec::with_capacity(self.entries.len());
         for entry in self
             .entries
@@ -185,20 +202,25 @@ impl TextRenderer {
             }
             push_area!(&entry.buffer, entry.position, entry.color);
         }
-        self.renderer
+        layer
+            .renderer
             .prepare(
                 device,
                 queue,
                 &mut self.font_system,
                 &mut self.atlas,
-                &self.viewport,
+                &layer.viewport,
                 text_areas,
                 &mut self.swash_cache,
             )
             .unwrap();
+        layer_index
     }
 
     pub(crate) fn finish_frame(&mut self) {
+        self.layers_used = 0;
+        // Glyphs stay pinned in the atlas until trimmed; without this it only grows until full.
+        self.atlas.trim();
         // Return buffers to the pool for reuse next frame
         for entry in self.entries.drain(..) {
             if self.buffer_pool.len() < MAX_POOLED_BUFFERS {
@@ -212,14 +234,12 @@ impl TextRenderer {
         }
     }
 
-    pub(crate) fn render<'a>(&'a self, pass: &mut RenderPass<'a>) {
-        self.renderer
-            .render(&self.atlas, &self.viewport, pass)
+    pub(crate) fn render<'a>(&'a self, layer: usize, pass: &mut RenderPass<'a>) {
+        let layer = &self.layers[layer];
+        layer
+            .renderer
+            .render(&self.atlas, &layer.viewport, pass)
             .unwrap();
-    }
-
-    pub(crate) fn resize(&mut self, width: u32, height: u32, queue: &Queue) {
-        self.viewport.update(queue, Resolution { width, height });
     }
 
     /// Takes a buffer from the pool, or creates a new one with the given metrics
