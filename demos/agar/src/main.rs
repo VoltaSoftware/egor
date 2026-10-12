@@ -4,7 +4,7 @@ use egor::{
         egui::{Context, Window},
     },
     math::{Rect, Vec2, vec2},
-    render::{Align, Color, Graphics},
+    render::{Color, Graphics},
 };
 use rand::Rng;
 
@@ -284,18 +284,7 @@ impl Game {
                 });
             }
 
-            GameState::Win | GameState::Lose => {
-                let (text, color) = if self.state == GameState::Win {
-                    ("You Win!", Color::GREEN)
-                } else {
-                    ("You Lose!", Color::RED)
-                };
-                gfx.text(text)
-                    .color(color)
-                    .size(100.0)
-                    .bold()
-                    .in_rect(Rect::new(Vec2::ZERO, screen_size), Align::MiddleCenter);
-            }
+            GameState::Win | GameState::Lose => {}
         }
     }
 }

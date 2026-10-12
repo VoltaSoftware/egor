@@ -1,5 +1,4 @@
 use color::{AlphaColor, LinearSrgb};
-use glyphon::cosmic_text;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Color {
@@ -46,13 +45,5 @@ impl From<Color> for [f64; 4] {
     fn from(value: Color) -> Self {
         let [r, g, b, a] = value.components();
         [r as f64, g as f64, b as f64, a as f64]
-    }
-}
-
-// Convert Color to cosmic_text::Color (u8 RGBA)
-impl From<Color> for cosmic_text::Color {
-    fn from(value: Color) -> Self {
-        let [r, g, b, a] = value.inner.to_rgba8().to_u8_array();
-        cosmic_text::Color::rgba(r, g, b, a)
     }
 }

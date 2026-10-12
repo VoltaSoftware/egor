@@ -17,9 +17,7 @@ use crate::primitives::PathBuilder;
 use crate::{
     camera::Camera,
     color::Color,
-    math::Rect,
     primitives::{PolygonBuilder, PolylineBuilder, PrimitiveBatch, RectangleBuilder},
-    text::{TextBuilder, TextRenderer},
 };
 
 // ---------------------------------------------------------------------------
@@ -2782,7 +2780,6 @@ pub struct Graphics<'a> {
     renderer: &'a mut Renderer,
     batch: &'a mut PrimitiveBatch,
     camera: Camera,
-    text_renderer: &'a mut TextRenderer,
     target_format: TextureFormat,
     target_size: (u32, u32),
     current_shader: Option<usize>,
@@ -2792,11 +2789,10 @@ pub struct Graphics<'a> {
 }
 
 impl<'a> Graphics<'a> {
-    /// Create `Graphics` with [`Renderer`], [`TextRenderer`] & `TextureFormat`
+    /// Create `Graphics` with [`Renderer`] & `TextureFormat`
     pub fn new(
         renderer: &'a mut Renderer,
         batch: &'a mut PrimitiveBatch,
-        text_renderer: &'a mut TextRenderer,
         render_targets: &'a mut RenderTargetStore,
         screen_capture: &'a mut ScreenCaptureState,
         offscreen_batches: &'a mut Vec<PrimitiveBatch>,
@@ -2808,7 +2804,6 @@ impl<'a> Graphics<'a> {
             renderer,
             batch,
             camera: Camera::default(),
-            text_renderer,
             target_format: format,
             target_size: (w, h),
             current_shader: None,
@@ -2871,7 +2866,6 @@ impl<'a> Graphics<'a> {
             renderer: self.renderer,
             batch: &mut offscreen_batch,
             camera: Camera::default(),
-            text_renderer: self.text_renderer,
             target_size: (w, h),
             target_format: format,
             current_shader: None,
@@ -3194,30 +3188,6 @@ impl<'a> Graphics<'a> {
     pub fn path(&mut self) -> PathBuilder<'_> {
         PathBuilder::new(self.batch, self.current_shader)
     }
-    /// Load a font from disk into the text system.
-    pub fn load_font(&mut self, bytes: &[u8]) -> Option<String> {
-        self.text_renderer.load_font_bytes(bytes)
-    }
-    /// Set the BCP 47 locale used for script-aware font fallback and shaping.
-    pub fn set_text_locale(&mut self, locale: &str) {
-        self.text_renderer.set_locale(locale);
-    }
-    /// Draw a line of text
-    pub fn text(&mut self, text: &str) -> TextBuilder<'_> {
-        let mut builder = TextBuilder::new(
-            self.text_renderer,
-            text.to_string(),
-            self.batch.render_target(),
-        );
-        if let Some((x, y, width, height)) = self.batch.scissor() {
-            builder = builder.clip(Rect::new(
-                glam::Vec2::new(x as f32, y as f32),
-                glam::Vec2::new(width as f32, height as f32),
-            ));
-        }
-        builder
-    }
-
     /// Cache a linear sampler binding without changing the source texture's filtering.
     pub fn linear_texture_variant(&mut self, id: usize) -> usize {
         self.renderer.linear_texture_variant(id)
@@ -3245,6 +3215,36 @@ impl<'a> Graphics<'a> {
         data: &[u8],
     ) -> Result<usize, String> {
         self.renderer.add_texture_array_raw(w, h, layers, data)
+    }
+
+    /// Like [`Self::add_texture_array_raw`], followed by `spare_layers` transparent layers
+    /// that are filled later with [`Self::write_texture_region`].
+    pub fn add_texture_array_raw_with_spare_layers(
+        &mut self,
+        w: u32,
+        h: u32,
+        layers: u32,
+        spare_layers: u32,
+        data: &[u8],
+    ) -> Result<usize, String> {
+        self.renderer
+            .add_texture_array_raw_with_spare_layers(w, h, layers, spare_layers, data)
+    }
+
+    /// Overwrite a `w`×`h` RGBA8 region of one layer of an existing texture.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_texture_region(
+        &mut self,
+        id: usize,
+        layer: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        data: &[u8],
+    ) -> Result<(), String> {
+        self.renderer
+            .write_texture_region(id, layer, x, y, w, h, data)
     }
 
     pub fn add_texture_raw(&mut self, w: u32, h: u32, data: &[u8]) -> usize {

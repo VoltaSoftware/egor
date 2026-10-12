@@ -2,7 +2,6 @@ use egor::{
     app::{App, FrameContext},
     input::MouseButton,
     math::{Vec2, vec2},
-    render::Color,
 };
 use rand::{Rng, rngs::ThreadRng};
 
@@ -65,17 +64,6 @@ fn main() {
                     .size(Vec2::splat(CRAB_SIZE))
                     .texture(ferris_tex);
             }
-
-            gfx.text("Egor Ferrismark")
-                .at((size.x / 2.0 - 50.0, 20.0))
-                .size(20.0)
-                .color(Color::WHITE);
-            gfx.text(&format!("Crabs: {}", crabs.len()))
-                .at(vec2(10.0, 10.0))
-                .color(Color::WHITE);
-            gfx.text(&format!("FPS: {}", timer.fps))
-                .at(vec2(10.0, 28.0))
-                .color(Color::WHITE);
         },
     );
 }

@@ -55,14 +55,5 @@ fn main() {
             gfx.with_shader(shader_id, |gfx| {
                 gfx.rect().at(bar_pos).size(bar_size);
             });
-
-            gfx.text(&format!("HP: {:.0}%", health * 100.0))
-                .at((size.x * 0.5 - 30.0, bar_pos.y - 30.0))
-                .size(20.0)
-                .color(Color::WHITE);
-
-            gfx.text(&format!("FPS: {}", timer.fps))
-                .at(vec2(10.0, 10.0))
-                .color(Color::WHITE);
         });
 }
