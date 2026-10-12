@@ -892,9 +892,6 @@ impl App {
             .as_ref()
             .map_or((size.width, size.height), |b| b.size());
         renderer.ensure_depth_size(w, h);
-        if let Some(text_renderer) = self.text_renderer.as_mut() {
-            text_renderer.resize(w, h, renderer.queue());
-        }
 
         log::warn!(
             "[egor] recreated backbuffer after surface acquire failure at {}x{}",
@@ -1781,8 +1778,9 @@ impl AppHandler<Renderer> for App {
                             .iter()
                             .all(|batch| batch.render_target != group_rt);
                         if has_text && is_last_group_for_target {
-                            text_renderer.prepare(&device, &queue, rt_w, rt_h, group_rt);
-                            text_renderer.render(&mut r_pass);
+                            let layer =
+                                text_renderer.prepare(&device, &queue, rt_w, rt_h, group_rt);
+                            text_renderer.render(layer, &mut r_pass);
                             frame_stats.draw_calls += 1;
                         }
                     }
@@ -1804,8 +1802,8 @@ impl AppHandler<Renderer> for App {
                         renderer.begin_render_pass_discard_depth(&mut frame.encoder, main_view)
                     };
                     if has_text {
-                        text_renderer.prepare(&device, &queue, w, h, None);
-                        text_renderer.render(&mut r_pass);
+                        let layer = text_renderer.prepare(&device, &queue, w, h, None);
+                        text_renderer.render(layer, &mut r_pass);
                         frame_stats.draw_calls += 1;
                     }
                 }
@@ -1901,8 +1899,8 @@ impl AppHandler<Renderer> for App {
                     }
 
                     if has_text {
-                        text_renderer.prepare(&device, &queue, w, h, None);
-                        text_renderer.render(&mut r_pass);
+                        let layer = text_renderer.prepare(&device, &queue, w, h, None);
+                        text_renderer.render(layer, &mut r_pass);
                         frame_stats.draw_calls += 1;
                     }
                 }
@@ -2091,9 +2089,6 @@ impl AppHandler<Renderer> for App {
         // The backbuffer fits the window to the texture limit; size everything else to match it.
         let (w, h) = self.backbuffer.as_ref().map_or((w, h), |b| b.size());
         renderer.ensure_depth_size(w, h);
-        if let Some(text_renderer) = self.text_renderer.as_mut() {
-            text_renderer.resize(w, h, renderer.queue());
-        }
     }
 
     fn suspended(&mut self) {
