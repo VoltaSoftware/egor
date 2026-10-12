@@ -38,8 +38,13 @@ fn render_array_pages(layers: u32) {
         let pixels = (0..layers)
             .flat_map(|page| colors[page as usize % 3].repeat(64))
             .collect::<Vec<_>>();
+        // The last layer starts as a spare and is written afterwards, as a glyph cache does.
+        let (filled, last) = pixels.split_at((layers as usize - 1) * 8 * 8 * 4);
         let id = textures
-            .insert_array_raw(&device, &queue, 8, 8, layers, &pixels)
+            .insert_array_raw_with_spare_layers(&device, &queue, 8, 8, layers - 1, 1, filled)
+            .unwrap();
+        textures
+            .write_region(&queue, id, layers - 1, 0, 0, 8, 8, last)
             .unwrap();
         assert!(
             textures

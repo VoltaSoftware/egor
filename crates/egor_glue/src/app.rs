@@ -10,7 +10,6 @@ use crate::{
         DeviceLossAction, SurfaceFailure, SurfaceRecoveryAction, SurfaceRecoveryState,
         max_frame_interval, retry_interval_for_refresh,
     },
-    text::TextRenderer,
 };
 
 #[cfg(not(target_os = "ios"))]
@@ -557,7 +556,6 @@ pub struct App {
     android_lifecycle: Option<Box<AndroidLifecycleFn>>,
     config: Option<AppConfig>,
     vsync: bool,
-    text_renderer: Option<TextRenderer>,
     backbuffer: Option<Backbuffer>,
     window: Option<Arc<Window>>,
     primitive_batch: PrimitiveBatch,
@@ -605,7 +603,6 @@ impl App {
             android_lifecycle: None,
             config: Some(AppConfig::default()),
             vsync: true,
-            text_renderer: None,
             backbuffer: None,
             window: None,
             memory_hints: MemoryHints::Performance,
@@ -1002,7 +999,6 @@ impl App {
 
     fn drop_renderer_owned_resources(&mut self) {
         self.backbuffer = None;
-        self.text_renderer = None;
         self.render_targets = RenderTargetStore::new();
         self.screen_capture = ScreenCaptureState::new();
         self.capture_frame_target = None;
@@ -1204,7 +1200,6 @@ impl AppHandler<Renderer> for App {
         if let Some(backbuffer) = self.backbuffer.as_mut() {
             backbuffer.set_vsync(device, hardware_vsync_enabled(self.vsync, self.fps_limit));
         }
-        self.text_renderer = Some(TextRenderer::new(device, renderer.queue(), format));
         if self.prewarm_watch_capture && renderer.supports_watch_overlay_capture() {
             let size = window_surface_size(window);
             let (w, h) = egor_render::target::fit_to_texture_limit(
@@ -1405,7 +1400,6 @@ impl AppHandler<Renderer> for App {
         let render_scale = backbuffer.render_scale();
         let (device, queue) = (renderer.device().clone(), renderer.queue().clone());
         let format = backbuffer.format();
-        let text_renderer = self.text_renderer.as_mut().unwrap();
         let update = self.update.as_mut().unwrap();
         let gpu_device_recreated = self.gpu_device_recreated_pending_frame;
 
@@ -1435,7 +1429,6 @@ impl AppHandler<Renderer> for App {
                 gfx: Graphics::new(
                     renderer,
                     &mut self.primitive_batch,
-                    text_renderer,
                     &mut self.render_targets,
                     &mut self.screen_capture,
                     &mut self.offscreen_batches,
@@ -1535,8 +1528,6 @@ impl AppHandler<Renderer> for App {
             }
         }
 
-        let has_text = text_renderer.has_entries();
-
         // Use the flag tracked during batch building instead of scanning all batches.
         let has_rt_overrides = self.primitive_batch.has_rt_overrides();
 
@@ -1565,7 +1556,7 @@ impl AppHandler<Renderer> for App {
                     (!renderer.supports_watch_overlay_pipeline(batch.shader_id))
                         .then_some(batch.shader_id)
                 });
-            if unsupported_capture || has_text || unsupported_shader.is_some() {
+            if unsupported_capture || unsupported_shader.is_some() {
                 if unsupported_capture {
                     if !self.watch_overlay_capture_unsupported_logged {
                         log::warn!(
@@ -1575,8 +1566,7 @@ impl AppHandler<Renderer> for App {
                     }
                 } else {
                     log::warn!(
-                        "[egor] watch overlay capture skipped: unsupported main-pass source (has_text={}, shader={:?})",
-                        has_text,
+                        "[egor] watch overlay capture skipped: unsupported main-pass shader {:?}",
                         unsupported_shader.flatten()
                     );
                 }
@@ -1769,15 +1759,6 @@ impl AppHandler<Renderer> for App {
                         &self.instance_byte_offsets,
                         false,
                     );
-
-                    let is_last_group_for_target = batches[batch_end..]
-                        .iter()
-                        .all(|batch| batch.render_target != group_rt);
-                    if has_text && is_last_group_for_target {
-                        let layer = text_renderer.prepare(&device, &queue, rt_w, rt_h, group_rt);
-                        text_renderer.render(layer, &mut r_pass);
-                        frame_stats.draw_calls += 1;
-                    }
                 }
             }
 
@@ -1807,15 +1788,6 @@ impl AppHandler<Renderer> for App {
                     &self.instance_byte_offsets,
                     watch_pass,
                 );
-
-                if has_text {
-                    let layer = text_renderer.prepare(&device, &queue, w, h, None);
-                    text_renderer.render(layer, &mut r_pass);
-                    frame_stats.draw_calls += 1;
-                }
-            }
-            if has_text {
-                text_renderer.finish_frame();
             }
 
             // Recycle batch GPU buffers for reuse next frame.
@@ -2101,7 +2073,6 @@ mod tests {
 
         assert!(app.renderer_recreate_requested);
         assert!(app.backbuffer.is_none());
-        assert!(app.text_renderer.is_none());
         assert_eq!(app.render_targets.len(), 0);
         assert!(app.capture_frame_target.is_none());
         assert!(app.offscreen_batches.is_empty());

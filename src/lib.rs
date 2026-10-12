@@ -72,7 +72,6 @@ pub mod render {
         color::Color,
         graphics::Graphics,
         primitives::{Anchor, BorderRadii},
-        text::Align,
     };
     pub use egor_render::wgpu::FilterMode;
     pub use egor_render::{

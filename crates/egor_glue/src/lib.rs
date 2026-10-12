@@ -6,4 +6,3 @@ pub mod math;
 pub mod primitives;
 pub mod profiling;
 pub(crate) mod surface_recovery;
-pub mod text;

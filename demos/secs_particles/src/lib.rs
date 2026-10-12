@@ -292,7 +292,5 @@ pub fn main() {
             });
 
             world.flush_despawned();
-            gfx.text(&format!("particles: {} | fps: {:.0}", drawn, timer.fps))
-                .color(Color::WHITE);
         });
 }

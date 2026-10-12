@@ -240,10 +240,6 @@ impl PrimitiveBatch {
         self.scissor = rect;
     }
 
-    pub(crate) fn scissor(&self) -> Option<(u32, u32, u32, u32)> {
-        self.scissor
-    }
-
     /// Set the camera matrix for subsequent draw commands.
     /// Assigns a slot ID so the hot-path comparison is a single `u32` instead
     /// of a full 64-byte matrix comparison.

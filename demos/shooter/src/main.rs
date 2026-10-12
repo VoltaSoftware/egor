@@ -7,7 +7,7 @@ use egor::{
     app::{App, FrameContext, WindowEvent, egui::Window},
     input::{KeyCode, MouseButton},
     math::{Rect, Vec2, vec2},
-    render::{Align, Color, OffscreenTarget},
+    render::{Color, OffscreenTarget},
 };
 
 use crate::{animation::SpriteAnim, tilemap::EgorMap};
@@ -178,11 +178,6 @@ fn main() {
             let screen_size = gfx.screen_size();
 
             if state.game_over {
-                gfx.text("GAME OVER")
-                    .color(Color::RED)
-                    .size(32.0)
-                    .bold()
-                    .in_rect(Rect::new(Vec2::ZERO, screen_size), Align::MiddleCenter);
                 return;
             }
             if let Some(minimap) = &mut state.minimap {

@@ -149,12 +149,7 @@ impl Texture {
         }
     }
 
-    fn validate_upload(
-        device: &Device,
-        data: &[u8],
-        width: u32,
-        height: u32,
-    ) -> Result<(), String> {
+    fn validate_size(device: &Device, width: u32, height: u32) -> Result<(), String> {
         if width == 0 || height == 0 {
             return Err(format!("zero-sized texture {width}x{height}"));
         }
@@ -165,6 +160,16 @@ impl Texture {
                 "texture {width}x{height} exceeds max dimension {max_dimension}"
             ));
         }
+        Ok(())
+    }
+
+    fn validate_upload(
+        device: &Device,
+        data: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
+        Self::validate_size(device, width, height)?;
 
         let expected_len = (width as usize)
             .checked_mul(height as usize)
@@ -192,10 +197,13 @@ impl Texture {
         label: Option<&str>,
     ) -> Self {
         Self::from_array_bytes(
-            device, queue, layout, sampler, data, width, height, 1, label,
+            device, queue, layout, sampler, data, width, height, 1, 0, label,
         )
     }
 
+    /// Uploads `layers` layers from `data`; `spare_layers` more follow them and
+    /// start transparent.
+    #[allow(clippy::too_many_arguments)]
     fn from_array_bytes(
         device: &Device,
         queue: &Queue,
@@ -205,14 +213,21 @@ impl Texture {
         width: u32,
         height: u32,
         layers: u32,
+        spare_layers: u32,
         label: Option<&str>,
     ) -> Self {
+        let total_layers = layers + spare_layers;
         let texture = device.create_texture(&TextureDescriptor {
             label,
             size: Extent3d {
                 width,
                 height,
-                depth_or_array_layers: Self::storage_layer_count(device, width, height, layers),
+                depth_or_array_layers: Self::storage_layer_count(
+                    device,
+                    width,
+                    height,
+                    total_layers,
+                ),
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -222,36 +237,38 @@ impl Texture {
             view_formats: &[],
         });
 
-        queue.write_texture(
-            TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: Origin3d::ZERO,
-                aspect: TextureAspect::All,
-            },
-            data,
-            TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * width),
-                rows_per_image: Some(height),
-            },
-            Extent3d {
-                width,
-                height,
-                depth_or_array_layers: layers,
-            },
-        );
+        if layers > 0 {
+            queue.write_texture(
+                TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: Origin3d::ZERO,
+                    aspect: TextureAspect::All,
+                },
+                data,
+                TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * width),
+                    rows_per_image: Some(height),
+                },
+                Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: layers,
+                },
+            );
+        }
         // GLES cannot reinterpret ordinary 2D storage as array storage. Create
         // only the view that matches the texture's actual storage target; the
         // pipeline variant uses the corresponding bind-group layout.
-        let view_dimension = if layers > 1 {
+        let view_dimension = if total_layers > 1 {
             TextureViewDimension::D2Array
         } else {
             TextureViewDimension::D2
         };
         let view = texture.create_view(&TextureViewDescriptor {
             dimension: Some(view_dimension),
-            array_layer_count: Some(layers),
+            array_layer_count: Some(total_layers),
             ..Default::default()
         });
 
@@ -259,7 +276,7 @@ impl Texture {
             bind_group: Self::create_bind_group(device, layout, &view, sampler),
             view,
             linear_variant: None,
-            is_array: layers > 1,
+            is_array: total_layers > 1,
         }
     }
 
@@ -455,12 +472,30 @@ impl Textures {
         layers: u32,
         data: &[u8],
     ) -> Result<usize, String> {
-        Texture::validate_upload(device, data, w, h)?;
-        let storage_layers = Texture::storage_layer_count(device, w, h, layers);
+        self.insert_array_raw_with_spare_layers(device, queue, w, h, layers, 0, data)
+    }
+
+    /// Like [`Self::insert_array_raw`], followed by `spare_layers` transparent layers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_array_raw_with_spare_layers(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        w: u32,
+        h: u32,
+        layers: u32,
+        spare_layers: u32,
+        data: &[u8],
+    ) -> Result<usize, String> {
+        Texture::validate_size(device, w, h)?;
+        let total_layers = layers
+            .checked_add(spare_layers)
+            .ok_or("Texture array layer count overflow")?;
+        let storage_layers = Texture::storage_layer_count(device, w, h, total_layers);
         let max_layers = device.limits().max_texture_array_layers;
-        if layers == 0 || storage_layers > max_layers {
+        if total_layers == 0 || storage_layers > max_layers {
             return Err(format!(
-                "Texture array with {layers} layers requires {storage_layers} storage layers; device limit is {max_layers}"
+                "Texture array with {total_layers} layers requires {storage_layers} storage layers; device limit is {max_layers}"
             ));
         }
         let expected = (w as usize)
@@ -477,17 +512,79 @@ impl Textures {
         let texture = Texture::from_array_bytes(
             device,
             queue,
-            &self.layouts[usize::from(layers > 1)],
+            &self.layouts[usize::from(total_layers > 1)],
             &self.nearest_sampler,
             data,
             w,
             h,
             layers,
+            spare_layers,
             Some("Egor Texture Array"),
         );
         let id = self.store.len();
         self.store.push(texture);
         Ok(id)
+    }
+
+    /// Overwrites a `w`×`h` RGBA8 region of one layer of texture `id`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_region(
+        &self,
+        queue: &Queue,
+        id: usize,
+        layer: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        data: &[u8],
+    ) -> Result<(), String> {
+        let texture = self
+            .store
+            .get(id)
+            .ok_or_else(|| format!("no texture {id}"))?
+            .view
+            .texture();
+        let size = texture.size();
+        let fits = x.checked_add(w).is_some_and(|right| right <= size.width)
+            && y.checked_add(h).is_some_and(|bottom| bottom <= size.height)
+            && layer < size.depth_or_array_layers;
+        if !fits {
+            return Err(format!(
+                "region {w}x{h} at ({x}, {y}) layer {layer} is outside texture {id} ({}x{}x{})",
+                size.width, size.height, size.depth_or_array_layers
+            ));
+        }
+        if data.len() != w as usize * h as usize * 4 {
+            return Err(format!(
+                "region {w}x{h} needs {} bytes, got {}",
+                w as usize * h as usize * 4,
+                data.len()
+            ));
+        }
+        if w == 0 || h == 0 {
+            return Ok(());
+        }
+        queue.write_texture(
+            TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: Origin3d { x, y, z: layer },
+                aspect: TextureAspect::All,
+            },
+            data,
+            TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * w),
+                rows_per_image: Some(h),
+            },
+            Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        Ok(())
     }
 
     pub fn replace(&mut self, device: &Device, queue: &Queue, id: usize, data: &[u8]) {

@@ -1311,6 +1311,43 @@ impl Renderer {
             .insert_array_raw(&self.gpu.device, &self.gpu.queue, w, h, layers, data)
     }
 
+    /// Creates a texture array from `layers` of RGBA8 data followed by
+    /// `spare_layers` transparent layers for [`Self::write_texture_region`].
+    pub fn add_texture_array_raw_with_spare_layers(
+        &mut self,
+        w: u32,
+        h: u32,
+        layers: u32,
+        spare_layers: u32,
+        data: &[u8],
+    ) -> Result<usize, String> {
+        self.textures.insert_array_raw_with_spare_layers(
+            &self.gpu.device,
+            &self.gpu.queue,
+            w,
+            h,
+            layers,
+            spare_layers,
+            data,
+        )
+    }
+
+    /// Overwrites a `w`×`h` RGBA8 region of one layer of an existing texture.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_texture_region(
+        &mut self,
+        id: usize,
+        layer: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        data: &[u8],
+    ) -> Result<(), String> {
+        self.textures
+            .write_region(&self.gpu.queue, id, layer, x, y, w, h, data)
+    }
+
     /// Replaces an existing texture with new image data
     pub fn update_texture(&mut self, index: usize, data: &[u8]) {
         self.textures
