@@ -30,7 +30,7 @@ impl Camera {
         let top = self.position.y;
         let bottom = self.position.y + height;
 
-        Mat4::orthographic_lh(left, right, bottom, top, -1.0, 1.0)
+        glam::camera::lh::proj::directx::orthographic(left, right, bottom, top, -1.0, 1.0)
     }
 
     /// Set the camera's position (top-left corner of view)
@@ -48,7 +48,7 @@ impl Camera {
         self.zoom = zoom.clamp(0.1, 10.0);
     }
 
-    /// Returns the viewport rectangle in world coordinates, factoring in zoom  
+    /// Returns the viewport rectangle in world coordinates, factoring in zoom
     /// Useful for culling or visibility checks
     pub fn viewport(&self, screen_size: Vec2) -> Rect {
         let size = screen_size / self.zoom;
@@ -78,7 +78,7 @@ mod tests {
         cam.set_zoom(1.0);
 
         let mat = cam.view_proj(vec2(800.0, 600.0));
-        let expected = Mat4::orthographic_lh(0.0, 800.0, 600.0, 0.0, -1.0, 1.0);
+        let expected = glam::camera::lh::proj::directx::orthographic(0.0, 800.0, 600.0, 0.0, -1.0, 1.0);
         assert_eq!(mat, expected);
     }
 
