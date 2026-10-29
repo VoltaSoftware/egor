@@ -32,7 +32,7 @@ pub use winit::{
 pub use winit::platform::ios::WindowExtIOS;
 
 #[cfg(target_os = "android")]
-use parking_lot::{RwLock, const_rwlock};
+use parking_lot::RwLock;
 #[cfg(target_os = "android")]
 pub use winit::platform::android::activity::AndroidApp;
 #[cfg(target_os = "android")]
@@ -51,7 +51,7 @@ pub struct AndroidAppStore {
 impl AndroidAppStore {
     pub const fn new() -> Self {
         Self {
-            app: const_rwlock(None),
+            app: RwLock::new(None),
         }
     }
 
