@@ -25,15 +25,27 @@ use crate::{
 // Render Target Store — persistent across frames, owns OffscreenTargets
 // ---------------------------------------------------------------------------
 
+/// A GPU resource the game freed, released once the frame that freed it is drawn.
+enum PendingFree {
+    Texture(usize),
+    RenderTarget(usize),
+    Uniform(usize),
+    Shader(usize),
+}
+
 /// Persistent storage for offscreen render targets created by game code.
 ///
 /// Stored in [`App`] and passed to [`Graphics`] each frame by reference.
-/// Render targets survive across frames; the game is responsible for
-/// recreating them when their size changes.
+/// Render targets survive across frames until the game frees them; resizing keeps their ids.
 pub struct RenderTargetStore {
-    targets: Vec<OffscreenTarget>,
+    targets: Vec<Option<OffscreenTarget>>,
     /// Each target's drawable texture, once registered; resizing rebinds it in place.
     textures: Vec<Option<usize>>,
+    /// Slots of freed targets, which the next ones reuse.
+    free_slots: Vec<usize>,
+    /// What the game freed this frame (any resource, not only targets). Draws recorded earlier in the frame may
+    /// still use them, so they are released at the start of the next frame.
+    pending_frees: Vec<PendingFree>,
 }
 
 impl RenderTargetStore {
@@ -41,6 +53,8 @@ impl RenderTargetStore {
         Self {
             targets: Vec::new(),
             textures: Vec::new(),
+            free_slots: Vec::new(),
+            pending_frees: Vec::new(),
         }
     }
 
@@ -52,28 +66,60 @@ impl RenderTargetStore {
         height: u32,
         format: TextureFormat,
     ) -> usize {
-        let id = self.targets.len();
-        self.targets
-            .push(OffscreenTarget::new(device, width, height, format));
-        self.textures.push(None);
-        id
+        let target = Some(OffscreenTarget::new(device, width, height, format));
+        match self.free_slots.pop() {
+            Some(id) => {
+                self.targets[id] = target;
+                self.textures[id] = None;
+                id
+            }
+            None => {
+                self.targets.push(target);
+                self.textures.push(None);
+                self.targets.len() - 1
+            }
+        }
     }
 
     /// Resize an existing offscreen target. If its dimensions already match, this is a no-op.
     pub fn resize(&mut self, device: &Device, id: usize, width: u32, height: u32) {
-        self.targets[id].resize(device, width, height);
+        self.get_mut(id).resize(device, width, height);
     }
 
     pub fn get(&self, id: usize) -> &OffscreenTarget {
-        &self.targets[id]
+        self.targets[id]
+            .as_ref()
+            .unwrap_or_else(|| panic!("render target {id} was freed"))
     }
 
     pub fn get_mut(&mut self, id: usize) -> &mut OffscreenTarget {
-        &mut self.targets[id]
+        self.targets[id]
+            .as_mut()
+            .unwrap_or_else(|| panic!("render target {id} was freed"))
     }
 
+    /// Slots in use or free; freed slots are reused before the store grows.
     pub fn len(&self) -> usize {
         self.targets.len()
+    }
+
+    /// Releases what was freed last frame. Call at the start of a frame, before the game records draws.
+    pub(crate) fn release_pending_frees(&mut self, renderer: &mut Renderer) {
+        for free in self.pending_frees.drain(..) {
+            match free {
+                PendingFree::Texture(id) => renderer.remove_texture(id),
+                PendingFree::RenderTarget(id) => {
+                    if self.targets.get_mut(id).and_then(Option::take).is_some() {
+                        if let Some(texture) = self.textures[id].take() {
+                            renderer.remove_texture(texture);
+                        }
+                        self.free_slots.push(id);
+                    }
+                }
+                PendingFree::Uniform(id) => renderer.remove_uniform(id),
+                PendingFree::Shader(id) => renderer.remove_shader(id),
+            }
+        }
     }
 }
 
@@ -2997,7 +3043,7 @@ impl<'a> Graphics<'a> {
         self.offscreen_batches.push(offscreen_batch);
     }
 
-    /// Use an offscreen target as a texture
+    /// Use an offscreen target as a texture. Each call adds a texture; free it with [`Self::free_texture`].
     pub fn offscreen_as_texture(&mut self, target: &mut OffscreenTarget) -> usize {
         self.renderer.add_offscreen_texture(target)
     }
@@ -3476,6 +3522,34 @@ impl<'a> Graphics<'a> {
                 tex_id
             }
         }
+    }
+
+    /// Frees a texture once this frame is drawn; a later texture reuses its id. Don't use the id after this.
+    pub fn free_texture(&mut self, id: usize) {
+        self.render_targets
+            .pending_frees
+            .push(PendingFree::Texture(id));
+    }
+
+    /// Frees a managed render target and its texture once this frame is drawn, like [`Self::free_texture`].
+    pub fn free_managed_render_target(&mut self, store_id: usize) {
+        self.render_targets
+            .pending_frees
+            .push(PendingFree::RenderTarget(store_id));
+    }
+
+    /// Frees a uniform once this frame is drawn, like [`Self::free_texture`].
+    pub fn free_uniform(&mut self, id: usize) {
+        self.render_targets
+            .pending_frees
+            .push(PendingFree::Uniform(id));
+    }
+
+    /// Frees a custom shader once this frame is drawn, like [`Self::free_texture`]. Its uniforms are separate.
+    pub fn free_shader(&mut self, id: usize) {
+        self.render_targets
+            .pending_frees
+            .push(PendingFree::Shader(id));
     }
 
     /// Direct subsequent draw commands to a managed offscreen render target.

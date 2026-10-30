@@ -347,7 +347,9 @@ pub(crate) struct Pipelines {
     primitive_replace: [RenderPipeline; 2],
     primitive_watch: [Option<RenderPipeline>; 2],
     primitive_replace_watch: [Option<RenderPipeline>; 2],
-    custom: Vec<CustomPipelineBinding>,
+    custom: Vec<Option<CustomPipelineBinding>>,
+    /// Slots of removed custom shaders, which the next ones reuse. Their compiled pipelines stay cached.
+    free_custom_slots: Vec<usize>,
     compiled_custom: Vec<CompiledCustomPipeline>,
     custom_cache: HashMap<CustomPipelineKey, usize>,
     texture_layout: [BindGroupLayout; 2],
@@ -436,6 +438,7 @@ impl Pipelines {
             primitive_watch,
             primitive_replace_watch,
             custom: Vec::new(),
+            free_custom_slots: Vec::new(),
             compiled_custom: Vec::new(),
             custom_cache: HashMap::new(),
             texture_layout,
@@ -520,11 +523,27 @@ impl Pipelines {
             id
         };
 
-        self.custom.push(CustomPipelineBinding {
+        let custom = Some(CustomPipelineBinding {
             compiled_pipeline_id,
             bindings,
         });
-        self.custom.len() - 1
+        match self.free_custom_slots.pop() {
+            Some(id) => {
+                self.custom[id] = custom;
+                id
+            }
+            None => {
+                self.custom.push(custom);
+                self.custom.len() - 1
+            }
+        }
+    }
+
+    /// Frees custom shader `id`; its slot goes to the next one. Draws with it fall back to the default pipeline.
+    pub fn remove_custom(&mut self, id: usize) {
+        if self.custom.get_mut(id).and_then(Option::take).is_some() {
+            self.free_custom_slots.push(id);
+        }
     }
 
     /// The layout of a [`CustomBinding::Texture`] group.
@@ -534,7 +553,7 @@ impl Pipelines {
 
     /// Points the `index`th texture binding of a custom shader at `texture_id`.
     pub fn set_custom_texture(&mut self, shader_id: usize, index: usize, texture_id: usize) {
-        let Some(custom) = self.custom.get_mut(shader_id) else {
+        let Some(Some(custom)) = self.custom.get_mut(shader_id) else {
             return;
         };
         if let Some(CustomBinding::Texture(texture)) = custom
@@ -565,7 +584,7 @@ impl Pipelines {
                 &[],
             ));
         }
-        if let Some(custom) = shader_id.and_then(|id| self.custom.get(id)) {
+        if let Some(custom) = shader_id.and_then(|id| self.custom.get(id)?.as_ref()) {
             let compiled = self.compiled_custom.get(custom.compiled_pipeline_id)?;
             if watch_overlay {
                 compiled.watch_pipeline[kind]
@@ -587,6 +606,7 @@ impl Pipelines {
                 Some(id) => self
                     .custom
                     .get(id)
+                    .and_then(Option::as_ref)
                     .and_then(|custom| self.compiled_custom.get(custom.compiled_pipeline_id))
                     .is_some_and(|compiled| compiled.watch_pipeline.iter().all(Option::is_some)),
                 None => {

@@ -26,6 +26,8 @@ pub(crate) struct Texture {
     bind_group: BindGroup,
     view: TextureView,
     linear_variant: Option<usize>,
+    /// The texture this is the linear variant of.
+    variant_of: Option<usize>,
     is_array: bool,
 }
 
@@ -276,6 +278,7 @@ impl Texture {
             bind_group: Self::create_bind_group(device, layout, &view, sampler),
             view,
             linear_variant: None,
+            variant_of: None,
             is_array: total_layers > 1,
         }
     }
@@ -308,6 +311,7 @@ impl Texture {
             bind_group: Self::create_bind_group(device, layout, &view, sampler),
             view,
             linear_variant: None,
+            variant_of: None,
             is_array: false,
         }
     }
@@ -349,7 +353,9 @@ pub(crate) struct Textures {
     default_sampler: Sampler,
     nearest_sampler: Sampler,
     default_texture: Texture,
-    store: Vec<Texture>,
+    store: Vec<Option<Texture>>,
+    /// Slots of removed textures, which the next inserts reuse.
+    free_slots: Vec<usize>,
 }
 
 impl Textures {
@@ -378,18 +384,64 @@ impl Textures {
             nearest_sampler,
             default_texture,
             store: Vec::new(),
+            free_slots: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, texture: Texture) -> usize {
+        match self.free_slots.pop() {
+            Some(id) => {
+                self.store[id] = Some(texture);
+                id
+            }
+            None => {
+                self.store.push(Some(texture));
+                self.store.len() - 1
+            }
+        }
+    }
+
+    /// Frees texture `id` and its linear variant; their slots go to the next inserts. Removing a linear variant
+    /// alone leaves its source, which makes a new variant when next asked.
+    pub fn remove(&mut self, id: usize) {
+        let Some(texture) = self.store.get_mut(id).and_then(Option::take) else {
+            return;
+        };
+        self.free_slots.push(id);
+        match texture.variant_of {
+            Some(source) => {
+                if let Some(Some(source)) = self.store.get_mut(source) {
+                    source.linear_variant = None;
+                }
+            }
+            None => {
+                if let Some(variant) = texture.linear_variant {
+                    self.remove(variant);
+                }
+            }
         }
     }
 
     /// Cache another binding to the same GPU image, without changing the original
     /// sampler or duplicating pixel storage. A different ID also splits draw batches.
     pub fn linear_variant(&mut self, device: &Device, id: usize) -> usize {
-        if let Some(variant) = self.store[id].linear_variant {
+        let Some(source) = self.store.get(id).and_then(Option::as_ref) else {
+            return id;
+        };
+        if let Some(variant) = source.linear_variant {
             return variant;
         }
-        let source = &self.store[id];
-        let variant_id = self.store.len();
-        let variant = Texture {
+        let variant = self.linear_binding(device, source, id);
+        let variant_id = self.push(variant);
+        let variant = self.store[variant_id].as_mut().unwrap();
+        variant.linear_variant = Some(variant_id);
+        self.store[id].as_mut().unwrap().linear_variant = Some(variant_id);
+        variant_id
+    }
+
+    /// A linear-sampled binding of `source` (texture `source_id`)'s image.
+    fn linear_binding(&self, device: &Device, source: &Texture, source_id: usize) -> Texture {
+        Texture {
             bind_group: Texture::create_bind_group(
                 device,
                 &self.layouts[usize::from(source.is_array)],
@@ -397,12 +449,26 @@ impl Textures {
                 &self.default_sampler,
             ),
             view: source.view.clone(),
-            linear_variant: Some(variant_id),
+            linear_variant: None,
+            variant_of: Some(source_id),
             is_array: source.is_array,
+        }
+    }
+
+    /// Puts `texture` in slot `id`, rebinding the slot's linear variant to its image so the
+    /// old image isn't kept alive.
+    fn replace_slot(&mut self, device: &Device, id: usize, mut texture: Texture) {
+        let Some(Some(old)) = self.store.get(id) else {
+            log::error!("[egor] can't replace texture {id}: it doesn't exist");
+            return;
         };
-        self.store[id].linear_variant = Some(variant_id);
-        self.store.push(variant);
-        variant_id
+        if let Some(variant) = old.linear_variant {
+            let mut binding = self.linear_binding(device, &texture, id);
+            binding.linear_variant = Some(variant);
+            self.store[variant] = Some(binding);
+            texture.linear_variant = Some(variant);
+        }
+        self.store[id] = Some(texture);
     }
 
     fn decode_rgba(data: &[u8]) -> (u32, u32, image::RgbaImage) {
@@ -413,6 +479,7 @@ impl Textures {
 
     pub fn get(&self, id: Option<usize>) -> &Texture {
         id.and_then(|i| self.store.get(i))
+            .and_then(Option::as_ref)
             .unwrap_or(&self.default_texture)
     }
 
@@ -429,8 +496,7 @@ impl Textures {
         h: u32,
         data: &[u8],
     ) -> usize {
-        let id = self.store.len();
-        self.store.push(Texture::from_bytes(
+        let texture = Texture::from_bytes(
             device,
             queue,
             &self.layouts[0],
@@ -438,8 +504,8 @@ impl Textures {
             data,
             w,
             h,
-        ));
-        id
+        );
+        self.push(texture)
     }
 
     pub fn insert_raw_nearest(
@@ -450,8 +516,7 @@ impl Textures {
         h: u32,
         data: &[u8],
     ) -> usize {
-        let id = self.store.len();
-        self.store.push(Texture::from_bytes(
+        let texture = Texture::from_bytes(
             device,
             queue,
             &self.layouts[0],
@@ -459,8 +524,8 @@ impl Textures {
             data,
             w,
             h,
-        ));
-        id
+        );
+        self.push(texture)
     }
 
     pub fn insert_array_raw(
@@ -521,9 +586,7 @@ impl Textures {
             spare_layers,
             Some("Egor Texture Array"),
         );
-        let id = self.store.len();
-        self.store.push(texture);
-        Ok(id)
+        Ok(self.push(texture))
     }
 
     /// Overwrites a `w`×`h` RGBA8 region of one layer of texture `id`.
@@ -542,6 +605,7 @@ impl Textures {
         let texture = self
             .store
             .get(id)
+            .and_then(Option::as_ref)
             .ok_or_else(|| format!("no texture {id}"))?
             .view
             .texture();
@@ -601,7 +665,7 @@ impl Textures {
         h: u32,
         data: &[u8],
     ) {
-        self.store[id] = Texture::from_bytes(
+        let texture = Texture::from_bytes(
             device,
             queue,
             &self.layouts[0],
@@ -610,12 +674,12 @@ impl Textures {
             w,
             h,
         );
+        self.replace_slot(device, id, texture);
     }
 
     pub fn insert_nearest(&mut self, device: &Device, queue: &Queue, data: &[u8]) -> usize {
         let (w, h, img) = Self::decode_rgba(data);
-        let id = self.store.len();
-        self.store.push(Texture::from_bytes(
+        let texture = Texture::from_bytes(
             device,
             queue,
             &self.layouts[0],
@@ -623,8 +687,8 @@ impl Textures {
             &img,
             w,
             h,
-        ));
-        id
+        );
+        self.push(texture)
     }
 
     pub fn insert_offscreen(
@@ -633,10 +697,8 @@ impl Textures {
         offscreen: &OffscreenTarget,
         filter: FilterMode,
     ) -> usize {
-        let id = self.store.len();
-        self.store
-            .push(self.offscreen_texture(device, offscreen, filter));
-        id
+        let texture = self.offscreen_texture(device, offscreen, filter);
+        self.push(texture)
     }
 
     /// Rebinds texture `id` to `offscreen`'s image after the target was resized. The id stays valid, and the
@@ -648,22 +710,8 @@ impl Textures {
         offscreen: &OffscreenTarget,
         filter: FilterMode,
     ) {
-        let mut texture = self.offscreen_texture(device, offscreen, filter);
-        if let Some(variant) = self.store[id].linear_variant {
-            self.store[variant] = Texture {
-                bind_group: Texture::create_bind_group(
-                    device,
-                    &self.layouts[0],
-                    &texture.view,
-                    &self.default_sampler,
-                ),
-                view: texture.view.clone(),
-                linear_variant: Some(variant),
-                is_array: false,
-            };
-            texture.linear_variant = Some(variant);
-        }
-        self.store[id] = texture;
+        let texture = self.offscreen_texture(device, offscreen, filter);
+        self.replace_slot(device, id, texture);
     }
 
     fn offscreen_texture(

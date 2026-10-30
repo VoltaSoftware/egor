@@ -1435,6 +1435,7 @@ impl AppHandler<Renderer> for App {
 
         self.events_drained.clear();
         std::mem::swap(&mut self.events, &mut self.events_drained);
+        self.render_targets.release_pending_frees(renderer);
 
         let (
             requested_size,
