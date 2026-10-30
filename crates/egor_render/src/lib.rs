@@ -1433,6 +1433,12 @@ impl Renderer {
             .replace_raw(&self.gpu.device, &self.gpu.queue, index, w, h, data);
     }
 
+    /// Frees texture `id` (and its linear variant) right away; the next texture reuses its id. Nothing recorded
+    /// but not yet drawn may still use it: `egor_glue`'s `Graphics::free_texture` waits for the frame to end.
+    pub fn remove_texture(&mut self, id: usize) {
+        self.textures.remove(id);
+    }
+
     /// Creates a uniform buffer and returns its id
     pub fn add_uniform(&mut self, data: &[u8]) -> usize {
         self.uniforms.insert(&self.gpu.device, data)
@@ -1441,6 +1447,17 @@ impl Renderer {
     /// Updates an existing uniform buffer with new data
     pub fn update_uniform(&mut self, id: usize, data: &[u8]) {
         self.uniforms.write(&self.gpu.queue, id, data);
+    }
+
+    /// Frees uniform `id` right away, like [`Self::remove_texture`].
+    pub fn remove_uniform(&mut self, id: usize) {
+        self.uniforms.remove(id);
+    }
+
+    /// Frees custom shader `id` right away, like [`Self::remove_texture`]. Its compiled pipeline stays cached
+    /// for the next shader with the same source.
+    pub fn remove_shader(&mut self, id: usize) {
+        self.pipelines.remove_custom(id);
     }
 
     /// Creates a custom shader pipeline from WGSL source code

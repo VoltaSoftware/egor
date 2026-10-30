@@ -31,7 +31,9 @@ struct UniformEntry {
 
 pub(crate) struct Uniforms {
     layout: BindGroupLayout,
-    store: Vec<UniformEntry>,
+    store: Vec<Option<UniformEntry>>,
+    /// Slots of removed uniforms, which the next inserts reuse.
+    free_slots: Vec<usize>,
 }
 
 impl Uniforms {
@@ -53,11 +55,15 @@ impl Uniforms {
         Self {
             layout,
             store: Vec::new(),
+            free_slots: Vec::new(),
         }
     }
 
     pub fn bind_group(&self, uniform_id: usize) -> &BindGroup {
-        &self.store[uniform_id].bind_group
+        &self.store[uniform_id]
+            .as_ref()
+            .expect("drew with a removed uniform")
+            .bind_group
     }
 
     pub fn layout(&self) -> &BindGroupLayout {
@@ -80,12 +86,30 @@ impl Uniforms {
             }],
         });
 
-        let id = self.store.len();
-        self.store.push(UniformEntry { buffer, bind_group });
-        id
+        let entry = Some(UniformEntry { buffer, bind_group });
+        match self.free_slots.pop() {
+            Some(id) => {
+                self.store[id] = entry;
+                id
+            }
+            None => {
+                self.store.push(entry);
+                self.store.len() - 1
+            }
+        }
+    }
+
+    /// Frees uniform `id`; its slot goes to the next insert.
+    pub fn remove(&mut self, id: usize) {
+        if self.store.get_mut(id).and_then(Option::take).is_some() {
+            self.free_slots.push(id);
+        }
     }
 
     pub fn write(&mut self, queue: &Queue, id: usize, data: &[u8]) {
-        queue.write_buffer(&self.store[id].buffer, 0, data);
+        match self.store.get(id) {
+            Some(Some(entry)) => queue.write_buffer(&entry.buffer, 0, data),
+            _ => log::error!("[egor] can't write uniform {id}: it doesn't exist"),
+        }
     }
 }
