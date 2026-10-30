@@ -229,6 +229,9 @@ pub struct Renderer {
     shared_instance_buffer: Option<Buffer>,
     instance_upload_pool: Option<instance_upload::InstanceUploadPool>,
     last_camera: [[[f32; 4]; 4]; 8],
+    /// The backbuffer's turn; while it isn't identity, every camera slot has a turned copy
+    /// `camera_slot_count` slots on, for draws straight into the backbuffer.
+    surface_transform: wgpu::SurfaceTransform,
 }
 
 impl Renderer {
@@ -421,7 +424,8 @@ impl Renderer {
         let camera_slot_stride =
             ((camera_data_size + min_alignment - 1) / min_alignment) * min_alignment;
         let camera_slot_count: u32 = 8;
-        let camera_buffer_size = camera_slot_stride * camera_slot_count;
+        // Room for the turned copies too.
+        let camera_buffer_size = camera_slot_stride * camera_slot_count * 2;
 
         let camera_buffer = device.create_buffer_init(&BufferInitDescriptor {
             label: None,
@@ -479,6 +483,7 @@ impl Renderer {
             shared_instance_buffer: None,
             instance_upload_pool,
             last_camera: [[[0.0; 4]; 4]; 8],
+            surface_transform: wgpu::SurfaceTransform::Identity,
         })
     }
 
@@ -1142,6 +1147,8 @@ impl Renderer {
     /// Writes a camera matrix into the given slot of the multi-slot camera buffer.
     /// Slot must be < camera_slot_count. Uses queue.write_buffer so ALL writes
     /// are applied before the next queue.submit.
+    /// With a turned backbuffer (see [`Self::set_surface_transform`]) it also writes the turned
+    /// copy to `slot + camera_slot_count`.
     pub fn write_camera_slot(&mut self, slot: u32, view_proj: [[f32; 4]; 4]) {
         debug_assert!(slot < self.camera_slot_count);
         let s = slot as usize;
@@ -1149,12 +1156,33 @@ impl Renderer {
             return;
         }
         self.last_camera[s] = view_proj;
+        self.write_camera_uniform(slot, view_proj);
+        if self.surface_transform != wgpu::SurfaceTransform::Identity {
+            self.write_camera_uniform(
+                slot + self.camera_slot_count,
+                target::turn_view_proj(view_proj, self.surface_transform),
+            );
+        }
+    }
+
+    fn write_camera_uniform(&self, slot: u32, view_proj: [[f32; 4]; 4]) {
         let offset = (slot * self.camera_slot_stride) as u64;
         self.gpu.queue.write_buffer(
             &self.camera_buffer,
             offset,
             bytemuck::bytes_of(&CameraUniform { view_proj }),
         );
+    }
+
+    /// Sets the backbuffer's turn ([`target::Backbuffer::transform`]) before this frame's camera
+    /// writes, so draws into the backbuffer can use the turned camera slots.
+    pub fn set_surface_transform(&mut self, transform: wgpu::SurfaceTransform) {
+        if self.surface_transform == transform {
+            return;
+        }
+        self.surface_transform = transform;
+        // Write every camera again, turned the new way.
+        self.last_camera = [[[f32::NAN; 4]; 4]; 8];
     }
 
     /// Returns the byte stride between camera slots (aligned to GPU requirements)

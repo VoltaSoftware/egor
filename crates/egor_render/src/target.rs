@@ -1,8 +1,8 @@
 use wgpu::{
     Adapter, CompositeAlphaMode, CurrentSurfaceTexture, Device, DownlevelFlags, Extent3d, Instance,
-    PresentMode, Surface, SurfaceConfiguration, SurfaceTarget, Texture, TextureDescriptor,
-    TextureDimension, TextureFormat, TextureUsages, TextureView, TextureViewDescriptor,
-    WindowHandle,
+    PresentMode, Surface, SurfaceConfiguration, SurfaceTarget, SurfaceTransform, Texture,
+    TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView,
+    TextureViewDescriptor, WindowHandle,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -28,6 +28,43 @@ pub fn fit_to_texture_limit(device: &Device, w: u32, h: u32) -> (u32, u32) {
     let scale = f64::from(max) / f64::from(w.max(h));
     let fit = |side: u32| ((f64::from(side) * scale) as u32).clamp(1, max);
     (fit(w), fit(h))
+}
+
+// A pre-rotated backbuffer (see `wgpu::SurfaceTransform`) holds the frame turned clockwise to the
+// display's panel. Draws into it keep the frame's own coordinates and turn at the end, in clip
+// space for geometry and in pixels for scissor rects.
+
+/// A clip-space point turned like a frame drawn into a surface with `turn` as its transform.
+pub fn turn_clip_point(x: f32, y: f32, turn: SurfaceTransform) -> (f32, f32) {
+    match turn {
+        SurfaceTransform::Identity => (x, y),
+        SurfaceTransform::Rotate90 => (y, -x),
+        SurfaceTransform::Rotate180 => (-x, -y),
+        SurfaceTransform::Rotate270 => (-y, x),
+    }
+}
+
+/// `view_proj` followed by the turn into a surface with `turn` as its transform.
+pub fn turn_view_proj(view_proj: [[f32; 4]; 4], turn: SurfaceTransform) -> [[f32; 4]; 4] {
+    view_proj.map(|[x, y, z, w]| {
+        let (x, y) = turn_clip_point(x, y, turn);
+        [x, y, z, w]
+    })
+}
+
+/// A pixel rect `(x, y, w, h)` inside a `frame_w`x`frame_h` frame, turned into a surface with
+/// `turn` as its transform.
+pub fn turn_rect(
+    (x, y, w, h): (u32, u32, u32, u32),
+    (frame_w, frame_h): (u32, u32),
+    turn: SurfaceTransform,
+) -> (u32, u32, u32, u32) {
+    match turn {
+        SurfaceTransform::Identity => (x, y, w, h),
+        SurfaceTransform::Rotate90 => (frame_h - y - h, x, h, w),
+        SurfaceTransform::Rotate180 => (frame_w - x - w, frame_h - y - h, w, h),
+        SurfaceTransform::Rotate270 => (y, frame_w - x - w, h, w),
+    }
 }
 
 #[cfg(target_os = "android")]
@@ -123,6 +160,7 @@ fn android_gl_fallback_surface_config(
         desired_maximum_frame_latency: DESIRED_MAXIMUM_FRAME_LATENCY,
         alpha_mode: CompositeAlphaMode::Auto,
         view_formats: Vec::new(),
+        pre_transform: SurfaceTransform::Identity,
     };
     Ok((config, format, false))
 }
@@ -135,6 +173,18 @@ fn is_android_gl(adapter: &Adapter) -> bool {
 #[cfg(not(target_os = "android"))]
 fn is_android_gl(_adapter: &Adapter) -> bool {
     false
+}
+
+/// Sizes `config` for a `w`x`h` frame drawn pre-rotated to `transform`, the display's turn from its
+/// panel. The compositor then shows frames as they are instead of turning each one, which phones
+/// whose display hardware can't rotate (Android's client composition) do on the GPU every frame.
+fn set_extent(config: &mut SurfaceConfiguration, transform: SurfaceTransform, w: u32, h: u32) {
+    config.pre_transform = transform;
+    (config.width, config.height) = if transform.swaps_extent() {
+        (h, w)
+    } else {
+        (w, h)
+    };
 }
 
 pub(crate) fn surface_config(
@@ -160,12 +210,14 @@ pub(crate) fn surface_config(
             })?;
     config.present_mode = vsync_present_mode();
     config.desired_maximum_frame_latency = DESIRED_MAXIMUM_FRAME_LATENCY;
+    set_extent(&mut config, caps.current_transform, w, h);
     if cfg!(debug_assertions) {
         log::info!(
-            "[egor] surface capabilities: present_modes={:?} usages={:?} formats={:?}",
+            "[egor] surface capabilities: present_modes={:?} usages={:?} formats={:?} transform={:?}",
             caps.present_modes,
             caps.usages,
-            caps.formats
+            caps.formats,
+            caps.current_transform
         );
     }
 
@@ -237,6 +289,10 @@ pub struct Backbuffer {
     last_acquire_failure: Option<SurfaceAcquireFailure>,
     /// The size the surface was asked for; the config holds it fitted to the texture limit.
     window_size: (u32, u32),
+    /// For reading the display's turn when the surface reports that it changed.
+    adapter: Adapter,
+    /// Set by a suboptimal acquire, which a pre-rotated surface reports after the display turns.
+    check_turn: bool,
 }
 
 impl Backbuffer {
@@ -298,6 +354,8 @@ impl Backbuffer {
             surface_copy_src,
             last_acquire_failure: None,
             window_size: (w, h),
+            adapter: adapter.clone(),
+            check_turn: false,
         })
     }
 
@@ -305,7 +363,44 @@ impl Backbuffer {
     /// limit and the frame is scaled up to fill it. Multiply the window's scale factor by this to get
     /// drawn pixels per logical pixel.
     pub fn render_scale(&self) -> f32 {
-        self.config.width as f32 / self.window_size.0.max(1) as f32
+        self.size().0 as f32 / self.window_size.0.max(1) as f32
+    }
+
+    /// How the surface's images are turned from the frame (see [`turn_view_proj`]); draws straight
+    /// into them must turn to match.
+    pub fn transform(&self) -> SurfaceTransform {
+        self.config.pre_transform
+    }
+
+    /// The surface's images' size: [`RenderTarget::size`], swapped when [`Self::transform`] turns
+    /// the frame a quarter.
+    pub fn surface_size(&self) -> (u32, u32) {
+        (self.config.width, self.config.height)
+    }
+
+    /// Follows a turn of the display reported by the last acquire, before this frame's draws read
+    /// [`Self::transform`]. The frame acquired with that report is still shown the right way round,
+    /// turned by the compositor.
+    pub fn follow_display_turn(&mut self, device: &Device) {
+        if !std::mem::take(&mut self.check_turn) {
+            return;
+        }
+        let transform = self
+            .surface
+            .get_capabilities(&self.adapter)
+            .current_transform;
+        if transform == self.config.pre_transform {
+            return;
+        }
+        log::info!(
+            "[egor] display turned: pre-rotating {:?} -> {transform:?}",
+            self.config.pre_transform
+        );
+        let (w, h) = self.size();
+        set_extent(&mut self.config, transform, w, h);
+        if let Err(error) = self.reconfigure(device) {
+            log::warn!("[egor] surface configure after display turn failed: {error:?}");
+        }
     }
 
     pub fn supports_copy_src(&self) -> bool {
@@ -387,8 +482,14 @@ impl RenderTarget for Backbuffer {
         self.view_format
     }
 
+    /// The frame's size, which is the surface's turned back when it is pre-rotated.
     fn size(&self) -> (u32, u32) {
-        (self.config.width, self.config.height)
+        let (w, h) = self.surface_size();
+        if self.config.pre_transform.swaps_extent() {
+            (h, w)
+        } else {
+            (w, h)
+        }
     }
 
     fn acquire(&mut self, device: &Device) -> Option<(TextureView, Option<Presentable>)> {
@@ -413,7 +514,11 @@ impl RenderTarget for Backbuffer {
             }
         }
 
-        match self.get_current_texture() {
+        let texture = self.get_current_texture();
+        if matches!(texture, CurrentSurfaceTexture::Suboptimal(_)) {
+            self.check_turn = true;
+        }
+        match texture {
             CurrentSurfaceTexture::Success(surface_texture)
             | CurrentSurfaceTexture::Suboptimal(surface_texture) => {
                 self.record_acquire_success();
@@ -459,10 +564,14 @@ impl RenderTarget for Backbuffer {
         }
         self.window_size = (w, h);
         let (fit_w, fit_h) = fit_to_texture_limit(device, w, h);
-        if self.config.width == fit_w && self.config.height == fit_h {
+        let transform = self
+            .surface
+            .get_capabilities(&self.adapter)
+            .current_transform;
+        if self.size() == (fit_w, fit_h) && self.config.pre_transform == transform {
             return;
         }
-        (self.config.width, self.config.height) = (fit_w, fit_h);
+        set_extent(&mut self.config, transform, fit_w, fit_h);
         if let Err(error) = self.reconfigure(device) {
             log::warn!("[egor] surface resize configure failed: {error:?}");
         }
@@ -596,7 +705,44 @@ impl RenderTarget for OffscreenTarget {
 
 #[cfg(test)]
 mod tests {
-    use super::fit_to_texture_limit;
+    use super::{fit_to_texture_limit, turn_clip_point, turn_rect};
+    use wgpu::SurfaceTransform;
+
+    #[test]
+    fn turned_scissor_rects_cover_the_turned_geometry() {
+        let frame = (40, 30);
+        let rect = (4, 6, 10, 8);
+        for turn in [
+            SurfaceTransform::Identity,
+            SurfaceTransform::Rotate90,
+            SurfaceTransform::Rotate180,
+            SurfaceTransform::Rotate270,
+        ] {
+            let surface = if turn.swaps_extent() {
+                (frame.1, frame.0)
+            } else {
+                frame
+            };
+            // The rect's corners through clip space, as the turned camera draws them.
+            let (mut min, mut max) = ((f32::MAX, f32::MAX), (f32::MIN, f32::MIN));
+            for (px, py) in [(rect.0, rect.1), (rect.0 + rect.2, rect.1 + rect.3)] {
+                let x = px as f32 / frame.0 as f32 * 2.0 - 1.0;
+                let y = 1.0 - py as f32 / frame.1 as f32 * 2.0;
+                let (x, y) = turn_clip_point(x, y, turn);
+                let (sx, sy) = (
+                    ((x + 1.0) / 2.0 * surface.0 as f32).round(),
+                    ((1.0 - y) / 2.0 * surface.1 as f32).round(),
+                );
+                (min, max) = (
+                    (min.0.min(sx), min.1.min(sy)),
+                    (max.0.max(sx), max.1.max(sy)),
+                );
+            }
+            let drawn = (min.0, min.1, max.0 - min.0, max.1 - min.1);
+            let (x, y, w, h) = turn_rect(rect, frame, turn);
+            assert_eq!(drawn, (x as f32, y as f32, w as f32, h as f32), "{turn:?}");
+        }
+    }
 
     #[test]
     fn fits_windows_beyond_the_texture_limit_keeping_aspect_ratio() {
