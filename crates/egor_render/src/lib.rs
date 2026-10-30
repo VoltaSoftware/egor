@@ -232,6 +232,8 @@ pub struct Renderer {
     /// The backbuffer's turn; while it isn't identity, every camera slot has a turned copy
     /// `camera_slot_count` slots on, for draws straight into the backbuffer.
     surface_transform: wgpu::SurfaceTransform,
+    /// Where `save_pipeline_cache` keeps the driver's compiled pipelines.
+    pipeline_cache_file: Option<std::path::PathBuf>,
 }
 
 impl Renderer {
@@ -252,7 +254,7 @@ impl Renderer {
         memory_hints: &MemoryHints,
         backend_preference: RendererBackendPreference,
     ) -> Self {
-        Self::try_new_with_backend(window, memory_hints, backend_preference)
+        Self::try_new_with_backend(window, memory_hints, backend_preference, None)
             .await
             .expect("failed to initialize egor renderer")
     }
@@ -261,13 +263,18 @@ impl Renderer {
         window: impl Into<SurfaceTarget<'static>> + WindowHandle,
         memory_hints: &MemoryHints,
     ) -> Result<Self, RendererInitError> {
-        Self::try_new_with_backend(window, memory_hints, RendererBackendPreference::Auto).await
+        Self::try_new_with_backend(window, memory_hints, RendererBackendPreference::Auto, None)
+            .await
     }
 
+    /// `pipeline_cache_dir` keeps the driver's compiled pipelines between runs, where the driver can (Vulkan):
+    /// compiling a pipeline can take tens of milliseconds on a phone. Save it with
+    /// [`Self::save_pipeline_cache`].
     pub async fn try_new_with_backend(
         window: impl Into<SurfaceTarget<'static>> + WindowHandle,
         memory_hints: &MemoryHints,
         backend_preference: RendererBackendPreference,
+        pipeline_cache_dir: Option<&std::path::Path>,
     ) -> Result<Self, RendererInitError> {
         log::info!("[egor] renderer init: creating wgpu instance");
         let mut desc = renderer_instance_descriptor();
@@ -358,15 +365,43 @@ impl Renderer {
             wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter_limits);
         #[cfg(not(target_arch = "wasm32"))]
         let required_limits = adapter_limits;
+        // Where the driver's compiled pipelines are kept between runs, for drivers that can (Vulkan).
+        let pipeline_cache_file = pipeline_cache_dir
+            .zip(wgpu::util::pipeline_cache_key(&adapter.get_info()))
+            .filter(|_| adapter.features().contains(wgpu::Features::PIPELINE_CACHE))
+            .map(|(dir, key)| dir.join(key));
+        let required_features = if pipeline_cache_file.is_some() {
+            wgpu::Features::PIPELINE_CACHE
+        } else {
+            wgpu::Features::empty()
+        };
         log::info!("[egor] renderer init: requesting device");
         let (device, queue) = adapter
             .request_device(&DeviceDescriptor {
+                required_features,
                 required_limits,
                 memory_hints: memory_hints.clone(),
                 ..Default::default()
             })
             .await
             .map_err(|error| RendererInitError::RequestDevice(error.to_string()))?;
+        let pipeline_cache = pipeline_cache_file.as_ref().map(|file| {
+            let data = std::fs::read(file).ok();
+            log::info!(
+                "[egor] renderer init: pipeline cache {} ({} bytes)",
+                file.display(),
+                data.as_ref().map_or(0, Vec::len)
+            );
+            // SAFETY: the file only ever holds `PipelineCache::get_data` from a device with the same cache key
+            // (`save_pipeline_cache`); a driver that can't use it starts an empty cache (`fallback`).
+            unsafe {
+                device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+                    label: Some("egor pipeline cache"),
+                    data: data.as_deref(),
+                    fallback: true,
+                })
+            }
+        });
         let device_lost = Arc::new(AtomicBool::new(false));
         let device_lost_callback = Arc::clone(&device_lost);
         device.set_device_lost_callback(move |reason, message| {
@@ -402,7 +437,12 @@ impl Renderer {
             "[egor] renderer init: watch overlay capture MRT supported: {watch_overlay_supported}"
         );
         log::info!("[egor] renderer init: creating pipelines and core buffers");
-        let pipelines = Pipelines::new(&device, surface_format, watch_overlay_supported);
+        let pipelines = Pipelines::new(
+            &device,
+            surface_format,
+            watch_overlay_supported,
+            pipeline_cache,
+        );
 
         let quad_vertex_buffer = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("Static Unit Quad VB"),
@@ -484,6 +524,7 @@ impl Renderer {
             instance_upload_pool,
             last_camera: [[[0.0; 4]; 4]; 8],
             surface_transform: wgpu::SurfaceTransform::Identity,
+            pipeline_cache_file,
         })
     }
 
@@ -1436,6 +1477,33 @@ impl Renderer {
             &layouts,
             bindings,
         )
+    }
+
+    /// Writes the driver's compiled pipelines to the pipeline cache file, so the next run starts with them.
+    /// Call it after compiling a batch of pipelines, such as while loading. A no-op without a cache.
+    pub fn save_pipeline_cache(&self) {
+        let (Some(file), Some(data)) = (&self.pipeline_cache_file, self.pipelines.cache_data())
+        else {
+            return;
+        };
+        // Through a temporary file, so a crash mid-write never leaves a torn cache.
+        let temp = file.with_extension("tmp");
+        let result = file
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&temp, &data))
+            .and_then(|()| std::fs::rename(&temp, file));
+        match result {
+            Ok(()) => log::info!(
+                "[egor] saved pipeline cache {} ({} bytes)",
+                file.display(),
+                data.len()
+            ),
+            Err(error) => log::warn!(
+                "[egor] saving pipeline cache {} failed: {error}",
+                file.display()
+            ),
+        }
     }
 
     /// Points texture `index` of a shader from [`Self::add_shader_with_textures`] at a 2D texture,

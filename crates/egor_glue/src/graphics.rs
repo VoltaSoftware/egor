@@ -3362,6 +3362,11 @@ impl<'a> Graphics<'a> {
         self.current_shader = shader_id;
     }
 
+    /// Keeps the pipelines compiled so far for the next run (see `App::pipeline_cache_dir`).
+    pub fn save_pipeline_cache(&self) {
+        self.renderer.save_pipeline_cache();
+    }
+
     /// Set the scissor rect for subsequent draw commands.
     /// `None` disables scissoring (full viewport).
     pub fn set_scissor(&mut self, rect: Option<(u32, u32, u32, u32)>) {

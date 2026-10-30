@@ -574,6 +574,7 @@ pub struct App {
     render_targets: RenderTargetStore,
     screen_capture: ScreenCaptureState,
     prewarm_watch_capture: bool,
+    pipeline_cache_dir: Option<std::path::PathBuf>,
     fps_limit: Option<u16>,
     native_refresh_rate_fps: Option<u16>,
     capture_frame_target: Option<CaptureFrameTarget>,
@@ -621,6 +622,7 @@ impl App {
             render_targets: RenderTargetStore::new(),
             screen_capture: ScreenCaptureState::new(),
             prewarm_watch_capture: false,
+            pipeline_cache_dir: None,
             fps_limit: None,
             native_refresh_rate_fps: None,
             capture_frame_target: None,
@@ -666,6 +668,14 @@ impl App {
     /// them during gameplay. Downsample/readback buffers remain on demand.
     pub fn prewarm_watch_capture(mut self) -> Self {
         self.prewarm_watch_capture = true;
+        self
+    }
+
+    /// Keeps the GPU driver's compiled pipelines in this directory between runs, where the driver can
+    /// (Vulkan), so pipelines compiled once don't cost a phone tens of milliseconds each again. Save it with
+    /// `Graphics::save_pipeline_cache` after compiling them.
+    pub fn pipeline_cache_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.pipeline_cache_dir = Some(dir.into());
         self
     }
 
@@ -1061,6 +1071,7 @@ impl App {
                 window.clone(),
                 &self.memory_hints,
                 self.renderer_backend,
+                self.pipeline_cache_dir.as_deref(),
             )
             .await
             {

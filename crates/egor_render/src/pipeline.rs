@@ -3,9 +3,10 @@ use std::{borrow::Cow, collections::HashMap};
 use wgpu::{
     BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType, BlendState,
     BufferBindingType, ColorTargetState, ColorWrites, CompareFunction, DepthStencilState, Device,
-    FragmentState, PipelineLayoutDescriptor, RenderPipeline, RenderPipelineDescriptor,
-    SamplerBindingType, ShaderModuleDescriptor, ShaderSource, ShaderStages, StencilState,
-    TextureFormat, TextureSampleType, TextureViewDimension, VertexState,
+    FragmentState, PipelineCache, PipelineLayoutDescriptor, RenderPipeline,
+    RenderPipelineDescriptor, SamplerBindingType, ShaderModuleDescriptor, ShaderSource,
+    ShaderStages, StencilState, TextureFormat, TextureSampleType, TextureViewDimension,
+    VertexState,
 };
 
 use crate::{instance::Instance, vertex::Vertex};
@@ -352,6 +353,8 @@ pub(crate) struct Pipelines {
     texture_layout: [BindGroupLayout; 2],
     pub camera_layout: BindGroupLayout,
     watch_overlay_supported: bool,
+    /// The driver's compiled pipelines, kept between runs (`Renderer::save_pipeline_cache`).
+    cache: Option<PipelineCache>,
 }
 
 impl Pipelines {
@@ -360,6 +363,7 @@ impl Pipelines {
         device: &Device,
         surface_format: TextureFormat,
         watch_overlay_supported: bool,
+        cache: Option<PipelineCache>,
     ) -> Self {
         let texture_layout =
             std::array::from_fn(|kind| create_texture_bind_group_layout(device, kind == 1));
@@ -376,6 +380,7 @@ impl Pipelines {
                 false,
                 false,
                 kind == 1,
+                cache.as_ref(),
             )
         });
         let primitive_replace = std::array::from_fn(|kind| {
@@ -389,6 +394,7 @@ impl Pipelines {
                 true,
                 false,
                 kind == 1,
+                cache.as_ref(),
             )
         });
         let primitive_watch = std::array::from_fn(|kind| {
@@ -403,6 +409,7 @@ impl Pipelines {
                     false,
                     true,
                     kind == 1,
+                    cache.as_ref(),
                 )
             })
         });
@@ -418,6 +425,7 @@ impl Pipelines {
                     true,
                     true,
                     kind == 1,
+                    cache.as_ref(),
                 )
             })
         });
@@ -433,7 +441,13 @@ impl Pipelines {
             texture_layout,
             camera_layout,
             watch_overlay_supported,
+            cache,
         }
+    }
+
+    /// The driver's compiled pipelines so far, to keep for the next run.
+    pub fn cache_data(&self) -> Option<Vec<u8>> {
+        self.cache.as_ref()?.get_data()
     }
 
     /// Creates a custom shader pipeline from WGSL source
@@ -471,6 +485,7 @@ impl Pipelines {
                     &self.camera_layout,
                     uniform_layouts,
                     &source,
+                    self.cache.as_ref(),
                 );
                 let watch = if self.watch_overlay_supported {
                     create_custom_watch_pipeline(
@@ -480,6 +495,7 @@ impl Pipelines {
                         &self.camera_layout,
                         uniform_layouts,
                         &source,
+                        self.cache.as_ref(),
                     )
                 } else {
                     None
@@ -655,6 +671,7 @@ fn create_primitive_pipeline(
     replace: bool,
     watch_overlay: bool,
     texture_array: bool,
+    cache: Option<&PipelineCache>,
 ) -> RenderPipeline {
     let source = crate::prepare_texture_shader(include_str!("../shader.wgsl"), texture_array);
     let shader = device.create_shader_module(ShaderModuleDescriptor {
@@ -735,7 +752,7 @@ fn create_primitive_pipeline(
             compilation_options: Default::default(),
         }),
         multiview_mask: None,
-        cache: None,
+        cache,
     })
 }
 
@@ -753,6 +770,7 @@ fn create_custom_pipeline(
     camera_layout: &BindGroupLayout,
     extra_layouts: &[&BindGroupLayout],
     wgsl_source: &str,
+    cache: Option<&PipelineCache>,
 ) -> RenderPipeline {
     let wgsl_source = custom_shader_source(wgsl_source, surface_format);
     let shader = device.create_shader_module(ShaderModuleDescriptor {
@@ -799,7 +817,7 @@ fn create_custom_pipeline(
             compilation_options: Default::default(),
         }),
         multiview_mask: None,
-        cache: None,
+        cache,
     })
 }
 
@@ -810,6 +828,7 @@ fn create_custom_watch_pipeline(
     camera_layout: &BindGroupLayout,
     extra_layouts: &[&BindGroupLayout],
     wgsl_source: &str,
+    cache: Option<&PipelineCache>,
 ) -> Option<RenderPipeline> {
     let wgsl_source = wrap_custom_shader_for_watch_output(
         wgsl_source,
@@ -866,7 +885,7 @@ fn create_custom_watch_pipeline(
             compilation_options: Default::default(),
         }),
         multiview_mask: None,
-        cache: None,
+        cache,
     }))
 }
 
@@ -932,7 +951,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     fn custom_pipeline_programs_are_reused_across_uniform_bindings() {
         let (device, _queue) = Device::noop(&wgpu::DeviceDescriptor::default());
         let surface_format = TextureFormat::Rgba8Unorm;
-        let mut pipelines = Pipelines::new(&device, surface_format, true);
+        let mut pipelines = Pipelines::new(&device, surface_format, true, None);
         let uniform_layout = create_camera_bind_group_layout(&device);
 
         let first = pipelines.add_custom(
@@ -976,7 +995,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     fn custom_pipeline_cache_keeps_compilation_inputs_separate() {
         let (device, _queue) = Device::noop(&wgpu::DeviceDescriptor::default());
         let surface_format = TextureFormat::Rgba8Unorm;
-        let mut pipelines = Pipelines::new(&device, surface_format, false);
+        let mut pipelines = Pipelines::new(&device, surface_format, false, None);
         let first_layout = create_camera_bind_group_layout(&device);
         let second_layout = create_camera_bind_group_layout(&device);
 

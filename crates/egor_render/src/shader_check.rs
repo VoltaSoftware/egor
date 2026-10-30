@@ -50,7 +50,7 @@ pub fn check_custom_shader_with_textures(
     let mut errors = Vec::new();
     let uniforms = Uniforms::new(&device);
     for surface_format in SURFACE_FORMATS {
-        let mut pipelines = Pipelines::new(&device, surface_format, true);
+        let mut pipelines = Pipelines::new(&device, surface_format, true, None);
         let texture_layout = pipelines.texture_layout_2d().clone();
         let mut layouts = vec![uniforms.layout(); uniform_sizes.len()];
         layouts.extend(std::iter::repeat_n(&texture_layout, texture_count));
