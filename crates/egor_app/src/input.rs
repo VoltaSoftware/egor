@@ -2,6 +2,7 @@ pub use winit::{event::MouseButton, event::Touch, event::TouchPhase, keyboard::K
 
 use std::collections::HashMap;
 
+use web_time::Instant;
 use winit::{
     dpi::PhysicalPosition,
     event::{DeviceId, ElementState, Ime, KeyEvent},
@@ -34,6 +35,8 @@ pub enum TouchSource {
 
 pub struct Input {
     keyboard: HashMap<KeyCode, (ElementState, ElementState)>, // (current, previous) state
+    /// When each key in `keyboard` last changed state, by the platform's event time.
+    key_times: HashMap<KeyCode, Instant>,
     mouse_buttons: HashMap<MouseButton, (ElementState, ElementState)>,
     mouse_position: (f32, f32),
     mouse_delta: (f32, f32),
@@ -54,6 +57,7 @@ impl Default for Input {
     fn default() -> Self {
         Self {
             keyboard: HashMap::default(),
+            key_times: HashMap::default(),
             mouse_buttons: HashMap::default(),
             mouse_position: (0.0, 0.0),
             mouse_delta: (0.0, 0.0),
@@ -101,8 +105,8 @@ impl Input {
             .unwrap_or(TouchSource::RealTouch)
     }
 
-    /// Update keyboard state from a `winit` KeyEvent
-    pub(crate) fn update_key(&mut self, event: KeyEvent) {
+    /// Update keyboard state from a `winit` KeyEvent that happened at `time`
+    pub(crate) fn update_key(&mut self, event: KeyEvent, time: Instant) {
         if event.state == ElementState::Pressed {
             if let Some(ref text) = event.text {
                 for c in text.chars() {
@@ -116,6 +120,9 @@ impl Input {
                 .get(&key_code)
                 .map_or(ElementState::Released, |(curr, _)| *curr);
             self.keyboard.insert(key_code, (event.state, prev));
+            if event.state != prev {
+                self.key_times.insert(key_code, time);
+            }
         }
     }
 
@@ -216,8 +223,14 @@ impl Input {
         }
     }
 
-    /// Simulate a touch event from mouse input (called internally when simulation is enabled)
-    pub(crate) fn simulate_touch_from_mouse(&mut self, button: MouseButton, state: ElementState) {
+    /// Simulate a touch event from mouse input that happened at `time` (called internally when
+    /// simulation is enabled)
+    pub(crate) fn simulate_touch_from_mouse(
+        &mut self,
+        button: MouseButton,
+        state: ElementState,
+        time: Instant,
+    ) {
         if !self.simulate_touch_with_mouse || button != MouseButton::Left {
             return;
         }
@@ -233,6 +246,7 @@ impl Input {
             phase,
             location: PhysicalPosition::new(pos.0 as f64, pos.1 as f64),
             force: None,
+            time,
         };
         self.touches.push(touch);
         self.touch_sources.insert(0, TouchSource::MouseSimulated);
@@ -251,6 +265,8 @@ impl Input {
                 phase: TouchPhase::Moved,
                 location: PhysicalPosition::new(pos.0 as f64, pos.1 as f64),
                 force: None,
+                // Cursor moves carry no time.
+                time: Instant::now(),
             };
             self.touches.push(touch);
             self.touch_sources.insert(0, TouchSource::MouseSimulated);
@@ -269,6 +285,8 @@ impl Input {
         // Drop released keys/buttons to avoid buildup
         self.keyboard
             .retain(|_, (curr, _)| *curr != ElementState::Released);
+        let keyboard = &self.keyboard;
+        self.key_times.retain(|key, _| keyboard.contains_key(key));
         self.mouse_buttons
             .retain(|_, (curr, _)| *curr != ElementState::Released);
 
@@ -300,6 +318,7 @@ impl Input {
     /// held keys should not carry forward into the next gameplay/UI context.
     pub fn clear_keyboard_state(&mut self) {
         self.keyboard.clear();
+        self.key_times.clear();
         self.text_events.clear();
     }
 
@@ -320,10 +339,12 @@ impl Input {
     /// browser context menus or window focus loss) and normal release events may
     /// never arrive.
     pub fn force_release_all_input_state(&mut self) {
-        for (curr, prev) in self.keyboard.values_mut() {
+        let now = Instant::now();
+        for (key, (curr, prev)) in self.keyboard.iter_mut() {
             if *curr == ElementState::Pressed {
                 *curr = ElementState::Released;
                 *prev = ElementState::Pressed;
+                self.key_times.insert(*key, now);
             }
         }
 
@@ -336,6 +357,7 @@ impl Input {
 
         for touch in &mut self.touches {
             touch.phase = TouchPhase::Ended;
+            touch.time = now;
         }
 
         if self.simulate_mouse_with_touch && self.primary_touch_id.is_some() {
@@ -367,6 +389,11 @@ impl Input {
         self.keyboard
             .get(&key)
             .is_some_and(|(curr, _)| *curr == ElementState::Released)
+    }
+
+    /// When a held or just released key last changed state, by the platform's event time
+    pub fn key_time(&self, key: KeyCode) -> Option<Instant> {
+        self.key_times.get(&key).copied()
     }
 
     /// True if any key in slice was just pressed
@@ -549,6 +576,7 @@ mod tests {
             phase: TouchPhase::Started,
             location: PhysicalPosition::new(10.0, 20.0),
             force: None,
+            time: Instant::now(),
         });
 
         input.force_release_all_input_state();
@@ -575,6 +603,7 @@ mod tests {
             phase: TouchPhase::Started,
             location: PhysicalPosition::new(10.0, 20.0),
             force: None,
+            time: Instant::now(),
         });
 
         assert_eq!(input.touch_source(11), TouchSource::RealTouch);
@@ -586,7 +615,7 @@ mod tests {
         input.set_simulate_touch_with_mouse(true);
         input.inject_cursor(10.0, 20.0);
 
-        input.simulate_touch_from_mouse(MouseButton::Left, Pressed);
+        input.simulate_touch_from_mouse(MouseButton::Left, Pressed, Instant::now());
 
         assert_eq!(input.touch_source(0), TouchSource::MouseSimulated);
     }
