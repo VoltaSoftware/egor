@@ -19,6 +19,9 @@ pub struct GeometryBatch {
     vertices_dirty: bool,
     indices_dirty: bool,
     instances: Vec<Instance>,
+    /// Where each run of instances with or without a text outline starts, and whether it has one. The default
+    /// shader draws each run with its own pipeline, so only outlined text pays for the outline path.
+    outline_runs: Vec<(u32, bool)>,
     instance_buffer: Option<Buffer>,
     instances_dirty: bool,
     max_verticies: usize,
@@ -47,6 +50,7 @@ impl GeometryBatch {
             vertices_dirty: false,
             indices_dirty: false,
             instances: Vec::with_capacity(Self::INITIAL_INSTANCE_CAPACITY),
+            outline_runs: Vec::new(),
             instance_buffer: None,
             instances_dirty: false,
             max_verticies,
@@ -110,7 +114,7 @@ impl GeometryBatch {
 
     /// Pushes an instance for instanced drawing
     pub fn push_instance(&mut self, instance: Instance) {
-        self.instances.push(instance);
+        self.push_instance_no_dirty(instance);
         self.instances_dirty = true;
     }
 
@@ -118,6 +122,15 @@ impl GeometryBatch {
     /// Caller MUST ensure `mark_instances_dirty()` is called once before upload.
     #[inline(always)]
     pub fn push_instance_no_dirty(&mut self, instance: Instance) {
+        let outlined = instance.outline_color[3] > 0.0;
+        if self
+            .outline_runs
+            .last()
+            .is_none_or(|&(_, run_outlined)| run_outlined != outlined)
+        {
+            self.outline_runs
+                .push((self.instances.len() as u32, outlined));
+        }
         self.instances.push(instance);
     }
 
@@ -170,6 +183,7 @@ impl GeometryBatch {
         }
         if !self.instances.is_empty() {
             self.instances.clear();
+            self.outline_runs.clear();
             self.instances_dirty = true;
         }
     }
@@ -253,6 +267,8 @@ impl GeometryBatch {
     /// Draws baked geometry and/or instanced quads as separate draw calls.
     /// `quad_bound` tracks whether the static quad VB/IB are currently bound
     /// to avoid redundant `set_vertex_buffer` / `set_index_buffer` calls.
+    /// With `bind_run`, instances are drawn a run at a time, after `bind_run` binds the pipeline for whether
+    /// the run has a text outline; baked geometry never has one.
     pub(crate) fn draw<'a>(
         &self,
         r_pass: &mut RenderPass<'a>,
@@ -261,6 +277,7 @@ impl GeometryBatch {
         dummy_instance: &'a Buffer,
         quad_bound: &mut bool,
         external_instances: Option<(&'a Buffer, u64)>,
+        mut bind_run: Option<&mut dyn FnMut(&mut RenderPass<'a>, bool)>,
     ) -> u32 {
         let mut draw_calls = 0;
 
@@ -274,13 +291,31 @@ impl GeometryBatch {
             } else if let Some(instance_buf) = &self.instance_buffer {
                 r_pass.set_vertex_buffer(1, instance_buf.slice(..));
             }
-            r_pass.draw_indexed(0..6, 0, 0..self.instances.len() as u32);
-            draw_calls += 1;
+            match bind_run.as_mut() {
+                Some(bind_run) => {
+                    for (index, &(start, outlined)) in self.outline_runs.iter().enumerate() {
+                        let end = self
+                            .outline_runs
+                            .get(index + 1)
+                            .map_or(self.instances.len() as u32, |&(next, _)| next);
+                        bind_run(r_pass, outlined);
+                        r_pass.draw_indexed(0..6, 0, start..end);
+                        draw_calls += 1;
+                    }
+                }
+                None => {
+                    r_pass.draw_indexed(0..6, 0, 0..self.instances.len() as u32);
+                    draw_calls += 1;
+                }
+            }
             *quad_bound = true;
         }
         if !self.indices.is_empty()
             && let (Some(vb), Some(ib)) = (&self.vertex_buffer, &self.index_buffer)
         {
+            if let Some(bind_run) = bind_run.as_mut() {
+                bind_run(r_pass, false);
+            }
             r_pass.set_vertex_buffer(0, vb.slice(..));
             r_pass.set_vertex_buffer(1, dummy_instance.slice(..));
             r_pass.set_index_buffer(ib.slice(..), IndexFormat::Uint16);

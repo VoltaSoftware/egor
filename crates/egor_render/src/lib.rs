@@ -204,6 +204,10 @@ fn watch_overlay_capture_supported(
     true
 }
 
+/// A draw's `current_shader` while the default shader's outline pipeline is bound. No custom shader has this id,
+/// so the next plain or custom batch binds its own pipeline again.
+const OUTLINE_PIPELINE: usize = usize::MAX;
+
 /// Low-level GPU renderer built on `wgpu`
 ///
 /// Handles rendering pipelines, surface configuration, resources (textures, buffers), & drawing
@@ -1040,27 +1044,84 @@ impl Renderer {
         }
 
         batch.upload(&self.gpu.device, &self.gpu.queue);
+        self.draw_uploaded_batch(
+            r_pass,
+            batch,
+            texture_id,
+            shader_id,
+            replace_blend,
+            camera_offset,
+            current_texture,
+            current_shader,
+            current_replace_blend,
+            current_camera_offset,
+            quad_bound,
+            None,
+            watch_overlay,
+        )
+    }
 
+    /// Binds what `batch` needs that isn't bound yet and draws it. With the default shader, each run of
+    /// outlined text goes through the outline pipeline and everything else through the plain one.
+    fn draw_uploaded_batch<'a>(
+        &'a self,
+        r_pass: &mut RenderPass<'a>,
+        batch: &mut GeometryBatch,
+        texture_id: Option<usize>,
+        shader_id: Option<usize>,
+        replace_blend: bool,
+        camera_offset: u32,
+        current_texture: &mut Option<usize>,
+        current_shader: &mut Option<usize>,
+        current_replace_blend: &mut bool,
+        current_camera_offset: &mut u32,
+        quad_bound: &mut bool,
+        external_instances: Option<(&'a Buffer, u64)>,
+        watch_overlay: bool,
+    ) -> u32 {
         let texture = self.textures.get(texture_id);
-        let texture_kind_changed =
-            self.textures.get(*current_texture).is_array() != texture.is_array();
+        let texture_array = texture.is_array();
+        let mut texture_kind_changed =
+            self.textures.get(*current_texture).is_array() != texture_array;
         if *current_texture != texture_id {
             texture.bind(r_pass, 0);
             *current_texture = texture_id;
         }
 
-        if texture_kind_changed
-            || *current_shader != shader_id
-            || *current_replace_blend != replace_blend
-        {
-            let (pipeline, bindings) = self
-                .pipelines
-                .resolve_with_replace(shader_id, replace_blend, watch_overlay, texture.is_array())
-                .expect("watch mask pipeline support should be checked before drawing");
-            r_pass.set_pipeline(pipeline);
-            self.bind_custom(r_pass, bindings);
-            *current_shader = shader_id;
+        let mut bind = |r_pass: &mut RenderPass<'a>, outlined: bool| {
+            let bound = if outlined {
+                Some(OUTLINE_PIPELINE)
+            } else {
+                shader_id
+            };
+            if !texture_kind_changed
+                && *current_shader == bound
+                && *current_replace_blend == replace_blend
+            {
+                return;
+            }
+            if outlined {
+                let pipeline = self
+                    .pipelines
+                    .resolve_outline(watch_overlay, texture_array)
+                    .expect("watch mask pipeline support should be checked before drawing");
+                r_pass.set_pipeline(pipeline);
+            } else {
+                let (pipeline, bindings) = self
+                    .pipelines
+                    .resolve_with_replace(shader_id, replace_blend, watch_overlay, texture_array)
+                    .expect("watch mask pipeline support should be checked before drawing");
+                r_pass.set_pipeline(pipeline);
+                self.bind_custom(r_pass, bindings);
+            }
+            *current_shader = bound;
             *current_replace_blend = replace_blend;
+            texture_kind_changed = false;
+        };
+        // Custom shaders and flat replacements draw a whole batch with one pipeline.
+        let default_shader = shader_id.is_none() && !replace_blend;
+        if !default_shader {
+            bind(r_pass, false);
         }
 
         if *current_camera_offset != camera_offset {
@@ -1074,7 +1135,8 @@ impl Renderer {
             &self.quad_index_buffer,
             &self.dummy_instance_buffer,
             quad_bound,
-            None,
+            external_instances,
+            default_shader.then_some(&mut bind as &mut dyn FnMut(&mut RenderPass<'a>, bool)),
         );
         batch.clear();
         draw_calls
@@ -1138,44 +1200,21 @@ impl Renderer {
         }
 
         batch.upload_geometry_only(&self.gpu.device, &self.gpu.queue);
-
-        let texture = self.textures.get(texture_id);
-        let texture_kind_changed =
-            self.textures.get(*current_texture).is_array() != texture.is_array();
-        if *current_texture != texture_id {
-            texture.bind(r_pass, 0);
-            *current_texture = texture_id;
-        }
-
-        if texture_kind_changed
-            || *current_shader != shader_id
-            || *current_replace_blend != replace_blend
-        {
-            let (pipeline, bindings) = self
-                .pipelines
-                .resolve_with_replace(shader_id, replace_blend, watch_overlay, texture.is_array())
-                .expect("watch mask pipeline support should be checked before drawing");
-            r_pass.set_pipeline(pipeline);
-            self.bind_custom(r_pass, bindings);
-            *current_shader = shader_id;
-            *current_replace_blend = replace_blend;
-        }
-
-        if *current_camera_offset != camera_offset {
-            r_pass.set_bind_group(1, &self.camera_bind_group, &[camera_offset]);
-            *current_camera_offset = camera_offset;
-        }
-
-        let draw_calls = batch.draw(
+        self.draw_uploaded_batch(
             r_pass,
-            &self.quad_vertex_buffer,
-            &self.quad_index_buffer,
-            &self.dummy_instance_buffer,
+            batch,
+            texture_id,
+            shader_id,
+            replace_blend,
+            camera_offset,
+            current_texture,
+            current_shader,
+            current_replace_blend,
+            current_camera_offset,
             quad_bound,
             Some((shared_buf, instance_byte_offset)),
-        );
-        batch.clear();
-        draw_calls
+            watch_overlay,
+        )
     }
 
     /// Writes a camera matrix into the given slot of the multi-slot camera buffer.

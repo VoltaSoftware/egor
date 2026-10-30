@@ -62,7 +62,19 @@ fn inside(pos: vec2<f32>, lo: vec2<f32>, hi: vec2<f32>) -> f32 {
          * step(lo.y, pos.y) * step(pos.y, hi.y);
 }
 
-fn fs_main_linear(input: VertexOutput) -> vec4<f32> {
+// Sprites, shapes and text without an outline: most of what is drawn. This body is kept apart from the outline
+// path, which a pipeline compiles in even when no instance takes it, and which on Adreno GPUs makes every pixel
+// of every sprite slower (a full-screen sprite cost a Pixel 2 XL 2.3 ms with it and 0.8 ms without).
+fn fs_plain_linear(input: VertexOutput) -> vec4<f32> {
+    let color = egor_sample_texture(input.tex_coords, input.texture_layer) * input.color;
+    if color.a < 0.004 {
+        discard;
+    }
+    return color;
+}
+
+// Outlined text: an instance with a non-zero outline alpha, drawn by the `fs_outline*` pipelines.
+fn fs_outline_linear(input: VertexOutput) -> vec4<f32> {
     if input.outline_color.a > 0.0 {
         let dims = vec2<f32>(egor_texture_dimensions());
         let texel = 1.0 / dims;
@@ -100,12 +112,7 @@ fn fs_main_linear(input: VertexOutput) -> vec4<f32> {
         discard;
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
-
-    let color = egor_sample_texture(input.tex_coords, input.texture_layer) * input.color;
-    if color.a < 0.004 {
-        discard;
-    }
-    return color;
+    return fs_plain_linear(input);
 }
 
 fn linear_to_srgb_channel(value: f32) -> f32 {
@@ -125,14 +132,31 @@ fn linear_to_srgb(color: vec4<f32>) -> vec4<f32> {
     );
 }
 
+fn watch_output(color: vec4<f32>, encoded: vec4<f32>, watch_overlay: f32) -> WatchFragmentOutput {
+    var out: WatchFragmentOutput;
+    out.color = encoded;
+    out.overlay = vec4<f32>(encoded.rgb, color.a * watch_overlay);
+    return out;
+}
+
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    return fs_main_linear(input);
+    return fs_plain_linear(input);
 }
 
 @fragment
 fn fs_main_srgb_encoded(input: VertexOutput) -> @location(0) vec4<f32> {
-    return linear_to_srgb(fs_main_linear(input));
+    return linear_to_srgb(fs_plain_linear(input));
+}
+
+@fragment
+fn fs_outline(input: VertexOutput) -> @location(0) vec4<f32> {
+    return fs_outline_linear(input);
+}
+
+@fragment
+fn fs_outline_srgb_encoded(input: VertexOutput) -> @location(0) vec4<f32> {
+    return linear_to_srgb(fs_outline_linear(input));
 }
 
 @fragment
@@ -147,21 +171,26 @@ fn fs_replace_srgb_encoded(input: VertexOutput) -> @location(0) vec4<f32> {
 
 @fragment
 fn fs_main_watch(input: VertexOutput) -> WatchFragmentOutput {
-    let color = fs_main_linear(input);
-    var out: WatchFragmentOutput;
-    out.color = color;
-    out.overlay = vec4<f32>(color.rgb, color.a * input.watch_overlay);
-    return out;
+    let color = fs_plain_linear(input);
+    return watch_output(color, color, input.watch_overlay);
 }
 
 @fragment
 fn fs_main_srgb_encoded_watch(input: VertexOutput) -> WatchFragmentOutput {
-    let color = fs_main_linear(input);
-    let encoded = linear_to_srgb(color);
-    var out: WatchFragmentOutput;
-    out.color = encoded;
-    out.overlay = vec4<f32>(encoded.rgb, color.a * input.watch_overlay);
-    return out;
+    let color = fs_plain_linear(input);
+    return watch_output(color, linear_to_srgb(color), input.watch_overlay);
+}
+
+@fragment
+fn fs_outline_watch(input: VertexOutput) -> WatchFragmentOutput {
+    let color = fs_outline_linear(input);
+    return watch_output(color, color, input.watch_overlay);
+}
+
+@fragment
+fn fs_outline_srgb_encoded_watch(input: VertexOutput) -> WatchFragmentOutput {
+    let color = fs_outline_linear(input);
+    return watch_output(color, linear_to_srgb(color), input.watch_overlay);
 }
 
 @fragment
