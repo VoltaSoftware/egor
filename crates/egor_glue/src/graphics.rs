@@ -3328,6 +3328,25 @@ impl<'a> Graphics<'a> {
             .add_shader_with_uniforms(wgsl_source, uniform_ids)
     }
 
+    /// Load a custom shader that also samples `texture_count` textures of its own
+    /// (see [`Renderer::add_shader_with_textures`]), set with [`Self::set_shader_texture`].
+    pub fn load_shader_with_textures(
+        &mut self,
+        wgsl_source: &str,
+        uniform_ids: &[usize],
+        texture_count: usize,
+    ) -> usize {
+        self.renderer
+            .add_shader_with_textures(wgsl_source, uniform_ids, texture_count)
+    }
+
+    /// Points texture `index` of a shader from [`Self::load_shader_with_textures`] at a texture,
+    /// for every draw with the shader this frame.
+    pub fn set_shader_texture(&mut self, shader_id: usize, index: usize, texture_id: usize) {
+        self.renderer
+            .set_shader_texture(shader_id, index, texture_id);
+    }
+
     /// Execute drawing commands with a custom shader
     ///
     /// The shader is automatically reset to default after the closure drops

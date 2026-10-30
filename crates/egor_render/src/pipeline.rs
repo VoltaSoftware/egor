@@ -311,10 +311,20 @@ struct CompiledCustomPipeline {
 }
 
 /// One logical custom material. Its compiled pipeline may be shared with other
-/// materials while its uniform bindings remain independent.
+/// materials while its bindings remain independent.
 struct CustomPipelineBinding {
     compiled_pipeline_id: usize,
-    uniform_ids: Vec<usize>,
+    bindings: Vec<CustomBinding>,
+}
+
+/// What a custom shader's bind groups after the texture and camera ones hold, in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CustomBinding {
+    /// A renderer uniform buffer.
+    Uniform(usize),
+    /// A 2D texture and its sampler, set with `Renderer::set_shader_texture`; egor's default
+    /// texture until then.
+    Texture(Option<usize>),
 }
 
 /// Every input that can affect custom pipeline compilation.
@@ -433,12 +443,12 @@ impl Pipelines {
         surface_format: TextureFormat,
         wgsl_source: &str,
         uniform_layouts: &[&BindGroupLayout],
-        uniform_ids: &[usize],
+        bindings: Vec<CustomBinding>,
     ) -> usize {
         assert_eq!(
             uniform_layouts.len(),
-            uniform_ids.len(),
-            "custom shader uniform layouts and bindings must have the same length"
+            bindings.len(),
+            "custom shader layouts and bindings must have the same length"
         );
 
         let cache_key = CustomPipelineKey {
@@ -496,9 +506,29 @@ impl Pipelines {
 
         self.custom.push(CustomPipelineBinding {
             compiled_pipeline_id,
-            uniform_ids: uniform_ids.to_vec(),
+            bindings,
         });
         self.custom.len() - 1
+    }
+
+    /// The layout of a [`CustomBinding::Texture`] group.
+    pub fn texture_layout_2d(&self) -> &BindGroupLayout {
+        &self.texture_layout[0]
+    }
+
+    /// Points the `index`th texture binding of a custom shader at `texture_id`.
+    pub fn set_custom_texture(&mut self, shader_id: usize, index: usize, texture_id: usize) {
+        let Some(custom) = self.custom.get_mut(shader_id) else {
+            return;
+        };
+        if let Some(CustomBinding::Texture(texture)) = custom
+            .bindings
+            .iter_mut()
+            .filter(|binding| matches!(binding, CustomBinding::Texture(_)))
+            .nth(index)
+        {
+            *texture = Some(texture_id);
+        }
     }
 
     pub fn resolve_with_replace(
@@ -507,7 +537,7 @@ impl Pipelines {
         replace_blend: bool,
         watch_overlay: bool,
         texture_array: bool,
-    ) -> Option<(&RenderPipeline, &[usize])> {
+    ) -> Option<(&RenderPipeline, &[CustomBinding])> {
         let kind = usize::from(texture_array);
         if replace_blend && shader_id.is_none() {
             return Some((
@@ -524,9 +554,9 @@ impl Pipelines {
             if watch_overlay {
                 compiled.watch_pipeline[kind]
                     .as_ref()
-                    .map(|pipeline| (pipeline, custom.uniform_ids.as_slice()))
+                    .map(|pipeline| (pipeline, custom.bindings.as_slice()))
             } else {
-                Some((&compiled.pipeline[kind], &custom.uniform_ids))
+                Some((&compiled.pipeline[kind], &custom.bindings))
             }
         } else if watch_overlay {
             Some((self.primitive_watch[kind].as_ref()?, &[]))
@@ -910,14 +940,14 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             surface_format,
             CUSTOM_SHADER_WITH_OVERLAY,
             &[&uniform_layout],
-            &[4],
+            vec![CustomBinding::Uniform(4)],
         );
         let second = pipelines.add_custom(
             &device,
             surface_format,
             CUSTOM_SHADER_WITH_OVERLAY,
             &[&uniform_layout],
-            &[9],
+            vec![CustomBinding::Uniform(9)],
         );
 
         assert_eq!(pipelines.compiled_custom.len(), 1);
@@ -930,8 +960,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             .resolve_with_replace(Some(second), false, false, false)
             .expect("second custom pipeline should resolve");
         assert_eq!(first_pipeline, second_pipeline);
-        assert_eq!(first_uniforms, &[4]);
-        assert_eq!(second_uniforms, &[9]);
+        assert_eq!(first_uniforms, &[CustomBinding::Uniform(4)]);
+        assert_eq!(second_uniforms, &[CustomBinding::Uniform(9)]);
 
         let (first_watch_pipeline, _) = pipelines
             .resolve_with_replace(Some(first), false, true, false)
@@ -955,21 +985,21 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             surface_format,
             CUSTOM_SHADER_WITH_OVERLAY,
             &[&first_layout],
-            &[4],
+            vec![CustomBinding::Uniform(4)],
         );
         pipelines.add_custom(
             &device,
             surface_format,
             CUSTOM_SHADER_WITH_OVERLAY,
             &[&second_layout],
-            &[9],
+            vec![CustomBinding::Uniform(9)],
         );
         pipelines.add_custom(
             &device,
             TextureFormat::Rgba8UnormSrgb,
             CUSTOM_SHADER_WITH_OVERLAY,
             &[&first_layout],
-            &[12],
+            vec![CustomBinding::Uniform(12)],
         );
 
         assert_eq!(pipelines.compiled_custom.len(), 3);

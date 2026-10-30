@@ -35,7 +35,7 @@ use wgpu::{
 use crate::{
     batch::GeometryBatch,
     frame::{Frame, Presentable},
-    pipeline::Pipelines,
+    pipeline::{CustomBinding, Pipelines},
     target::{OffscreenTarget, RenderTarget},
     texture::Textures,
     uniforms::{CameraUniform, Uniforms},
@@ -927,15 +927,12 @@ impl Renderer {
         let texture = self.textures.get(texture_id);
         texture.bind(r_pass, 0);
 
-        let (pipeline, uniform_ids) = self
+        let (pipeline, bindings) = self
             .pipelines
             .resolve_with_replace(shader_id, replace_blend, watch_overlay, texture.is_array())
             .expect("watch overlay pipeline support should be checked before drawing");
         r_pass.set_pipeline(pipeline);
-
-        for (i, &uid) in uniform_ids.iter().enumerate() {
-            r_pass.set_bind_group((2 + i) as u32, self.uniforms.bind_group(uid), &[]);
-        }
+        self.bind_custom(r_pass, bindings);
 
         r_pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
         r_pass.set_index_buffer(self.quad_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
@@ -1015,14 +1012,12 @@ impl Renderer {
             || *current_shader != shader_id
             || *current_replace_blend != replace_blend
         {
-            let (pipeline, uniform_ids) = self
+            let (pipeline, bindings) = self
                 .pipelines
                 .resolve_with_replace(shader_id, replace_blend, watch_overlay, texture.is_array())
                 .expect("watch mask pipeline support should be checked before drawing");
             r_pass.set_pipeline(pipeline);
-            for (i, &uid) in uniform_ids.iter().enumerate() {
-                r_pass.set_bind_group((2 + i) as u32, self.uniforms.bind_group(uid), &[]);
-            }
+            self.bind_custom(r_pass, bindings);
             *current_shader = shader_id;
             *current_replace_blend = replace_blend;
         }
@@ -1115,14 +1110,12 @@ impl Renderer {
             || *current_shader != shader_id
             || *current_replace_blend != replace_blend
         {
-            let (pipeline, uniform_ids) = self
+            let (pipeline, bindings) = self
                 .pipelines
                 .resolve_with_replace(shader_id, replace_blend, watch_overlay, texture.is_array())
                 .expect("watch mask pipeline support should be checked before drawing");
             r_pass.set_pipeline(pipeline);
-            for (i, &uid) in uniform_ids.iter().enumerate() {
-                r_pass.set_bind_group((2 + i) as u32, self.uniforms.bind_group(uid), &[]);
-            }
+            self.bind_custom(r_pass, bindings);
             *current_shader = shader_id;
             *current_replace_blend = replace_blend;
         }
@@ -1401,8 +1394,7 @@ impl Renderer {
     /// Creates a custom shader pipeline from WGSL source code
     /// Returns the pipeline index for use in draw calls
     pub fn add_shader(&mut self, wgsl_source: &str) -> usize {
-        self.pipelines
-            .add_custom(&self.gpu.device, self.surface_format, wgsl_source, &[], &[])
+        self.add_shader_with_textures(wgsl_source, &[], 0)
     }
 
     /// Creates a custom shader pipeline with associated uniform buffers
@@ -1412,14 +1404,59 @@ impl Renderer {
     ///
     /// Returns the pipeline index for use in draw calls
     pub fn add_shader_with_uniforms(&mut self, wgsl_source: &str, uniform_ids: &[usize]) -> usize {
-        let layouts = vec![self.uniforms.layout(); uniform_ids.len()];
+        self.add_shader_with_textures(wgsl_source, uniform_ids, 0)
+    }
+
+    /// Like [`Self::add_shader_with_uniforms`], plus `texture_count` textures bound after the
+    /// uniforms, so a shader can sample several, each with its own filtering. Texture `i` is
+    /// `@group(2 + uniforms + i) @binding(0) var t: texture_2d<f32>;` with its sampler at
+    /// `@binding(1)`; set it with [`Self::set_shader_texture`]. WebGL2 has 4 bind groups, so only
+    /// two uniforms and textures together fit after the texture and camera ones.
+    pub fn add_shader_with_textures(
+        &mut self,
+        wgsl_source: &str,
+        uniform_ids: &[usize],
+        texture_count: usize,
+    ) -> usize {
+        let texture_layout = self.pipelines.texture_layout_2d().clone();
+        let mut layouts = vec![self.uniforms.layout(); uniform_ids.len()];
+        layouts.extend(std::iter::repeat_n(&texture_layout, texture_count));
+        let bindings = uniform_ids
+            .iter()
+            .map(|&id| CustomBinding::Uniform(id))
+            .chain(std::iter::repeat_n(
+                CustomBinding::Texture(None),
+                texture_count,
+            ))
+            .collect();
         self.pipelines.add_custom(
             &self.gpu.device,
             self.surface_format,
             wgsl_source,
             &layouts,
-            uniform_ids,
+            bindings,
         )
+    }
+
+    /// Points texture `index` of a shader from [`Self::add_shader_with_textures`] at a 2D texture,
+    /// such as an offscreen target's. Like a uniform, it applies to every draw with the shader in the
+    /// frame being built.
+    pub fn set_shader_texture(&mut self, shader_id: usize, index: usize, texture_id: usize) {
+        self.pipelines
+            .set_custom_texture(shader_id, index, texture_id);
+    }
+
+    /// Binds a custom shader's uniforms and textures after the texture and camera groups.
+    fn bind_custom(&self, r_pass: &mut RenderPass, bindings: &[CustomBinding]) {
+        for (i, binding) in bindings.iter().enumerate() {
+            let group = (2 + i) as u32;
+            match *binding {
+                CustomBinding::Uniform(id) => {
+                    r_pass.set_bind_group(group, self.uniforms.bind_group(id), &[])
+                }
+                CustomBinding::Texture(id) => self.textures.get(id).bind(r_pass, group),
+            }
+        }
     }
 }
 

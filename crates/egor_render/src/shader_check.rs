@@ -14,7 +14,8 @@ use naga::valid::{Capabilities, ValidationFlags, Validator};
 use wgpu::{Device, DeviceDescriptor, Limits, TextureFormat};
 
 use crate::pipeline::{
-    Pipelines, custom_shader_source, surface_needs_srgb_encode, wrap_custom_shader_for_watch_output,
+    CustomBinding, Pipelines, custom_shader_source, surface_needs_srgb_encode,
+    wrap_custom_shader_for_watch_output,
 };
 use crate::uniforms::Uniforms;
 
@@ -26,6 +27,16 @@ const SURFACE_FORMATS: [TextureFormat; 2] =
 /// uniform buffers of `uniform_sizes` bytes, bound from `@group(2)` up. An empty list means the shader is
 /// valid everywhere.
 pub fn check_custom_shader(wgsl_source: &str, uniform_sizes: &[u64]) -> Vec<String> {
+    check_custom_shader_with_textures(wgsl_source, uniform_sizes, 0)
+}
+
+/// [`check_custom_shader`] for a shader loaded with [`crate::Renderer::add_shader_with_textures`]:
+/// `texture_count` textures bound after the uniforms.
+pub fn check_custom_shader_with_textures(
+    wgsl_source: &str,
+    uniform_sizes: &[u64],
+    texture_count: usize,
+) -> Vec<String> {
     let (device, _queue) = Device::noop(&DeviceDescriptor {
         required_limits: Limits::downlevel_webgl2_defaults(),
         ..Default::default()
@@ -38,17 +49,20 @@ pub fn check_custom_shader(wgsl_source: &str, uniform_sizes: &[u64]) -> Vec<Stri
 
     let mut errors = Vec::new();
     let uniforms = Uniforms::new(&device);
-    let uniform_layouts = vec![uniforms.layout(); uniform_sizes.len()];
-    let uniform_ids: Vec<usize> = (0..uniform_sizes.len()).collect();
     for surface_format in SURFACE_FORMATS {
         let mut pipelines = Pipelines::new(&device, surface_format, true);
-        let shader_id = pipelines.add_custom(
-            &device,
-            surface_format,
-            wgsl_source,
-            &uniform_layouts,
-            &uniform_ids,
-        );
+        let texture_layout = pipelines.texture_layout_2d().clone();
+        let mut layouts = vec![uniforms.layout(); uniform_sizes.len()];
+        layouts.extend(std::iter::repeat_n(&texture_layout, texture_count));
+        let bindings = (0..uniform_sizes.len())
+            .map(CustomBinding::Uniform)
+            .chain(std::iter::repeat_n(
+                CustomBinding::Texture(None),
+                texture_count,
+            ))
+            .collect();
+        let shader_id =
+            pipelines.add_custom(&device, surface_format, wgsl_source, &layouts, bindings);
         errors.extend(
             wgpu_errors
                 .lock()
