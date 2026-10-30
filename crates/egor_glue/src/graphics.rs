@@ -32,12 +32,15 @@ use crate::{
 /// recreating them when their size changes.
 pub struct RenderTargetStore {
     targets: Vec<OffscreenTarget>,
+    /// Each target's drawable texture, once registered; resizing rebinds it in place.
+    textures: Vec<Option<usize>>,
 }
 
 impl RenderTargetStore {
     pub fn new() -> Self {
         Self {
             targets: Vec::new(),
+            textures: Vec::new(),
         }
     }
 
@@ -52,6 +55,7 @@ impl RenderTargetStore {
         let id = self.targets.len();
         self.targets
             .push(OffscreenTarget::new(device, width, height, format));
+        self.textures.push(None);
         id
     }
 
@@ -3425,11 +3429,11 @@ impl<'a> Graphics<'a> {
         let tex_id = self
             .renderer
             .add_offscreen_texture_with_filter(self.render_targets.get_mut(store_id), filter);
+        self.render_targets.textures[store_id] = Some(tex_id);
         (store_id, tex_id)
     }
 
-    /// Resize a managed render target. Re-registers the texture binding.
-    /// Returns the (possibly new) egor texture id.
+    /// Resize a managed render target and rebind its texture, which keeps its egor texture id (returned).
     pub fn resize_managed_render_target(
         &mut self,
         store_id: usize,
@@ -3454,8 +3458,24 @@ impl<'a> Graphics<'a> {
     ) -> usize {
         self.render_targets
             .resize(self.renderer.device(), store_id, width, height);
-        self.renderer
-            .add_offscreen_texture_with_filter(self.render_targets.get_mut(store_id), filter)
+        match self.render_targets.textures[store_id] {
+            Some(tex_id) => {
+                self.renderer.replace_offscreen_texture_with_filter(
+                    tex_id,
+                    self.render_targets.get(store_id),
+                    filter,
+                );
+                tex_id
+            }
+            None => {
+                let tex_id = self.renderer.add_offscreen_texture_with_filter(
+                    self.render_targets.get_mut(store_id),
+                    filter,
+                );
+                self.render_targets.textures[store_id] = Some(tex_id);
+                tex_id
+            }
+        }
     }
 
     /// Direct subsequent draw commands to a managed offscreen render target.
