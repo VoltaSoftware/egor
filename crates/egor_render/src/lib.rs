@@ -1338,6 +1338,17 @@ impl Renderer {
             .insert_offscreen(&self.gpu.device, offscreen, filter)
     }
 
+    /// Rebinds offscreen texture `id` to `offscreen` after it was resized, keeping the id.
+    pub fn replace_offscreen_texture_with_filter(
+        &mut self,
+        id: usize,
+        offscreen: &OffscreenTarget,
+        filter: wgpu::FilterMode,
+    ) {
+        self.textures
+            .replace_offscreen(&self.gpu.device, id, offscreen, filter);
+    }
+
     /// Return a cached linear-filtered binding without modifying the source texture.
     pub fn linear_texture_variant(&mut self, id: usize) -> usize {
         self.textures.linear_variant(&self.gpu.device, id)

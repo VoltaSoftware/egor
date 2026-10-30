@@ -634,7 +634,45 @@ impl Textures {
         filter: FilterMode,
     ) -> usize {
         let id = self.store.len();
-        self.store.push(Texture::from_view(
+        self.store
+            .push(self.offscreen_texture(device, offscreen, filter));
+        id
+    }
+
+    /// Rebinds texture `id` to `offscreen`'s image after the target was resized. The id stays valid, and the
+    /// old image is freed instead of kept alive by a binding nothing draws with. A linear variant follows it.
+    pub fn replace_offscreen(
+        &mut self,
+        device: &Device,
+        id: usize,
+        offscreen: &OffscreenTarget,
+        filter: FilterMode,
+    ) {
+        let mut texture = self.offscreen_texture(device, offscreen, filter);
+        if let Some(variant) = self.store[id].linear_variant {
+            self.store[variant] = Texture {
+                bind_group: Texture::create_bind_group(
+                    device,
+                    &self.layouts[0],
+                    &texture.view,
+                    &self.default_sampler,
+                ),
+                view: texture.view.clone(),
+                linear_variant: Some(variant),
+                is_array: false,
+            };
+            texture.linear_variant = Some(variant);
+        }
+        self.store[id] = texture;
+    }
+
+    fn offscreen_texture(
+        &self,
+        device: &Device,
+        offscreen: &OffscreenTarget,
+        filter: FilterMode,
+    ) -> Texture {
+        Texture::from_view(
             offscreen.texture(),
             device,
             &self.layouts[0],
@@ -642,8 +680,7 @@ impl Textures {
                 FilterMode::Nearest => &self.nearest_sampler,
                 FilterMode::Linear => &self.default_sampler,
             },
-        ));
-        id
+        )
     }
 }
 
