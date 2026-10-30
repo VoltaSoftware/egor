@@ -3,6 +3,7 @@ use egor_render::{
     Renderer, Texture, TextureFormat,
     batch::GeometryBatch,
     target::{OffscreenTarget, RenderTarget},
+    wgpu::SurfaceTransform,
 };
 use glam::Vec2;
 use std::sync::Arc;
@@ -153,12 +154,25 @@ struct VertexOutput {
     @location(0) uv: vec2<f32>,
 };
 
+// The destination's turn from the source, as `wgpu::SurfaceTransform`: 0 none, then 90, 180 and 270
+// degrees clockwise. Set when blitting into a pre-rotated backbuffer.
+override TURN: u32 = 0u;
+
+fn turn(p: vec2<f32>) -> vec2<f32> {
+    switch TURN {
+        case 1u: { return vec2<f32>(p.y, -p.x); }
+        case 2u: { return -p; }
+        case 3u: { return vec2<f32>(-p.y, p.x); }
+        default: { return p; }
+    }
+}
+
 @vertex
 fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
     // Fullscreen triangle: 3 vertices cover the entire clip space.
     let uv = vec2<f32>(f32((idx << 1u) & 2u), f32(idx & 2u));
     var out: VertexOutput;
-    out.position = vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
+    out.position = vec4<f32>(turn(uv * 2.0 - 1.0), 0.0, 1.0);
     // Flip Y so texture top-left maps to NDC top-left.
     out.uv = vec2<f32>(uv.x, 1.0 - uv.y);
     return out;
@@ -172,6 +186,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     return textureSample(t_src, s_src, in.uv);
 }
 "#;
+
+/// [`BLIT_SHADER_WGSL`]'s `TURN` for a destination turned `turn` from its source.
+fn blit_turn_constants(turn: SurfaceTransform) -> [(&'static str, f64); 1] {
+    [("TURN", f64::from(turn as u32))]
+}
+
+fn blit_turn_options<'a>(
+    constants: &'a [(&'a str, f64)],
+) -> egor_render::wgpu::PipelineCompilationOptions<'a> {
+    egor_render::wgpu::PipelineCompilationOptions {
+        constants,
+        ..Default::default()
+    }
+}
 
 /// WGSL shader for fullscreen-triangle blit that outputs BT.601 luminance
 /// to a single-channel R8Unorm render target. Eliminates CPU-side grayscale
@@ -1066,9 +1094,9 @@ pub struct ScreenCaptureState {
     last_watch_capture_uniform: Option<WatchCaptureUniform>,
     watch_capture_binding: Option<(egor_render::wgpu::TextureView, egor_render::wgpu::BindGroup)>,
     present_pipeline: Option<egor_render::wgpu::RenderPipeline>,
-    present_pipeline_format: Option<TextureFormat>,
+    present_pipeline_key: Option<(TextureFormat, SurfaceTransform)>,
     composite_pipeline: Option<egor_render::wgpu::RenderPipeline>,
-    composite_pipeline_format: Option<TextureFormat>,
+    composite_pipeline_key: Option<(TextureFormat, SurfaceTransform)>,
     // Intermediate copy of the backbuffer with TEXTURE_BINDING
     // (surface textures may lack TEXTURE_BINDING on some backends like DX12).
     source_copy: Option<Texture>,
@@ -1140,9 +1168,9 @@ impl ScreenCaptureState {
             last_watch_capture_uniform: None,
             watch_capture_binding: None,
             present_pipeline: None,
-            present_pipeline_format: None,
+            present_pipeline_key: None,
             composite_pipeline: None,
-            composite_pipeline_format: None,
+            composite_pipeline_key: None,
             source_copy: None,
             source_copy_view: None,
             source_copy_w: 0,
@@ -1389,13 +1417,18 @@ impl ScreenCaptureState {
 
     // -- pipeline / resource setup (lazy) --------------------------------
 
-    pub(crate) fn prewarm_watch_pipelines(&mut self, device: &Device, format: TextureFormat) {
+    pub(crate) fn prewarm_watch_pipelines(
+        &mut self,
+        device: &Device,
+        format: TextureFormat,
+        turn: SurfaceTransform,
+    ) {
         // Thread creation can stall native presentation. Pay that cost during
         // renderer initialization and keep the worker across watch stop/start.
         #[cfg(not(target_arch = "wasm32"))]
         self.readback_worker.get_or_insert_with(ReadbackWorker::new);
         self.ensure_watch_capture_pipeline(device);
-        self.ensure_present_pipeline(device, format);
+        self.ensure_present_pipeline(device, format, turn);
     }
 
     fn ensure_pipeline(&mut self, device: &Device) {
@@ -2210,8 +2243,13 @@ impl ScreenCaptureState {
         self.write_idx = (self.write_idx + 1) % SLOT_COUNT;
     }
 
-    fn ensure_present_pipeline(&mut self, device: &Device, format: TextureFormat) {
-        if self.present_pipeline.is_some() && self.present_pipeline_format == Some(format) {
+    fn ensure_present_pipeline(
+        &mut self,
+        device: &Device,
+        format: TextureFormat,
+        turn: SurfaceTransform,
+    ) {
+        if self.present_pipeline.is_some() && self.present_pipeline_key == Some((format, turn)) {
             return;
         }
 
@@ -2222,6 +2260,7 @@ impl ScreenCaptureState {
             source: egor_render::wgpu::ShaderSource::Wgsl(BLIT_SHADER_WGSL.into()),
         });
         let bind_group_layout = self.blit_bind_group_layout.as_ref().expect("pipeline init");
+        let turn_constants = blit_turn_constants(turn);
         let pipeline_layout =
             device.create_pipeline_layout(&egor_render::wgpu::PipelineLayoutDescriptor {
                 label: None,
@@ -2237,7 +2276,7 @@ impl ScreenCaptureState {
                     module: &shader,
                     entry_point: Some("vs_main"),
                     buffers: &[],
-                    compilation_options: Default::default(),
+                    compilation_options: blit_turn_options(&turn_constants),
                 },
                 fragment: Some(egor_render::wgpu::FragmentState {
                     module: &shader,
@@ -2259,11 +2298,17 @@ impl ScreenCaptureState {
                 cache: None,
             },
         ));
-        self.present_pipeline_format = Some(format);
+        self.present_pipeline_key = Some((format, turn));
     }
 
-    fn ensure_composite_pipeline(&mut self, device: &Device, format: TextureFormat) {
-        if self.composite_pipeline.is_some() && self.composite_pipeline_format == Some(format) {
+    fn ensure_composite_pipeline(
+        &mut self,
+        device: &Device,
+        format: TextureFormat,
+        turn: SurfaceTransform,
+    ) {
+        if self.composite_pipeline.is_some() && self.composite_pipeline_key == Some((format, turn))
+        {
             return;
         }
 
@@ -2274,6 +2319,7 @@ impl ScreenCaptureState {
             source: egor_render::wgpu::ShaderSource::Wgsl(BLIT_SHADER_WGSL.into()),
         });
         let bind_group_layout = self.blit_bind_group_layout.as_ref().expect("pipeline init");
+        let turn_constants = blit_turn_constants(turn);
         let pipeline_layout =
             device.create_pipeline_layout(&egor_render::wgpu::PipelineLayoutDescriptor {
                 label: None,
@@ -2289,7 +2335,7 @@ impl ScreenCaptureState {
                     module: &shader,
                     entry_point: Some("vs_main"),
                     buffers: &[],
-                    compilation_options: Default::default(),
+                    compilation_options: blit_turn_options(&turn_constants),
                 },
                 fragment: Some(egor_render::wgpu::FragmentState {
                     module: &shader,
@@ -2322,7 +2368,7 @@ impl ScreenCaptureState {
                 cache: None,
             },
         ));
-        self.composite_pipeline_format = Some(format);
+        self.composite_pipeline_key = Some((format, turn));
     }
 
     /// Present an offscreen frame source into the actual surface with a
@@ -2335,8 +2381,9 @@ impl ScreenCaptureState {
         source_view: &egor_render::wgpu::TextureView,
         dest_view: &egor_render::wgpu::TextureView,
         dest_format: TextureFormat,
+        turn: SurfaceTransform,
     ) {
-        self.ensure_present_pipeline(device, dest_format);
+        self.ensure_present_pipeline(device, dest_format, turn);
         let bind_group = self.source_bind_group(device, source_view);
         let pipeline = self.present_pipeline.as_ref().expect("present pipeline");
 
@@ -2369,8 +2416,9 @@ impl ScreenCaptureState {
         source_view: &egor_render::wgpu::TextureView,
         dest_view: &egor_render::wgpu::TextureView,
         dest_format: TextureFormat,
+        turn: SurfaceTransform,
     ) {
-        self.ensure_composite_pipeline(device, dest_format);
+        self.ensure_composite_pipeline(device, dest_format, turn);
         let bind_group = self.source_bind_group(device, source_view);
         let pipeline = self
             .composite_pipeline
@@ -3280,6 +3328,25 @@ impl<'a> Graphics<'a> {
             .add_shader_with_uniforms(wgsl_source, uniform_ids)
     }
 
+    /// Load a custom shader that also samples `texture_count` textures of its own
+    /// (see [`Renderer::add_shader_with_textures`]), set with [`Self::set_shader_texture`].
+    pub fn load_shader_with_textures(
+        &mut self,
+        wgsl_source: &str,
+        uniform_ids: &[usize],
+        texture_count: usize,
+    ) -> usize {
+        self.renderer
+            .add_shader_with_textures(wgsl_source, uniform_ids, texture_count)
+    }
+
+    /// Points texture `index` of a shader from [`Self::load_shader_with_textures`] at a texture,
+    /// for every draw with the shader this frame.
+    pub fn set_shader_texture(&mut self, shader_id: usize, index: usize, texture_id: usize) {
+        self.renderer
+            .set_shader_texture(shader_id, index, texture_id);
+    }
+
     /// Execute drawing commands with a custom shader
     ///
     /// The shader is automatically reset to default after the closure drops
@@ -3293,6 +3360,11 @@ impl<'a> Graphics<'a> {
     /// Directly set (or clear) the active shader for subsequent draw commands.
     pub fn set_current_shader(&mut self, shader_id: Option<usize>) {
         self.current_shader = shader_id;
+    }
+
+    /// Keeps the pipelines compiled so far for the next run (see `App::pipeline_cache_dir`).
+    pub fn save_pipeline_cache(&self) {
+        self.renderer.save_pipeline_cache();
     }
 
     /// Set the scissor rect for subsequent draw commands.

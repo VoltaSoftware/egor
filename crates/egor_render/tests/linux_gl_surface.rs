@@ -97,6 +97,7 @@ impl SurfaceTest {
             window.clone(),
             &wgpu::MemoryHints::default(),
             preference,
+            None,
         ))
         .unwrap_or_else(|error| panic!("{backend:?} initialization failed: {error}"));
         assert_eq!(renderer.adapter_info().backend, backend);

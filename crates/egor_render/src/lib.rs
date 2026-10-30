@@ -35,7 +35,7 @@ use wgpu::{
 use crate::{
     batch::GeometryBatch,
     frame::{Frame, Presentable},
-    pipeline::Pipelines,
+    pipeline::{CustomBinding, Pipelines},
     target::{OffscreenTarget, RenderTarget},
     texture::Textures,
     uniforms::{CameraUniform, Uniforms},
@@ -229,6 +229,11 @@ pub struct Renderer {
     shared_instance_buffer: Option<Buffer>,
     instance_upload_pool: Option<instance_upload::InstanceUploadPool>,
     last_camera: [[[f32; 4]; 4]; 8],
+    /// The backbuffer's turn; while it isn't identity, every camera slot has a turned copy
+    /// `camera_slot_count` slots on, for draws straight into the backbuffer.
+    surface_transform: wgpu::SurfaceTransform,
+    /// Where `save_pipeline_cache` keeps the driver's compiled pipelines.
+    pipeline_cache_file: Option<std::path::PathBuf>,
 }
 
 impl Renderer {
@@ -249,7 +254,7 @@ impl Renderer {
         memory_hints: &MemoryHints,
         backend_preference: RendererBackendPreference,
     ) -> Self {
-        Self::try_new_with_backend(window, memory_hints, backend_preference)
+        Self::try_new_with_backend(window, memory_hints, backend_preference, None)
             .await
             .expect("failed to initialize egor renderer")
     }
@@ -258,13 +263,18 @@ impl Renderer {
         window: impl Into<SurfaceTarget<'static>> + WindowHandle,
         memory_hints: &MemoryHints,
     ) -> Result<Self, RendererInitError> {
-        Self::try_new_with_backend(window, memory_hints, RendererBackendPreference::Auto).await
+        Self::try_new_with_backend(window, memory_hints, RendererBackendPreference::Auto, None)
+            .await
     }
 
+    /// `pipeline_cache_dir` keeps the driver's compiled pipelines between runs, where the driver can (Vulkan):
+    /// compiling a pipeline can take tens of milliseconds on a phone. Save it with
+    /// [`Self::save_pipeline_cache`].
     pub async fn try_new_with_backend(
         window: impl Into<SurfaceTarget<'static>> + WindowHandle,
         memory_hints: &MemoryHints,
         backend_preference: RendererBackendPreference,
+        pipeline_cache_dir: Option<&std::path::Path>,
     ) -> Result<Self, RendererInitError> {
         log::info!("[egor] renderer init: creating wgpu instance");
         let mut desc = renderer_instance_descriptor();
@@ -355,15 +365,43 @@ impl Renderer {
             wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter_limits);
         #[cfg(not(target_arch = "wasm32"))]
         let required_limits = adapter_limits;
+        // Where the driver's compiled pipelines are kept between runs, for drivers that can (Vulkan).
+        let pipeline_cache_file = pipeline_cache_dir
+            .zip(wgpu::util::pipeline_cache_key(&adapter.get_info()))
+            .filter(|_| adapter.features().contains(wgpu::Features::PIPELINE_CACHE))
+            .map(|(dir, key)| dir.join(key));
+        let required_features = if pipeline_cache_file.is_some() {
+            wgpu::Features::PIPELINE_CACHE
+        } else {
+            wgpu::Features::empty()
+        };
         log::info!("[egor] renderer init: requesting device");
         let (device, queue) = adapter
             .request_device(&DeviceDescriptor {
+                required_features,
                 required_limits,
                 memory_hints: memory_hints.clone(),
                 ..Default::default()
             })
             .await
             .map_err(|error| RendererInitError::RequestDevice(error.to_string()))?;
+        let pipeline_cache = pipeline_cache_file.as_ref().map(|file| {
+            let data = std::fs::read(file).ok();
+            log::info!(
+                "[egor] renderer init: pipeline cache {} ({} bytes)",
+                file.display(),
+                data.as_ref().map_or(0, Vec::len)
+            );
+            // SAFETY: the file only ever holds `PipelineCache::get_data` from a device with the same cache key
+            // (`save_pipeline_cache`); a driver that can't use it starts an empty cache (`fallback`).
+            unsafe {
+                device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+                    label: Some("egor pipeline cache"),
+                    data: data.as_deref(),
+                    fallback: true,
+                })
+            }
+        });
         let device_lost = Arc::new(AtomicBool::new(false));
         let device_lost_callback = Arc::clone(&device_lost);
         device.set_device_lost_callback(move |reason, message| {
@@ -399,7 +437,12 @@ impl Renderer {
             "[egor] renderer init: watch overlay capture MRT supported: {watch_overlay_supported}"
         );
         log::info!("[egor] renderer init: creating pipelines and core buffers");
-        let pipelines = Pipelines::new(&device, surface_format, watch_overlay_supported);
+        let pipelines = Pipelines::new(
+            &device,
+            surface_format,
+            watch_overlay_supported,
+            pipeline_cache,
+        );
 
         let quad_vertex_buffer = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("Static Unit Quad VB"),
@@ -421,7 +464,8 @@ impl Renderer {
         let camera_slot_stride =
             ((camera_data_size + min_alignment - 1) / min_alignment) * min_alignment;
         let camera_slot_count: u32 = 8;
-        let camera_buffer_size = camera_slot_stride * camera_slot_count;
+        // Room for the turned copies too.
+        let camera_buffer_size = camera_slot_stride * camera_slot_count * 2;
 
         let camera_buffer = device.create_buffer_init(&BufferInitDescriptor {
             label: None,
@@ -479,6 +523,8 @@ impl Renderer {
             shared_instance_buffer: None,
             instance_upload_pool,
             last_camera: [[[0.0; 4]; 4]; 8],
+            surface_transform: wgpu::SurfaceTransform::Identity,
+            pipeline_cache_file,
         })
     }
 
@@ -922,15 +968,12 @@ impl Renderer {
         let texture = self.textures.get(texture_id);
         texture.bind(r_pass, 0);
 
-        let (pipeline, uniform_ids) = self
+        let (pipeline, bindings) = self
             .pipelines
             .resolve_with_replace(shader_id, replace_blend, watch_overlay, texture.is_array())
             .expect("watch overlay pipeline support should be checked before drawing");
         r_pass.set_pipeline(pipeline);
-
-        for (i, &uid) in uniform_ids.iter().enumerate() {
-            r_pass.set_bind_group((2 + i) as u32, self.uniforms.bind_group(uid), &[]);
-        }
+        self.bind_custom(r_pass, bindings);
 
         r_pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
         r_pass.set_index_buffer(self.quad_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
@@ -1010,14 +1053,12 @@ impl Renderer {
             || *current_shader != shader_id
             || *current_replace_blend != replace_blend
         {
-            let (pipeline, uniform_ids) = self
+            let (pipeline, bindings) = self
                 .pipelines
                 .resolve_with_replace(shader_id, replace_blend, watch_overlay, texture.is_array())
                 .expect("watch mask pipeline support should be checked before drawing");
             r_pass.set_pipeline(pipeline);
-            for (i, &uid) in uniform_ids.iter().enumerate() {
-                r_pass.set_bind_group((2 + i) as u32, self.uniforms.bind_group(uid), &[]);
-            }
+            self.bind_custom(r_pass, bindings);
             *current_shader = shader_id;
             *current_replace_blend = replace_blend;
         }
@@ -1110,14 +1151,12 @@ impl Renderer {
             || *current_shader != shader_id
             || *current_replace_blend != replace_blend
         {
-            let (pipeline, uniform_ids) = self
+            let (pipeline, bindings) = self
                 .pipelines
                 .resolve_with_replace(shader_id, replace_blend, watch_overlay, texture.is_array())
                 .expect("watch mask pipeline support should be checked before drawing");
             r_pass.set_pipeline(pipeline);
-            for (i, &uid) in uniform_ids.iter().enumerate() {
-                r_pass.set_bind_group((2 + i) as u32, self.uniforms.bind_group(uid), &[]);
-            }
+            self.bind_custom(r_pass, bindings);
             *current_shader = shader_id;
             *current_replace_blend = replace_blend;
         }
@@ -1142,6 +1181,8 @@ impl Renderer {
     /// Writes a camera matrix into the given slot of the multi-slot camera buffer.
     /// Slot must be < camera_slot_count. Uses queue.write_buffer so ALL writes
     /// are applied before the next queue.submit.
+    /// With a turned backbuffer (see [`Self::set_surface_transform`]) it also writes the turned
+    /// copy to `slot + camera_slot_count`.
     pub fn write_camera_slot(&mut self, slot: u32, view_proj: [[f32; 4]; 4]) {
         debug_assert!(slot < self.camera_slot_count);
         let s = slot as usize;
@@ -1149,12 +1190,33 @@ impl Renderer {
             return;
         }
         self.last_camera[s] = view_proj;
+        self.write_camera_uniform(slot, view_proj);
+        if self.surface_transform != wgpu::SurfaceTransform::Identity {
+            self.write_camera_uniform(
+                slot + self.camera_slot_count,
+                target::turn_view_proj(view_proj, self.surface_transform),
+            );
+        }
+    }
+
+    fn write_camera_uniform(&self, slot: u32, view_proj: [[f32; 4]; 4]) {
         let offset = (slot * self.camera_slot_stride) as u64;
         self.gpu.queue.write_buffer(
             &self.camera_buffer,
             offset,
             bytemuck::bytes_of(&CameraUniform { view_proj }),
         );
+    }
+
+    /// Sets the backbuffer's turn ([`target::Backbuffer::transform`]) before this frame's camera
+    /// writes, so draws into the backbuffer can use the turned camera slots.
+    pub fn set_surface_transform(&mut self, transform: wgpu::SurfaceTransform) {
+        if self.surface_transform == transform {
+            return;
+        }
+        self.surface_transform = transform;
+        // Write every camera again, turned the new way.
+        self.last_camera = [[[f32::NAN; 4]; 4]; 8];
     }
 
     /// Returns the byte stride between camera slots (aligned to GPU requirements)
@@ -1373,8 +1435,7 @@ impl Renderer {
     /// Creates a custom shader pipeline from WGSL source code
     /// Returns the pipeline index for use in draw calls
     pub fn add_shader(&mut self, wgsl_source: &str) -> usize {
-        self.pipelines
-            .add_custom(&self.gpu.device, self.surface_format, wgsl_source, &[], &[])
+        self.add_shader_with_textures(wgsl_source, &[], 0)
     }
 
     /// Creates a custom shader pipeline with associated uniform buffers
@@ -1384,14 +1445,86 @@ impl Renderer {
     ///
     /// Returns the pipeline index for use in draw calls
     pub fn add_shader_with_uniforms(&mut self, wgsl_source: &str, uniform_ids: &[usize]) -> usize {
-        let layouts = vec![self.uniforms.layout(); uniform_ids.len()];
+        self.add_shader_with_textures(wgsl_source, uniform_ids, 0)
+    }
+
+    /// Like [`Self::add_shader_with_uniforms`], plus `texture_count` textures bound after the
+    /// uniforms, so a shader can sample several, each with its own filtering. Texture `i` is
+    /// `@group(2 + uniforms + i) @binding(0) var t: texture_2d<f32>;` with its sampler at
+    /// `@binding(1)`; set it with [`Self::set_shader_texture`]. WebGL2 has 4 bind groups, so only
+    /// two uniforms and textures together fit after the texture and camera ones.
+    pub fn add_shader_with_textures(
+        &mut self,
+        wgsl_source: &str,
+        uniform_ids: &[usize],
+        texture_count: usize,
+    ) -> usize {
+        let texture_layout = self.pipelines.texture_layout_2d().clone();
+        let mut layouts = vec![self.uniforms.layout(); uniform_ids.len()];
+        layouts.extend(std::iter::repeat_n(&texture_layout, texture_count));
+        let bindings = uniform_ids
+            .iter()
+            .map(|&id| CustomBinding::Uniform(id))
+            .chain(std::iter::repeat_n(
+                CustomBinding::Texture(None),
+                texture_count,
+            ))
+            .collect();
         self.pipelines.add_custom(
             &self.gpu.device,
             self.surface_format,
             wgsl_source,
             &layouts,
-            uniform_ids,
+            bindings,
         )
+    }
+
+    /// Writes the driver's compiled pipelines to the pipeline cache file, so the next run starts with them.
+    /// Call it after compiling a batch of pipelines, such as while loading. A no-op without a cache.
+    pub fn save_pipeline_cache(&self) {
+        let (Some(file), Some(data)) = (&self.pipeline_cache_file, self.pipelines.cache_data())
+        else {
+            return;
+        };
+        // Through a temporary file, so a crash mid-write never leaves a torn cache.
+        let temp = file.with_extension("tmp");
+        let result = file
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&temp, &data))
+            .and_then(|()| std::fs::rename(&temp, file));
+        match result {
+            Ok(()) => log::info!(
+                "[egor] saved pipeline cache {} ({} bytes)",
+                file.display(),
+                data.len()
+            ),
+            Err(error) => log::warn!(
+                "[egor] saving pipeline cache {} failed: {error}",
+                file.display()
+            ),
+        }
+    }
+
+    /// Points texture `index` of a shader from [`Self::add_shader_with_textures`] at a 2D texture,
+    /// such as an offscreen target's. Like a uniform, it applies to every draw with the shader in the
+    /// frame being built.
+    pub fn set_shader_texture(&mut self, shader_id: usize, index: usize, texture_id: usize) {
+        self.pipelines
+            .set_custom_texture(shader_id, index, texture_id);
+    }
+
+    /// Binds a custom shader's uniforms and textures after the texture and camera groups.
+    fn bind_custom(&self, r_pass: &mut RenderPass, bindings: &[CustomBinding]) {
+        for (i, binding) in bindings.iter().enumerate() {
+            let group = (2 + i) as u32;
+            match *binding {
+                CustomBinding::Uniform(id) => {
+                    r_pass.set_bind_group(group, self.uniforms.bind_group(id), &[])
+                }
+                CustomBinding::Texture(id) => self.textures.get(id).bind(r_pass, group),
+            }
+        }
     }
 }
 

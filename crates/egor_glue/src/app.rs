@@ -29,7 +29,8 @@ use egor_app::{
 use egor_render::{
     MemoryHints, Renderer, RendererBackendPreference, TextureFormat,
     instance::Instance,
-    target::{Backbuffer, RenderTarget},
+    target::{Backbuffer, RenderTarget, turn_rect},
+    wgpu::SurfaceTransform,
 };
 
 type UpdateFn = dyn FnMut(&mut FrameContext);
@@ -171,7 +172,8 @@ fn window_surface_size(window: &Window) -> PhysicalSize<u32> {
 }
 
 /// Draws the batches in `range` that belong to `target` into an open pass and
-/// returns the number of draw calls issued.
+/// returns the number of draw calls issued. `turn` is the attachment's turn from
+/// the `target_w`x`target_h` frame: the backbuffer's when drawing straight into it.
 #[allow(clippy::too_many_arguments)]
 fn draw_batches<'a>(
     renderer: &'a Renderer,
@@ -180,6 +182,7 @@ fn draw_batches<'a>(
     range: std::ops::Range<usize>,
     target: Option<usize>,
     (target_w, target_h): (u32, u32),
+    turn: SurfaceTransform,
     camera_slot_stride: u32,
     instance_byte_offsets: &[u64],
     watch_pass: bool,
@@ -204,6 +207,12 @@ fn draw_batches<'a>(
     let mut quad_bound = true;
     let full_scissor = (0u32, 0u32, target_w.max(1), target_h.max(1));
     let mut cur_scissor = (u32::MAX, u32::MAX, u32::MAX, u32::MAX);
+    // Turned copies of the cameras sit after the plain ones.
+    let camera_slot_base = if turn == SurfaceTransform::Identity {
+        0
+    } else {
+        renderer.camera_slot_count()
+    };
     let mut draw_calls = 0;
 
     for idx in range {
@@ -221,6 +230,7 @@ fn draw_batches<'a>(
             }
             None => full_scissor,
         };
+        let target_scissor = turn_rect(target_scissor, (target_w.max(1), target_h.max(1)), turn);
         if cur_scissor != target_scissor {
             r_pass.set_scissor_rect(
                 target_scissor.0,
@@ -230,7 +240,7 @@ fn draw_batches<'a>(
             );
             cur_scissor = target_scissor;
         }
-        let offset = batch.camera_slot * camera_slot_stride;
+        let offset = (camera_slot_base + batch.camera_slot) * camera_slot_stride;
         draw_calls += if let Some(shared_buf) = renderer.shared_instance_buffer() {
             renderer.draw_batch_shared_with_watch_overlay(
                 r_pass,
@@ -564,6 +574,7 @@ pub struct App {
     render_targets: RenderTargetStore,
     screen_capture: ScreenCaptureState,
     prewarm_watch_capture: bool,
+    pipeline_cache_dir: Option<std::path::PathBuf>,
     fps_limit: Option<u16>,
     native_refresh_rate_fps: Option<u16>,
     capture_frame_target: Option<CaptureFrameTarget>,
@@ -611,6 +622,7 @@ impl App {
             render_targets: RenderTargetStore::new(),
             screen_capture: ScreenCaptureState::new(),
             prewarm_watch_capture: false,
+            pipeline_cache_dir: None,
             fps_limit: None,
             native_refresh_rate_fps: None,
             capture_frame_target: None,
@@ -659,6 +671,14 @@ impl App {
         self
     }
 
+    /// Keeps the GPU driver's compiled pipelines in this directory between runs, where the driver can
+    /// (Vulkan), so pipelines compiled once don't cost a phone tens of milliseconds each again. Save it with
+    /// `Graphics::save_pipeline_cache` after compiling them.
+    pub fn pipeline_cache_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.pipeline_cache_dir = Some(dir.into());
+        self
+    }
+
     fn prepare_watch_renderer(
         &mut self,
         renderer: &mut Renderer,
@@ -667,7 +687,13 @@ impl App {
         height: u32,
     ) {
         let (device, queue) = (renderer.device().clone(), renderer.queue().clone());
-        self.screen_capture.prewarm_watch_pipelines(&device, format);
+        // Warm the pipelines the backbuffer will use.
+        let turn = self
+            .backbuffer
+            .as_ref()
+            .map_or(SurfaceTransform::Identity, Backbuffer::transform);
+        self.screen_capture
+            .prewarm_watch_pipelines(&device, format, turn);
 
         // Some GL drivers defer compilation until the first draw. Exercise
         // the built-in watch and downsample pipelines during initialization.
@@ -732,6 +758,7 @@ impl App {
             &target.color_view,
             &presented.view,
             format,
+            turn,
         );
         if let Err(error) = renderer.try_submit_commands(encoder.finish()) {
             log::warn!("[egor] watch pipeline warmup submission failed: {error:?}");
@@ -985,7 +1012,7 @@ impl App {
         let (w, h) = self
             .backbuffer
             .as_ref()
-            .map_or((size.width, size.height), |b| b.size());
+            .map_or((size.width, size.height), Backbuffer::surface_size);
         renderer.ensure_depth_size(w, h);
 
         log::warn!(
@@ -1044,6 +1071,7 @@ impl App {
                 window.clone(),
                 &self.memory_hints,
                 self.renderer_backend,
+                self.pipeline_cache_dir.as_deref(),
             )
             .await
             {
@@ -1395,8 +1423,10 @@ impl AppHandler<Renderer> for App {
             return;
         };
 
+        backbuffer.follow_display_turn(renderer.device());
+        let surface_turn = backbuffer.transform();
+        renderer.set_surface_transform(surface_turn);
         let (w, h) = backbuffer.size();
-        renderer.ensure_depth_size(w, h);
         let render_scale = backbuffer.render_scale();
         let (device, queue) = (renderer.device().clone(), renderer.queue().clone());
         let format = backbuffer.format();
@@ -1581,7 +1611,7 @@ impl AppHandler<Renderer> for App {
         let use_capture_frame_target = capture_active
             && !use_watch_frame_target
             && capture_source_render_target.is_none()
-            && !backbuffer.supports_copy_src();
+            && (!backbuffer.supports_copy_src() || surface_turn != SurfaceTransform::Identity);
         if use_capture_frame_target {
             CaptureFrameTarget::ensure(&mut self.capture_frame_target, &device, w, h, format);
         }
@@ -1592,6 +1622,19 @@ impl AppHandler<Renderer> for App {
         } else {
             None
         };
+        // The main pass draws turned only when it draws straight into the backbuffer; the
+        // frame targets are blitted into it turned instead.
+        let main_turn = if use_watch_frame_target || use_capture_frame_target {
+            SurfaceTransform::Identity
+        } else {
+            surface_turn
+        };
+        let (depth_w, depth_h) = if main_turn == SurfaceTransform::Identity {
+            (w, h)
+        } else {
+            backbuffer.surface_size()
+        };
+        renderer.ensure_depth_size(depth_w, depth_h);
 
         frame_stats.prep_time = prep_started_at.elapsed();
 
@@ -1755,6 +1798,7 @@ impl AppHandler<Renderer> for App {
                         group,
                         group_rt,
                         (rt_w, rt_h),
+                        SurfaceTransform::Identity,
                         stride,
                         &self.instance_byte_offsets,
                         false,
@@ -1784,6 +1828,7 @@ impl AppHandler<Renderer> for App {
                     0..batch_count,
                     None,
                     (w, h),
+                    main_turn,
                     stride,
                     &self.instance_byte_offsets,
                     watch_pass,
@@ -1806,6 +1851,7 @@ impl AppHandler<Renderer> for App {
                 source_view,
                 &frame.view,
                 format,
+                surface_turn,
             );
         }
 
@@ -1830,6 +1876,7 @@ impl AppHandler<Renderer> for App {
                     &watch_target.color_view,
                     &frame.view,
                     format,
+                    surface_turn,
                 );
             } else if let Some(source_rt_id) = capture_source_render_target {
                 let source_view = self.render_targets.get(source_rt_id).view();
@@ -1852,6 +1899,7 @@ impl AppHandler<Renderer> for App {
                     source_view,
                     &frame.view,
                     format,
+                    surface_turn,
                 );
             } else {
                 let bb_ptr = frame
@@ -1968,7 +2016,10 @@ impl AppHandler<Renderer> for App {
             backbuffer.resize(renderer.device(), w, h);
         }
         // The backbuffer fits the window to the texture limit; size everything else to match it.
-        let (w, h) = self.backbuffer.as_ref().map_or((w, h), |b| b.size());
+        let (w, h) = self
+            .backbuffer
+            .as_ref()
+            .map_or((w, h), Backbuffer::surface_size);
         renderer.ensure_depth_size(w, h);
     }
 
