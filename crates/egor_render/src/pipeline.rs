@@ -344,8 +344,11 @@ struct CustomPipelineKey {
 /// - Camera bind group layout (for view/projection transforms)
 pub(crate) struct Pipelines {
     primitive: [RenderPipeline; 2],
+    /// The default shader with its text outline path, only for instances with an outline.
+    primitive_outline: [RenderPipeline; 2],
     primitive_replace: [RenderPipeline; 2],
     primitive_watch: [Option<RenderPipeline>; 2],
+    primitive_outline_watch: [Option<RenderPipeline>; 2],
     primitive_replace_watch: [Option<RenderPipeline>; 2],
     custom: Vec<Option<CustomPipelineBinding>>,
     /// Slots of removed custom shaders, which the next ones reuse. Their compiled pipelines stay cached.
@@ -371,69 +374,46 @@ impl Pipelines {
             std::array::from_fn(|kind| create_texture_bind_group_layout(device, kind == 1));
         let camera_layout = create_camera_bind_group_layout(device);
 
-        let primitive = std::array::from_fn(|kind| {
-            create_primitive_pipeline(
-                device,
-                surface_format,
-                &texture_layout[kind],
-                &camera_layout,
-                Some(BlendState::ALPHA_BLENDING),
-                true,
-                false,
-                false,
-                kind == 1,
-                cache.as_ref(),
-            )
-        });
-        let primitive_replace = std::array::from_fn(|kind| {
-            create_primitive_pipeline(
-                device,
-                surface_format,
-                &texture_layout[kind],
-                &camera_layout,
-                None,
-                false,
-                true,
-                false,
-                kind == 1,
-                cache.as_ref(),
-            )
-        });
-        let primitive_watch = std::array::from_fn(|kind| {
-            watch_overlay_supported.then(|| {
+        let pipelines = |fragment: PrimitiveFragment, watch_overlay: bool| {
+            let (blend, depth_enabled) = match fragment {
+                PrimitiveFragment::Replace => (None, false),
+                PrimitiveFragment::Plain | PrimitiveFragment::Outline => {
+                    (Some(BlendState::ALPHA_BLENDING), true)
+                }
+            };
+            std::array::from_fn(|kind| {
                 create_primitive_pipeline(
                     device,
                     surface_format,
                     &texture_layout[kind],
                     &camera_layout,
-                    Some(BlendState::ALPHA_BLENDING),
-                    true,
-                    false,
-                    true,
+                    blend,
+                    depth_enabled,
+                    fragment,
+                    watch_overlay,
                     kind == 1,
                     cache.as_ref(),
                 )
             })
-        });
-        let primitive_replace_watch = std::array::from_fn(|kind| {
-            watch_overlay_supported.then(|| {
-                create_primitive_pipeline(
-                    device,
-                    surface_format,
-                    &texture_layout[kind],
-                    &camera_layout,
-                    None,
-                    false,
-                    true,
-                    true,
-                    kind == 1,
-                    cache.as_ref(),
-                )
-            })
-        });
+        };
+        let watch_pipelines = |fragment: PrimitiveFragment| {
+            if watch_overlay_supported {
+                pipelines(fragment, true).map(Some)
+            } else {
+                [None, None]
+            }
+        };
+        let primitive = pipelines(PrimitiveFragment::Plain, false);
+        let primitive_outline = pipelines(PrimitiveFragment::Outline, false);
+        let primitive_replace = pipelines(PrimitiveFragment::Replace, false);
+        let primitive_watch = watch_pipelines(PrimitiveFragment::Plain);
+        let primitive_outline_watch = watch_pipelines(PrimitiveFragment::Outline);
+        let primitive_replace_watch = watch_pipelines(PrimitiveFragment::Replace);
 
         Self {
             primitive,
+            primitive_outline,
+            primitive_outline_watch,
             primitive_replace,
             primitive_watch,
             primitive_replace_watch,
@@ -600,6 +580,21 @@ impl Pipelines {
         }
     }
 
+    /// The default shader's outlined-text pipeline, for instances with an outline; `resolve_with_replace` gives
+    /// the plain one, which every other default draw uses.
+    pub fn resolve_outline(
+        &self,
+        watch_overlay: bool,
+        texture_array: bool,
+    ) -> Option<&RenderPipeline> {
+        let kind = usize::from(texture_array);
+        if watch_overlay {
+            self.primitive_outline_watch[kind].as_ref()
+        } else {
+            Some(&self.primitive_outline[kind])
+        }
+    }
+
     pub fn supports_watch_overlay(&self, shader_id: Option<usize>) -> bool {
         self.watch_overlay_supported
             && match shader_id {
@@ -681,6 +676,27 @@ fn create_camera_bind_group_layout(device: &Device) -> BindGroupLayout {
 /// - Vertex shader transforms using camera uniform
 /// - Fragment shader samples from texture
 /// - `Vertex` buffer layout from vertex module
+/// Which fragment body a default pipeline runs (`shader.wgsl`).
+#[derive(Clone, Copy, Debug)]
+enum PrimitiveFragment {
+    /// Sprites, shapes and text without an outline.
+    Plain,
+    /// Text with an outline.
+    Outline,
+    /// A flat color written over what is there.
+    Replace,
+}
+
+impl PrimitiveFragment {
+    fn entry_name(self) -> &'static str {
+        match self {
+            Self::Plain => "main",
+            Self::Outline => "outline",
+            Self::Replace => "replace",
+        }
+    }
+}
+
 fn create_primitive_pipeline(
     device: &Device,
     surface_format: TextureFormat,
@@ -688,7 +704,7 @@ fn create_primitive_pipeline(
     camera_layout: &BindGroupLayout,
     blend: Option<BlendState>,
     depth_enabled: bool,
-    replace: bool,
+    fragment: PrimitiveFragment,
     watch_overlay: bool,
     texture_array: bool,
     cache: Option<&PipelineCache>,
@@ -698,20 +714,16 @@ fn create_primitive_pipeline(
         label: None,
         source: ShaderSource::Wgsl(source.into()),
     });
-    let fragment_entry_point = match (
-        replace,
-        surface_needs_srgb_encode(surface_format),
-        watch_overlay,
-    ) {
-        (true, true, true) => "fs_replace_srgb_encoded_watch",
-        (true, false, true) => "fs_replace_watch",
-        (false, true, true) => "fs_main_srgb_encoded_watch",
-        (false, false, true) => "fs_main_watch",
-        (true, true, false) => "fs_replace_srgb_encoded",
-        (true, false, false) => "fs_replace",
-        (false, true, false) => "fs_main_srgb_encoded",
-        (false, false, false) => "fs_main",
-    };
+    let fragment_entry_point = format!(
+        "fs_{}{}{}",
+        fragment.entry_name(),
+        if surface_needs_srgb_encode(surface_format) {
+            "_srgb_encoded"
+        } else {
+            ""
+        },
+        if watch_overlay { "_watch" } else { "" },
+    );
     let mut targets = vec![Some(ColorTargetState {
         format: surface_format,
         blend,
@@ -724,27 +736,20 @@ fn create_primitive_pipeline(
             write_mask: ColorWrites::ALL,
         }));
     }
-    let pipeline_label = match (replace, watch_overlay) {
-        (true, true) => "Primitive Replace Watch Overlay Pipeline",
-        (false, true) => "Primitive Watch Overlay Pipeline",
-        (true, false) => "Primitive Replace Pipeline",
-        (false, false) => "Primitive Pipeline",
-    };
-    let pipeline_layout_label = match (replace, watch_overlay) {
-        (true, true) => "Primitive Replace Watch Overlay Pipeline Layout",
-        (false, true) => "Primitive Watch Overlay Pipeline Layout",
-        (true, false) => "Primitive Replace Pipeline Layout",
-        (false, false) => "Primitive Pipeline Layout",
-    };
+    let pipeline_label = format!(
+        "Primitive {fragment:?}{} Pipeline",
+        if watch_overlay { " Watch Overlay" } else { "" }
+    );
+    let pipeline_layout_label = format!("{pipeline_label} Layout");
 
     let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-        label: Some(pipeline_layout_label),
+        label: Some(&pipeline_layout_label),
         bind_group_layouts: &[Some(texture_layout), Some(camera_layout)],
         immediate_size: 0,
     });
 
     device.create_render_pipeline(&RenderPipelineDescriptor {
-        label: Some(pipeline_label),
+        label: Some(&pipeline_label),
         layout: Some(&pipeline_layout),
         vertex: VertexState {
             module: &shader,
@@ -767,7 +772,7 @@ fn create_primitive_pipeline(
         multisample: Default::default(),
         fragment: Some(FragmentState {
             module: &shader,
-            entry_point: Some(fragment_entry_point),
+            entry_point: Some(&fragment_entry_point),
             targets: &targets,
             compilation_options: Default::default(),
         }),
