@@ -474,10 +474,15 @@ impl<R, H: AppHandler<R> + 'static> ApplicationHandler<(R, H)> for AppRunner<R, 
                 )))]
                 self.desktop_frame_pacer.reset();
             }
-            WindowEvent::KeyboardInput { event, .. } => self.input.update_key(event),
-            WindowEvent::MouseInput { button, state, .. } => {
+            WindowEvent::KeyboardInput { event, time, .. } => self.input.update_key(event, time),
+            WindowEvent::MouseInput {
+                button,
+                state,
+                time,
+                ..
+            } => {
                 self.input.update_mouse_button(button, state);
-                self.input.simulate_touch_from_mouse(button, state);
+                self.input.simulate_touch_from_mouse(button, state, time);
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.input.update_cursor(position);
