@@ -54,6 +54,6 @@ web-sys = { version = "0.3.106", features = ["Window", "Document", "Element", "H
 wasm-bindgen = "0.2.129"
 
 [dev-dependencies]
-winit = { git = "https://github.com/VoltaSoftware/winit", branch = "feat/input-event-times" }
+winit = { git = "https://github.com/VoltaSoftware/winit", branch = "lot" }
 pollster = "1.0.1"
 wgpu = { version = "30.0.1", default-features = false, features = ["noop", "wgsl"] }

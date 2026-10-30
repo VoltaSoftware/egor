@@ -23,7 +23,7 @@ log = [
 [dependencies]
 log = { version = "0.4.34", optional = true }
 web-time = "1.1.0"
-winit = { git = "https://github.com/VoltaSoftware/winit", branch = "feat/input-event-times" }
+winit = { git = "https://github.com/VoltaSoftware/winit", branch = "lot" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = { version = "0.1.7", optional = true }
