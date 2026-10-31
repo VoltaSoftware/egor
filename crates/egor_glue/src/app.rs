@@ -574,6 +574,8 @@ pub struct App {
     render_targets: RenderTargetStore,
     screen_capture: ScreenCaptureState,
     prewarm_watch_capture: bool,
+    /// The watch renderer's warm-up draw, waiting for the pipelines it draws with.
+    watch_warmup_pending: bool,
     pipeline_cache_dir: Option<std::path::PathBuf>,
     fps_limit: Option<u16>,
     native_refresh_rate_fps: Option<u16>,
@@ -622,6 +624,7 @@ impl App {
             render_targets: RenderTargetStore::new(),
             screen_capture: ScreenCaptureState::new(),
             prewarm_watch_capture: false,
+            watch_warmup_pending: false,
             pipeline_cache_dir: None,
             fps_limit: None,
             native_refresh_rate_fps: None,
@@ -679,6 +682,42 @@ impl App {
         self
     }
 
+    /// Takes in capture pipelines compiled since the last frame. Once they and egor's own are in, warms up the
+    /// watch renderer if the app asked for that.
+    fn advance_capture_pipelines(&mut self, renderer: &mut Renderer, window: &Window) {
+        self.screen_capture.advance_pipeline_build(renderer.device());
+        if !self.watch_warmup_pending {
+            return;
+        }
+        let Some(backbuffer) = self.backbuffer.as_ref() else {
+            return;
+        };
+        let (format, turn) = (backbuffer.format(), backbuffer.transform());
+        if !self.screen_capture.pipelines_ready(format, turn) {
+            // The surface may have turned since the build started.
+            self.screen_capture.build_pipelines(
+                renderer.device(),
+                format,
+                turn,
+                renderer.allows_worker_threads(),
+            );
+            return;
+        }
+        // The warm-up releases the capture buffers, so it waits for a requested capture to be taken.
+        if !renderer.startup_pipelines_ready() || self.screen_capture.is_requested() {
+            return;
+        }
+        self.watch_warmup_pending = false;
+        let size = window_surface_size(window);
+        let (w, h) = egor_render::target::fit_to_texture_limit(
+            renderer.device(),
+            size.width.max(1),
+            size.height.max(1),
+        );
+        self.prepare_watch_renderer(renderer, format, w, h);
+    }
+
+    /// Draws once through the watch and capture pipelines, which are compiled by now.
     fn prepare_watch_renderer(
         &mut self,
         renderer: &mut Renderer,
@@ -686,14 +725,12 @@ impl App {
         width: u32,
         height: u32,
     ) {
+        let started_at = Instant::now();
         let (device, queue) = (renderer.device().clone(), renderer.queue().clone());
-        // Warm the pipelines the backbuffer will use.
         let turn = self
             .backbuffer
             .as_ref()
             .map_or(SurfaceTransform::Identity, Backbuffer::transform);
-        self.screen_capture
-            .prewarm_watch_pipelines(&device, format, turn);
 
         // Some GL drivers defer compilation until the first draw. Exercise
         // the built-in watch and downsample pipelines during initialization.
@@ -702,6 +739,7 @@ impl App {
         let target = WatchFrameTarget::new(&device, width, height, format);
         let presented = CaptureFrameTarget::new(&device, width, height, format);
         renderer.ensure_depth_size(width, height);
+        let targets_made_in = started_at.elapsed();
         let depth_view = renderer.depth_view().clone();
         let mut encoder = device.create_command_encoder(&Default::default());
         let mut batch = egor_render::batch::GeometryBatch::new(4, 6);
@@ -765,6 +803,11 @@ impl App {
         }
         self.screen_capture.release_buffers();
         self.watch_frame_target = Some(target);
+        log::info!(
+            "[egor] watch renderer warmed up in {} ms ({} ms making its {width}x{height} targets)",
+            started_at.elapsed().as_millis(),
+            targets_made_in.as_millis()
+        );
     }
 
     /// Set window icon
@@ -1028,6 +1071,7 @@ impl App {
         self.backbuffer = None;
         self.render_targets = RenderTargetStore::new();
         self.screen_capture = ScreenCaptureState::new();
+        self.watch_warmup_pending = false;
         self.capture_frame_target = None;
         self.watch_frame_target = None;
         self.watch_overlay_capture_unsupported_logged = false;
@@ -1229,13 +1273,19 @@ impl AppHandler<Renderer> for App {
             backbuffer.set_vsync(device, hardware_vsync_enabled(self.vsync, self.fps_limit));
         }
         if self.prewarm_watch_capture && renderer.supports_watch_overlay_capture() {
-            let size = window_surface_size(window);
-            let (w, h) = egor_render::target::fit_to_texture_limit(
-                renderer.device(),
-                size.width.max(1),
-                size.height.max(1),
+            // The pipelines compile away from this thread; the watch renderer warms up on the first frame they
+            // and egor's own are in.
+            let turn = self
+                .backbuffer
+                .as_ref()
+                .map_or(SurfaceTransform::Identity, Backbuffer::transform);
+            self.screen_capture.prewarm_watch_pipelines(
+                device,
+                format,
+                turn,
+                renderer.allows_worker_threads(),
             );
-            self.prepare_watch_renderer(renderer, format, w, h);
+            self.watch_warmup_pending = true;
         }
         if let Some(fps_limit) = self.fps_limit {
             set_native_preferred_fps(window, fps_limit);
@@ -1417,6 +1467,8 @@ impl AppHandler<Renderer> for App {
             return;
         }
 
+        self.advance_capture_pipelines(renderer, _window);
+
         let Some(backbuffer) = &mut self.backbuffer else {
             self.frame_timer_reset_requested = true;
             self.finish_frame_stats(frame_stats, egor_frame_started_at);
@@ -1575,9 +1627,24 @@ impl AppHandler<Renderer> for App {
             }
         }
 
-        let mut capture_active = self.screen_capture.is_requested();
-        let mut capture_source_render_target = self.screen_capture.requested_source_render_target();
-        let mut use_watch_frame_target = self.screen_capture.is_watch_overlay_capture_requested();
+        // A requested capture waits, still requested, for the pipelines it draws with to compile away from the
+        // frame, and for egor's own.
+        let capture_ready = self.screen_capture.is_requested() && {
+            self.screen_capture.build_pipelines(
+                &device,
+                format,
+                surface_turn,
+                renderer.allows_worker_threads(),
+            );
+            self.screen_capture.pipelines_ready(format, surface_turn)
+                && renderer.startup_pipelines_ready()
+        };
+        let mut capture_active = capture_ready;
+        let mut capture_source_render_target = capture_ready
+            .then(|| self.screen_capture.requested_source_render_target())
+            .flatten();
+        let mut use_watch_frame_target =
+            capture_ready && self.screen_capture.is_watch_overlay_capture_requested();
         if use_watch_frame_target {
             let unsupported_capture = !renderer.supports_watch_overlay_capture();
             let unsupported_shader = batches
@@ -1638,6 +1705,14 @@ impl AppHandler<Renderer> for App {
         renderer.ensure_depth_size(depth_w, depth_h);
 
         frame_stats.prep_time = prep_started_at.elapsed();
+
+        // egor's built-in pipelines compile off this thread at startup. Until they are in, a frame runs the app but
+        // draws nothing, rather than wait for them (the platform's launch screen stays up meanwhile).
+        if !renderer.startup_pipelines_ready() {
+            self.primitive_batch.recycle(batches);
+            self.finish_frame_stats(frame_stats, egor_frame_started_at);
+            return;
+        }
 
         let surface_acquire_started_at = Instant::now();
         let frame_result = match renderer.try_begin_frame(backbuffer) {

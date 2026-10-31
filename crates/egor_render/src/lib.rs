@@ -18,6 +18,7 @@ use std::sync::{
 };
 
 pub use instance_upload::InstanceUploadMetrics;
+pub use texture::EmptyTextureArray;
 
 pub use wgpu::{
     self, AdapterInfo, Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, Extent3d,
@@ -35,7 +36,7 @@ use wgpu::{
 use crate::{
     batch::GeometryBatch,
     frame::{Frame, Presentable},
-    pipeline::{CustomBinding, Pipelines},
+    pipeline::{CompileMode, CustomBinding, Pipelines},
     target::{OffscreenTarget, RenderTarget},
     texture::Textures,
     uniforms::{CameraUniform, Uniforms},
@@ -94,6 +95,9 @@ impl RendererBackendPreference {
 fn renderer_instance_descriptor() -> InstanceDescriptor {
     let mut desc = InstanceDescriptor::new_without_display_handle();
     desc.flags = desc.flags.with_env();
+    // egor never draws or dispatches indirectly, and validating those calls compiles compute pipelines while the
+    // device is created: 60-100 ms of an iPhone's launch with a cold shader cache, and 0.5 s once after an install.
+    desc.flags.remove(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL);
     configure_renderer_instance_flags(&mut desc);
     desc
 }
@@ -238,6 +242,27 @@ pub struct Renderer {
     surface_transform: wgpu::SurfaceTransform,
     /// Where `save_pipeline_cache` keeps the driver's compiled pipelines.
     pipeline_cache_file: Option<std::path::PathBuf>,
+    /// Threads compiling custom shaders; 0 when they compile on the thread that adds them.
+    #[cfg(not(target_arch = "wasm32"))]
+    shader_compile_threads: usize,
+    /// The background compiles not all finished yet.
+    #[cfg(not(target_arch = "wasm32"))]
+    compile_batch: Option<CompileBatch>,
+}
+
+/// Custom shaders compiling on worker threads, from the first to start while none were.
+#[cfg(not(target_arch = "wasm32"))]
+struct CompileBatch {
+    started_at: std::time::Instant,
+    first: usize,
+}
+
+/// Threads for compiling custom shaders: several at once, without taking every core from the frame.
+#[cfg(not(target_arch = "wasm32"))]
+fn shader_compile_threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, |cores| cores.get() / 2)
+        .clamp(1, 3)
 }
 
 impl Renderer {
@@ -441,11 +466,42 @@ impl Renderer {
             "[egor] renderer init: watch overlay capture MRT supported: {watch_overlay_supported}"
         );
         log::info!("[egor] renderer init: creating pipelines and core buffers");
-        let pipelines = Pipelines::new(
+        // A pipeline takes tens of milliseconds to compile on a phone, so pipelines compile on worker threads where
+        // the backend allows it, and frames draw nothing until egor's own are in rather than wait for them.
+        // OpenGL's context belongs to one thread at a time (wgpu gives up waiting for it after a second), so there
+        // they compile a family a frame. Browsers compile them away from the page's main thread when asked
+        // through `createRenderPipelineAsync`; WebGL has no such call.
+        #[cfg(not(target_arch = "wasm32"))]
+        let shader_compile_threads = match adapter.get_info().backend {
+            wgpu::Backend::Vulkan | wgpu::Backend::Metal | wgpu::Backend::Dx12 => {
+                shader_compile_threads()
+            }
+            _ => 0,
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let compile_mode = if shader_compile_threads > 0 {
+            log::info!(
+                "[egor] renderer init: compiling pipelines on {shader_compile_threads} threads"
+            );
+            CompileMode::Threads(shader_compile_threads)
+        } else {
+            CompileMode::Frames
+        };
+        #[cfg(target_arch = "wasm32")]
+        let compile_mode = if adapter.get_info().backend == wgpu::Backend::BrowserWebGpu {
+            log::info!(
+                "[egor] renderer init: compiling pipelines through the browser's async pipelines"
+            );
+            CompileMode::Browser
+        } else {
+            CompileMode::Frames
+        };
+        let pipelines = Pipelines::new_with(
             &device,
             surface_format,
             watch_overlay_supported,
             pipeline_cache,
+            compile_mode,
         );
 
         let quad_vertex_buffer = device.create_buffer_init(&BufferInitDescriptor {
@@ -529,6 +585,14 @@ impl Renderer {
             last_camera: [[[0.0; 4]; 4]; 8],
             surface_transform: wgpu::SurfaceTransform::Identity,
             pipeline_cache_file,
+            #[cfg(not(target_arch = "wasm32"))]
+            shader_compile_threads,
+            // egor's own pipelines are the first batch.
+            #[cfg(not(target_arch = "wasm32"))]
+            compile_batch: (shader_compile_threads > 0).then(|| CompileBatch {
+                started_at: std::time::Instant::now(),
+                first: 0,
+            }),
         })
     }
 
@@ -650,6 +714,7 @@ impl Renderer {
         &mut self,
         target: &mut dyn RenderTarget,
     ) -> Result<Option<Frame>, RendererFrameError> {
+        self.take_finished_compiles();
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let (view, presentable) = target.acquire(&self.gpu.device)?;
             let encoder = self.gpu.device.create_command_encoder(&Default::default());
@@ -987,8 +1052,10 @@ impl Renderer {
         self.pipelines.supports_watch_overlay(shader_id)
     }
 
+    /// Whether the device can capture the watch overlay. egor's own pipelines for it may still be compiling
+    /// ([`Self::startup_pipelines_ready`]).
     pub fn supports_watch_overlay_capture(&self) -> bool {
-        self.pipelines.supports_watch_overlay(None)
+        self.pipelines.watch_overlay_supported()
     }
 
     /// Draws a geometry batch. Call [`bind_pass_state`] first to set pipeline/texture.
@@ -1537,40 +1604,146 @@ impl Renderer {
                 texture_count,
             ))
             .collect();
-        self.pipelines.add_custom(
+        let (finished, started) = self.pipelines.compiles();
+        let id = self.pipelines.add_custom(
             &self.gpu.device,
             self.surface_format,
             wgsl_source,
             &layouts,
             bindings,
-        )
+        );
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.shader_compile_threads > 0
+            && finished == started
+            && self.pipelines.compiles().1 > started
+        {
+            self.compile_batch = Some(CompileBatch {
+                started_at: std::time::Instant::now(),
+                first: started,
+            });
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = (finished, started);
+        id
+    }
+
+    /// Waits for custom shader `id`'s pipelines, if a compile thread is still on them. A draw needs them, so
+    /// `Graphics` waits before a shader can be drawn with.
+    pub fn wait_for_shader(&mut self, id: usize) {
+        self.pipelines.wait_for_custom(id);
+    }
+
+    /// Shader compiles finished, and started; they all finish at once where shaders compile on the thread
+    /// that adds them.
+    pub fn shader_compiles(&self) -> (usize, usize) {
+        self.pipelines.compiles()
+    }
+
+    /// Whether other threads can use the GPU: Vulkan, Metal and DX12. OpenGL's context belongs to one thread at a
+    /// time, and browsers have no threads to give.
+    pub fn allows_worker_threads(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.shader_compile_threads > 0;
+        #[cfg(target_arch = "wasm32")]
+        false
+    }
+
+    /// Starts making an empty `w`×`h` texture array of `layers`, which the GPU clears on first use. Allocating a big
+    /// one took a Samsung A16's driver 0.19 s, so where other threads can use the GPU, one makes it.
+    pub fn start_empty_texture_array(
+        &mut self,
+        w: u32,
+        h: u32,
+        layers: u32,
+    ) -> Result<EmptyTextureArray, String> {
+        let on_thread = self.allows_worker_threads();
+        self.textures
+            .start_empty_array(&self.gpu.device, &self.gpu.queue, w, h, layers, on_thread)
+    }
+
+    /// The texture array's id, once it is made.
+    pub fn take_empty_texture_array(&mut self, array: &mut EmptyTextureArray) -> Option<usize> {
+        self.textures.take_empty_array(array)
+    }
+
+    /// Takes in finished compiles and says whether egor's own pipelines, which every frame draws with, are
+    /// compiled. Until they are, `egor_glue` draws nothing rather than wait.
+    pub fn startup_pipelines_ready(&mut self) -> bool {
+        if !self.pipelines.builtins_ready() {
+            self.take_finished_compiles();
+        }
+        self.pipelines.builtins_ready()
+    }
+
+    /// Takes in the custom shaders the compile threads finished. Once all of a batch are in, it saves the
+    /// driver's compiled pipelines for the next run, as [`Self::save_pipeline_cache`] after compiling them on
+    /// this thread would.
+    fn take_finished_compiles(&mut self) {
+        self.pipelines.take_finished_compiles();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let (finished, started) = self.pipelines.compiles();
+            if finished == started
+                && let Some(batch) = self.compile_batch.take()
+            {
+                log::info!(
+                    "[egor] compiled {} shaders on {} threads in {} ms",
+                    finished - batch.first,
+                    self.shader_compile_threads,
+                    batch.started_at.elapsed().as_millis()
+                );
+                self.save_pipeline_cache();
+            }
+        }
     }
 
     /// Writes the driver's compiled pipelines to the pipeline cache file, so the next run starts with them.
     /// Call it after compiling a batch of pipelines, such as while loading. A no-op without a cache.
+    ///
+    /// Natively the cache is read out and written on another thread: a phone's driver can take a while to
+    /// serialize a few MB of it, and the frame shouldn't wait.
     pub fn save_pipeline_cache(&self) {
-        let (Some(file), Some(data)) = (&self.pipeline_cache_file, self.pipelines.cache_data())
-        else {
+        let (Some(file), Some(cache)) = (
+            self.pipeline_cache_file.clone(),
+            self.pipelines.cache().cloned(),
+        ) else {
             return;
         };
-        // Through a temporary file, so a crash mid-write never leaves a torn cache.
-        let temp = file.with_extension("tmp");
-        let result = file
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::write(&temp, &data))
-            .and_then(|()| std::fs::rename(&temp, file));
-        match result {
-            Ok(()) => log::info!(
-                "[egor] saved pipeline cache {} ({} bytes)",
-                file.display(),
-                data.len()
-            ),
-            Err(error) => log::warn!(
-                "[egor] saving pipeline cache {} failed: {error}",
-                file.display()
-            ),
+        let save = move || {
+            // One save at a time, so two never write the temporary file at once.
+            static SAVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _saving = SAVING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(data) = cache.get_data() else {
+                return;
+            };
+            // Through a temporary file, so a crash mid-write never leaves a torn cache.
+            let temp = file.with_extension("tmp");
+            let result = file
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&temp, &data))
+                .and_then(|()| std::fs::rename(&temp, &file));
+            match result {
+                Ok(()) => log::info!(
+                    "[egor] saved pipeline cache {} ({} bytes)",
+                    file.display(),
+                    data.len()
+                ),
+                Err(error) => log::warn!(
+                    "[egor] saving pipeline cache {} failed: {error}",
+                    file.display()
+                ),
+            }
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Err(error) = std::thread::Builder::new()
+            .name("egor pipeline cache".to_owned())
+            .spawn(save)
+        {
+            log::warn!("[egor] couldn't start saving the pipeline cache: {error}");
         }
+        #[cfg(target_arch = "wasm32")]
+        save();
     }
 
     /// Points texture `index` of a shader from [`Self::add_shader_with_textures`] at a 2D texture,
