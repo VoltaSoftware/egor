@@ -311,25 +311,72 @@ struct CompiledCustomPipeline {
     watch_pipeline: [Option<RenderPipeline>; 2],
 }
 
+impl CompiledCustomPipeline {
+    fn pick(&self, watch_overlay: bool, texture_array: bool) -> Option<&RenderPipeline> {
+        let kind = usize::from(texture_array);
+        if watch_overlay {
+            self.watch_pipeline[kind].as_ref()
+        } else {
+            Some(&self.pipeline[kind])
+        }
+    }
+}
+
 /// A custom shader's pipelines, or a worker thread still compiling them.
 enum CompiledSlot {
     Ready(CompiledCustomPipeline),
     Compiling,
 }
 
-/// Everything compiling one custom shader takes, so it can run on a worker thread.
-struct CustomCompile {
+/// Everything compiling one family of pipelines takes (a custom shader's, or a built-in one's), so it can run on a
+/// worker thread or through the browser.
+struct PipelineCompile {
     device: Device,
     surface_format: TextureFormat,
     texture_layout: [BindGroupLayout; 2],
     camera_layout: BindGroupLayout,
-    uniform_layouts: Vec<BindGroupLayout>,
-    wgsl_source: String,
     cache: Option<PipelineCache>,
     watch_overlay_supported: bool,
+    program: Program,
 }
 
-/// A custom shader's pipelines as they were asked for: pipelines, or futures of them.
+/// What a [`PipelineCompile`] builds.
+enum Program {
+    Custom {
+        wgsl_source: String,
+        uniform_layouts: Vec<BindGroupLayout>,
+    },
+    /// egor's own shader (`shader.wgsl`), with this fragment body.
+    Builtin(PrimitiveFragment),
+}
+
+/// Where pipelines compile.
+pub(crate) enum CompileMode {
+    /// On the thread that asks for them (tests and the shader check).
+    #[cfg_attr(not(any(test, feature = "shader-check")), allow(dead_code))]
+    Here,
+    /// The built-in ones a family a frame, from [`Pipelines::take_finished_compiles`]; custom ones on the thread
+    /// that asks (OpenGL, whose context belongs to one thread at a time).
+    Frames,
+    /// On this many worker threads.
+    #[cfg(not(target_arch = "wasm32"))]
+    Threads(usize),
+    /// Through the browser's `createRenderPipelineAsync`, away from the page's main thread.
+    #[cfg(target_arch = "wasm32")]
+    Browser,
+}
+
+/// The built-in pipelines' slots in `compiled_custom`, ahead of every custom shader's.
+const PLAIN: usize = 0;
+const OUTLINE: usize = 1;
+const REPLACE: usize = 2;
+const BUILTINS: [(usize, PrimitiveFragment); 3] = [
+    (PLAIN, PrimitiveFragment::Plain),
+    (OUTLINE, PrimitiveFragment::Outline),
+    (REPLACE, PrimitiveFragment::Replace),
+];
+
+/// A family's pipelines as they were asked for: pipelines, or futures of them.
 struct BuiltPipelines<R> {
     normal: R,
     normal_watch: Option<R>,
@@ -349,11 +396,38 @@ impl BuiltPipelines<RenderPipeline> {
     }
 }
 
-impl CustomCompile {
+impl PipelineCompile {
     fn build<R>(&self, create: CreatePipeline<'_, R>) -> BuiltPipelines<R> {
-        let uniform_layouts: Vec<&BindGroupLayout> = self.uniform_layouts.iter().collect();
+        let (wgsl_source, uniform_layouts) = match &self.program {
+            Program::Custom {
+                wgsl_source,
+                uniform_layouts,
+            } => (wgsl_source, uniform_layouts),
+            Program::Builtin(fragment) => {
+                let primitive = |watch_overlay, array: bool| {
+                    create_primitive_pipeline(
+                        &self.device,
+                        self.surface_format,
+                        &self.texture_layout[usize::from(array)],
+                        &self.camera_layout,
+                        *fragment,
+                        watch_overlay,
+                        array,
+                        self.cache.as_ref(),
+                        create,
+                    )
+                };
+                let watch = |array| self.watch_overlay_supported.then(|| primitive(true, array));
+                return BuiltPipelines {
+                    normal: primitive(false, false),
+                    normal_watch: watch(false),
+                    array: Some((primitive(false, true), watch(true))),
+                };
+            }
+        };
+        let uniform_layouts: Vec<&BindGroupLayout> = uniform_layouts.iter().collect();
         let build = |array| {
-            let source = crate::prepare_texture_shader(&self.wgsl_source, array);
+            let source = crate::prepare_texture_shader(wgsl_source, array);
             let texture_layout = &self.texture_layout[usize::from(array)];
             let pipeline = create_custom_pipeline(
                 &self.device,
@@ -382,8 +456,7 @@ impl CustomCompile {
             (pipeline, watch)
         };
         let (normal, normal_watch) = build(false);
-        let array = self
-            .wgsl_source
+        let array = wgsl_source
             .contains("// EGOR_TEXTURE_SAMPLING")
             .then(|| build(true));
         BuiltPipelines {
@@ -432,7 +505,7 @@ impl CustomCompile {
 struct AsyncCompiles {
     finished: std::rc::Rc<std::cell::RefCell<Vec<(usize, CompiledCustomPipeline)>>>,
     /// The compiles still waiting, by compiled slot, for a draw that needs one first to run it at once.
-    queued: HashMap<usize, std::rc::Rc<CustomCompile>>,
+    queued: HashMap<usize, std::rc::Rc<PipelineCompile>>,
 }
 
 /// What a compile thread hands back: the compiled slot's index, and its pipelines or the panic that stopped them.
@@ -443,7 +516,7 @@ type FinishedCompile = (usize, std::thread::Result<CompiledCustomPipeline>);
 /// started it, rather than waiting behind every compile queued before it.
 #[cfg(not(target_arch = "wasm32"))]
 struct QueuedCompile {
-    compile: CustomCompile,
+    compile: PipelineCompile,
     claimed: std::sync::atomic::AtomicBool,
 }
 
@@ -541,17 +614,13 @@ struct CustomPipelineKey {
 /// - Texture bind group layout (for sampling textures in shaders)
 /// - Camera bind group layout (for view/projection transforms)
 pub(crate) struct Pipelines {
-    primitive: [RenderPipeline; 2],
-    /// The default shader with its text outline path, only for instances with an outline.
-    primitive_outline: [RenderPipeline; 2],
-    primitive_replace: [RenderPipeline; 2],
-    primitive_watch: [Option<RenderPipeline>; 2],
-    primitive_outline_watch: [Option<RenderPipeline>; 2],
-    primitive_replace_watch: [Option<RenderPipeline>; 2],
     custom: Vec<Option<CustomPipelineBinding>>,
     /// Slots of removed custom shaders, which the next ones reuse. Their compiled pipelines stay cached.
     free_custom_slots: Vec<usize>,
+    /// The built-in pipelines (at [`PLAIN`], [`OUTLINE`] and [`REPLACE`]), then every custom shader's.
     compiled_custom: Vec<CompiledSlot>,
+    /// Built-in families still to compile, one a frame ([`CompileMode::Frames`]).
+    frame_queue: std::collections::VecDeque<(usize, PipelineCompile)>,
     custom_cache: HashMap<CustomPipelineKey, usize>,
     texture_layout: [BindGroupLayout; 2],
     pub camera_layout: BindGroupLayout,
@@ -568,63 +637,41 @@ pub(crate) struct Pipelines {
 }
 
 impl Pipelines {
-    /// Creates all pipelines and bind group layouts for the given device and surface format
+    /// Creates all pipelines and bind group layouts for the given device and surface format, compiling the
+    /// built-in pipelines at once.
+    #[cfg(any(test, feature = "shader-check"))]
     pub fn new(
         device: &Device,
         surface_format: TextureFormat,
         watch_overlay_supported: bool,
         cache: Option<PipelineCache>,
     ) -> Self {
+        Self::new_with(
+            device,
+            surface_format,
+            watch_overlay_supported,
+            cache,
+            CompileMode::Here,
+        )
+    }
+
+    /// Like [`Self::new`], with every pipeline compiling where `mode` says. Unless that is here, the built-in
+    /// ones are not ready until [`Self::builtins_ready`]; custom shaders don't wait for them.
+    pub fn new_with(
+        device: &Device,
+        surface_format: TextureFormat,
+        watch_overlay_supported: bool,
+        cache: Option<PipelineCache>,
+        mode: CompileMode,
+    ) -> Self {
         let texture_layout =
             std::array::from_fn(|kind| create_texture_bind_group_layout(device, kind == 1));
         let camera_layout = create_camera_bind_group_layout(device);
-
-        let pipelines = |fragment: PrimitiveFragment, watch_overlay: bool| {
-            let (blend, depth_enabled) = match fragment {
-                PrimitiveFragment::Replace => (None, false),
-                PrimitiveFragment::Plain | PrimitiveFragment::Outline => {
-                    (Some(BlendState::ALPHA_BLENDING), true)
-                }
-            };
-            std::array::from_fn(|kind| {
-                create_primitive_pipeline(
-                    device,
-                    surface_format,
-                    &texture_layout[kind],
-                    &camera_layout,
-                    blend,
-                    depth_enabled,
-                    fragment,
-                    watch_overlay,
-                    kind == 1,
-                    cache.as_ref(),
-                )
-            })
-        };
-        let watch_pipelines = |fragment: PrimitiveFragment| {
-            if watch_overlay_supported {
-                pipelines(fragment, true).map(Some)
-            } else {
-                [None, None]
-            }
-        };
-        let primitive = pipelines(PrimitiveFragment::Plain, false);
-        let primitive_outline = pipelines(PrimitiveFragment::Outline, false);
-        let primitive_replace = pipelines(PrimitiveFragment::Replace, false);
-        let primitive_watch = watch_pipelines(PrimitiveFragment::Plain);
-        let primitive_outline_watch = watch_pipelines(PrimitiveFragment::Outline);
-        let primitive_replace_watch = watch_pipelines(PrimitiveFragment::Replace);
-
-        Self {
-            primitive,
-            primitive_outline,
-            primitive_outline_watch,
-            primitive_replace,
-            primitive_watch,
-            primitive_replace_watch,
+        let mut pipelines = Self {
             custom: Vec::new(),
             free_custom_slots: Vec::new(),
             compiled_custom: Vec::new(),
+            frame_queue: Default::default(),
             custom_cache: HashMap::new(),
             texture_layout,
             camera_layout,
@@ -636,24 +683,53 @@ impl Pipelines {
             async_compiles: None,
             compiles_started: 0,
             compiles_finished: 0,
+        };
+        let frames = matches!(mode, CompileMode::Frames);
+        match mode {
+            CompileMode::Here | CompileMode::Frames => {}
+            #[cfg(not(target_arch = "wasm32"))]
+            CompileMode::Threads(threads) => {
+                pipelines.background = Some(BackgroundCompiles::start(threads));
+            }
+            #[cfg(target_arch = "wasm32")]
+            CompileMode::Browser => {
+                pipelines.async_compiles = Some(AsyncCompiles {
+                    finished: Default::default(),
+                    queued: HashMap::new(),
+                });
+            }
         }
+        for (slot, fragment) in BUILTINS {
+            let compile = PipelineCompile {
+                device: device.clone(),
+                surface_format,
+                texture_layout: pipelines.texture_layout.clone(),
+                camera_layout: pipelines.camera_layout.clone(),
+                cache: pipelines.cache.clone(),
+                watch_overlay_supported,
+                program: Program::Builtin(fragment),
+            };
+            if frames {
+                pipelines.compiles_started += 1;
+                pipelines.compiled_custom.push(CompiledSlot::Compiling);
+                pipelines.frame_queue.push_back((slot, compile));
+            } else {
+                pipelines.start_compile(compile);
+            }
+        }
+        pipelines
     }
 
-    /// From now on custom shaders compile on `threads` worker threads, and [`Self::add_custom`] returns before
-    /// they are ready; [`Self::wait_for_custom`] waits for one.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn compile_in_background(&mut self, threads: usize) {
-        self.background = Some(BackgroundCompiles::start(threads));
+    /// Whether the built-in pipelines every frame draws with are compiled.
+    pub fn builtins_ready(&self) -> bool {
+        BUILTINS.iter().all(|&(slot, _)| self.ready(slot).is_some())
     }
 
-    /// From now on custom shaders compile through the browser's `createRenderPipelineAsync`, away from the
-    /// page's main thread, and [`Self::add_custom`] returns before they are ready.
-    #[cfg(target_arch = "wasm32")]
-    pub fn compile_async(&mut self) {
-        self.async_compiles = Some(AsyncCompiles {
-            finished: Default::default(),
-            queued: HashMap::new(),
-        });
+    fn ready(&self, slot: usize) -> Option<&CompiledCustomPipeline> {
+        match self.compiled_custom.get(slot)? {
+            CompiledSlot::Ready(compiled) => Some(compiled),
+            CompiledSlot::Compiling => None,
+        }
     }
 
     /// Custom shader compiles finished, and started.
@@ -661,8 +737,13 @@ impl Pipelines {
         (self.compiles_finished, self.compiles_started)
     }
 
-    /// Takes in the compiles the worker threads, or the browser, have finished.
+    /// Takes in the compiles the worker threads, or the browser, have finished; or, compiling a frame at a
+    /// time, compiles the next built-in family.
     pub fn take_finished_compiles(&mut self) {
+        if let Some((slot, compile)) = self.frame_queue.pop_front() {
+            self.compiled_custom[slot] = CompiledSlot::Ready(compile.run());
+            self.compiles_finished += 1;
+        }
         #[cfg(not(target_arch = "wasm32"))]
         while let Some(Ok((id, result))) = self
             .background
@@ -742,7 +823,7 @@ impl Pipelines {
     }
 
     /// Compiles `compile` on a worker thread when there are any, else here; the index of its slot.
-    fn start_compile(&mut self, compile: CustomCompile) -> usize {
+    fn start_compile(&mut self, compile: PipelineCompile) -> usize {
         let id = self.compiled_custom.len();
         self.compiles_started += 1;
         #[cfg(not(target_arch = "wasm32"))]
@@ -811,15 +892,17 @@ impl Pipelines {
         let compiled_pipeline_id = if let Some(&id) = self.custom_cache.get(&cache_key) {
             id
         } else {
-            let id = self.start_compile(CustomCompile {
+            let id = self.start_compile(PipelineCompile {
                 device: device.clone(),
                 surface_format,
                 texture_layout: self.texture_layout.clone(),
                 camera_layout: self.camera_layout.clone(),
-                uniform_layouts: cache_key.uniform_layouts.clone(),
-                wgsl_source: cache_key.wgsl_source.clone(),
                 cache: self.cache.clone(),
                 watch_overlay_supported: self.watch_overlay_supported,
+                program: Program::Custom {
+                    wgsl_source: cache_key.wgsl_source.clone(),
+                    uniform_layouts: cache_key.uniform_layouts.clone(),
+                },
             });
             self.custom_cache.insert(cache_key, id);
             id
@@ -875,34 +958,20 @@ impl Pipelines {
         watch_overlay: bool,
         texture_array: bool,
     ) -> Option<(&RenderPipeline, &[CustomBinding])> {
-        let kind = usize::from(texture_array);
         if replace_blend && shader_id.is_none() {
             return Some((
-                if watch_overlay {
-                    self.primitive_replace_watch[kind].as_ref()?
-                } else {
-                    &self.primitive_replace[kind]
-                },
+                self.ready(REPLACE)?.pick(watch_overlay, texture_array)?,
                 &[],
             ));
         }
         if let Some(custom) = shader_id.and_then(|id| self.custom.get(id)?.as_ref()) {
-            let CompiledSlot::Ready(compiled) =
-                self.compiled_custom.get(custom.compiled_pipeline_id)?
-            else {
-                return None;
-            };
-            if watch_overlay {
-                compiled.watch_pipeline[kind]
-                    .as_ref()
-                    .map(|pipeline| (pipeline, custom.bindings.as_slice()))
-            } else {
-                Some((&compiled.pipeline[kind], &custom.bindings))
-            }
-        } else if watch_overlay {
-            Some((self.primitive_watch[kind].as_ref()?, &[]))
+            let compiled = self.ready(custom.compiled_pipeline_id)?;
+            Some((
+                compiled.pick(watch_overlay, texture_array)?,
+                custom.bindings.as_slice(),
+            ))
         } else {
-            Some((&self.primitive[kind], &[]))
+            Some((self.ready(PLAIN)?.pick(watch_overlay, texture_array)?, &[]))
         }
     }
 
@@ -913,12 +982,7 @@ impl Pipelines {
         watch_overlay: bool,
         texture_array: bool,
     ) -> Option<&RenderPipeline> {
-        let kind = usize::from(texture_array);
-        if watch_overlay {
-            self.primitive_outline_watch[kind].as_ref()
-        } else {
-            Some(&self.primitive_outline[kind])
-        }
+        self.ready(OUTLINE)?.pick(watch_overlay, texture_array)
     }
 
     pub fn supports_watch_overlay(&self, shader_id: Option<usize>) -> bool {
@@ -935,10 +999,10 @@ impl Pipelines {
                         }
                         CompiledSlot::Compiling => false,
                     }),
-                None => {
-                    self.primitive_watch.iter().all(Option::is_some)
-                        && self.primitive_replace_watch.iter().all(Option::is_some)
-                }
+                None => [PLAIN, REPLACE].iter().all(|&slot| {
+                    self.ready(slot)
+                        .is_some_and(|compiled| compiled.watch_pipeline.iter().all(Option::is_some))
+                }),
             }
     }
 }
@@ -1028,18 +1092,23 @@ impl PrimitiveFragment {
     }
 }
 
-fn create_primitive_pipeline(
+fn create_primitive_pipeline<R>(
     device: &Device,
     surface_format: TextureFormat,
     texture_layout: &BindGroupLayout,
     camera_layout: &BindGroupLayout,
-    blend: Option<BlendState>,
-    depth_enabled: bool,
     fragment: PrimitiveFragment,
     watch_overlay: bool,
     texture_array: bool,
     cache: Option<&PipelineCache>,
-) -> RenderPipeline {
+    create: CreatePipeline<'_, R>,
+) -> R {
+    let (blend, depth_enabled) = match fragment {
+        PrimitiveFragment::Replace => (None, false),
+        PrimitiveFragment::Plain | PrimitiveFragment::Outline => {
+            (Some(BlendState::ALPHA_BLENDING), true)
+        }
+    };
     let source = crate::prepare_texture_shader(include_str!("../shader.wgsl"), texture_array);
     let shader = device.create_shader_module(ShaderModuleDescriptor {
         label: None,
@@ -1079,37 +1148,40 @@ fn create_primitive_pipeline(
         immediate_size: 0,
     });
 
-    device.create_render_pipeline(&RenderPipelineDescriptor {
-        label: Some(&pipeline_label),
-        layout: Some(&pipeline_layout),
-        vertex: VertexState {
-            module: &shader,
-            entry_point: Some("vs_main"),
-            buffers: &[Some(Vertex::desc()), Some(Instance::desc())],
-            compilation_options: Default::default(),
-        },
-        primitive: Default::default(),
-        depth_stencil: Some(DepthStencilState {
-            format: crate::Renderer::DEPTH_FORMAT,
-            depth_write_enabled: Some(depth_enabled),
-            depth_compare: Some(if depth_enabled {
-                CompareFunction::LessEqual
-            } else {
-                CompareFunction::Always
+    create(
+        device,
+        &RenderPipelineDescriptor {
+            label: Some(&pipeline_label),
+            layout: Some(&pipeline_layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[Some(Vertex::desc()), Some(Instance::desc())],
+                compilation_options: Default::default(),
+            },
+            primitive: Default::default(),
+            depth_stencil: Some(DepthStencilState {
+                format: crate::Renderer::DEPTH_FORMAT,
+                depth_write_enabled: Some(depth_enabled),
+                depth_compare: Some(if depth_enabled {
+                    CompareFunction::LessEqual
+                } else {
+                    CompareFunction::Always
+                }),
+                stencil: StencilState::default(),
+                bias: Default::default(),
             }),
-            stencil: StencilState::default(),
-            bias: Default::default(),
-        }),
-        multisample: Default::default(),
-        fragment: Some(FragmentState {
-            module: &shader,
-            entry_point: Some(&fragment_entry_point),
-            targets: &targets,
-            compilation_options: Default::default(),
-        }),
-        multiview_mask: None,
-        cache,
-    })
+            multisample: Default::default(),
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some(&fragment_entry_point),
+                targets: &targets,
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache,
+        },
+    )
 }
 
 /// Creates a custom rendering pipeline from user-provided WGSL source
@@ -1318,8 +1390,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     fn background_compiles_hand_their_pipelines_to_the_shaders_waiting_for_them() {
         let (device, _queue) = Device::noop(&wgpu::DeviceDescriptor::default());
         let surface_format = TextureFormat::Rgba8Unorm;
-        let mut pipelines = Pipelines::new(&device, surface_format, true, None);
-        pipelines.compile_in_background(2);
+        let mut pipelines =
+            Pipelines::new_with(&device, surface_format, true, None, CompileMode::Threads(2));
         let uniform_layout = create_camera_bind_group_layout(&device);
         let mut add = |source, uniform| {
             pipelines.add_custom(
@@ -1334,8 +1406,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let same_program = add(CUSTOM_SHADER_WITH_OVERLAY, 2);
         let other = add(CUSTOM_SHADER_WITHOUT_OVERLAY, 3);
 
-        // One compile per program, however many shaders share it.
-        assert_eq!(pipelines.compiles().1, 2);
+        // One compile per program, however many shaders share it, after egor's own.
+        assert_eq!(pipelines.compiles().1, BUILTINS.len() + 2);
         for id in [first, same_program, other] {
             pipelines.wait_for_custom(id);
             assert!(
@@ -1344,9 +1416,45 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                     .is_some()
             );
         }
-        assert_eq!(pipelines.compiles(), (2, 2));
+        while !pipelines.builtins_ready() {
+            pipelines.take_finished_compiles();
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            pipelines.compiles(),
+            (BUILTINS.len() + 2, BUILTINS.len() + 2)
+        );
+        assert!(
+            pipelines
+                .resolve_with_replace(None, false, false, true)
+                .is_some()
+        );
+        assert!(pipelines.resolve_outline(true, false).is_some());
+        assert!(pipelines.supports_watch_overlay(None));
         assert!(pipelines.supports_watch_overlay(Some(first)));
         assert!(!pipelines.supports_watch_overlay(Some(other)));
+    }
+
+    #[test]
+    fn built_in_pipelines_compile_a_family_a_frame_on_opengl() {
+        let (device, _queue) = Device::noop(&wgpu::DeviceDescriptor::default());
+        let mut pipelines = Pipelines::new_with(
+            &device,
+            TextureFormat::Rgba8Unorm,
+            true,
+            None,
+            CompileMode::Frames,
+        );
+        for frame in 0..BUILTINS.len() {
+            assert!(!pipelines.builtins_ready(), "ready after {frame} frames");
+            pipelines.take_finished_compiles();
+        }
+        assert!(pipelines.builtins_ready());
+        assert!(
+            pipelines
+                .resolve_with_replace(None, true, false, false)
+                .is_some()
+        );
     }
 
     #[test]
@@ -1371,7 +1479,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             vec![CustomBinding::Uniform(9)],
         );
 
-        assert_eq!(pipelines.compiled_custom.len(), 1);
+        assert_eq!(pipelines.compiled_custom.len(), BUILTINS.len() + 1);
         assert_eq!(pipelines.custom.len(), 2);
 
         let (first_pipeline, first_uniforms) = pipelines
@@ -1423,6 +1531,6 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             vec![CustomBinding::Uniform(12)],
         );
 
-        assert_eq!(pipelines.compiled_custom.len(), 3);
+        assert_eq!(pipelines.compiled_custom.len(), BUILTINS.len() + 3);
     }
 }

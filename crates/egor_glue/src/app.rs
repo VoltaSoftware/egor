@@ -1639,6 +1639,14 @@ impl AppHandler<Renderer> for App {
 
         frame_stats.prep_time = prep_started_at.elapsed();
 
+        // egor's built-in pipelines compile off this thread at startup. Until they are in, a frame runs the app but
+        // draws nothing, rather than wait for them (the platform's launch screen stays up meanwhile).
+        if !renderer.startup_pipelines_ready() {
+            self.primitive_batch.recycle(batches);
+            self.finish_frame_stats(frame_stats, egor_frame_started_at);
+            return;
+        }
+
         let surface_acquire_started_at = Instant::now();
         let frame_result = match renderer.try_begin_frame(backbuffer) {
             Ok(frame_result) => frame_result,

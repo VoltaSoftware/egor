@@ -35,7 +35,7 @@ use wgpu::{
 use crate::{
     batch::GeometryBatch,
     frame::{Frame, Presentable},
-    pipeline::{CustomBinding, Pipelines},
+    pipeline::{CompileMode, CustomBinding, Pipelines},
     target::{OffscreenTarget, RenderTarget},
     texture::Textures,
     uniforms::{CameraUniform, Uniforms},
@@ -462,15 +462,11 @@ impl Renderer {
             "[egor] renderer init: watch overlay capture MRT supported: {watch_overlay_supported}"
         );
         log::info!("[egor] renderer init: creating pipelines and core buffers");
-        let mut pipelines = Pipelines::new(
-            &device,
-            surface_format,
-            watch_overlay_supported,
-            pipeline_cache,
-        );
-        // A pipeline takes tens of milliseconds to compile on a phone, so custom shaders compile on worker threads
-        // where the backend allows it: OpenGL's context belongs to one thread at a time, and wgpu gives up
-        // waiting for it after a second; browsers have no threads to give.
+        // A pipeline takes tens of milliseconds to compile on a phone, so pipelines compile on worker threads where
+        // the backend allows it, and frames draw nothing until egor's own are in rather than wait for them.
+        // OpenGL's context belongs to one thread at a time (wgpu gives up waiting for it after a second), so there
+        // they compile a family a frame. Browsers compile them away from the page's main thread when asked
+        // through `createRenderPipelineAsync`; WebGL has no such call.
         #[cfg(not(target_arch = "wasm32"))]
         let shader_compile_threads = match adapter.get_info().backend {
             wgpu::Backend::Vulkan | wgpu::Backend::Metal | wgpu::Backend::Dx12 => {
@@ -479,21 +475,30 @@ impl Renderer {
             _ => 0,
         };
         #[cfg(not(target_arch = "wasm32"))]
-        if shader_compile_threads > 0 {
-            pipelines.compile_in_background(shader_compile_threads);
+        let compile_mode = if shader_compile_threads > 0 {
             log::info!(
-                "[egor] renderer init: compiling custom shaders on {shader_compile_threads} threads"
+                "[egor] renderer init: compiling pipelines on {shader_compile_threads} threads"
             );
-        }
-        // Browsers compile pipelines away from the page's main thread when asked through
-        // `createRenderPipelineAsync`; WebGL has no such call.
+            CompileMode::Threads(shader_compile_threads)
+        } else {
+            CompileMode::Frames
+        };
         #[cfg(target_arch = "wasm32")]
-        if adapter.get_info().backend == wgpu::Backend::BrowserWebGpu {
-            pipelines.compile_async();
+        let compile_mode = if adapter.get_info().backend == wgpu::Backend::BrowserWebGpu {
             log::info!(
-                "[egor] renderer init: compiling custom shaders through the browser's async pipelines"
+                "[egor] renderer init: compiling pipelines through the browser's async pipelines"
             );
-        }
+            CompileMode::Browser
+        } else {
+            CompileMode::Frames
+        };
+        let pipelines = Pipelines::new_with(
+            &device,
+            surface_format,
+            watch_overlay_supported,
+            pipeline_cache,
+            compile_mode,
+        );
 
         let quad_vertex_buffer = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("Static Unit Quad VB"),
@@ -578,8 +583,12 @@ impl Renderer {
             pipeline_cache_file,
             #[cfg(not(target_arch = "wasm32"))]
             shader_compile_threads,
+            // egor's own pipelines are the first batch.
             #[cfg(not(target_arch = "wasm32"))]
-            compile_batch: None,
+            compile_batch: (shader_compile_threads > 0).then(|| CompileBatch {
+                started_at: std::time::Instant::now(),
+                first: 0,
+            }),
         })
     }
 
@@ -1618,10 +1627,19 @@ impl Renderer {
         self.pipelines.wait_for_custom(id);
     }
 
-    /// Custom shader compiles finished, and started; they all finish at once where shaders compile on the
-    /// thread that adds them.
+    /// Shader compiles finished, and started; they all finish at once where shaders compile on the thread
+    /// that adds them.
     pub fn shader_compiles(&self) -> (usize, usize) {
         self.pipelines.compiles()
+    }
+
+    /// Takes in finished compiles and says whether egor's own pipelines, which every frame draws with, are
+    /// compiled. Until they are, `egor_glue` draws nothing rather than wait.
+    pub fn startup_pipelines_ready(&mut self) -> bool {
+        if !self.pipelines.builtins_ready() {
+            self.take_finished_compiles();
+        }
+        self.pipelines.builtins_ready()
     }
 
     /// Takes in the custom shaders the compile threads finished. Once all of a batch are in, it saves the
@@ -1636,7 +1654,7 @@ impl Renderer {
                 && let Some(batch) = self.compile_batch.take()
             {
                 log::info!(
-                    "[egor] compiled {} custom shaders on {} threads in {} ms",
+                    "[egor] compiled {} shaders on {} threads in {} ms",
                     finished - batch.first,
                     self.shader_compile_threads,
                     batch.started_at.elapsed().as_millis()
