@@ -1052,8 +1052,10 @@ impl Renderer {
         self.pipelines.supports_watch_overlay(shader_id)
     }
 
+    /// Whether the device can capture the watch overlay. egor's own pipelines for it may still be compiling
+    /// ([`Self::startup_pipelines_ready`]).
     pub fn supports_watch_overlay_capture(&self) -> bool {
-        self.pipelines.supports_watch_overlay(None)
+        self.pipelines.watch_overlay_supported()
     }
 
     /// Draws a geometry batch. Call [`bind_pass_state`] first to set pipeline/texture.
@@ -1697,29 +1699,51 @@ impl Renderer {
 
     /// Writes the driver's compiled pipelines to the pipeline cache file, so the next run starts with them.
     /// Call it after compiling a batch of pipelines, such as while loading. A no-op without a cache.
+    ///
+    /// Natively the cache is read out and written on another thread: a phone's driver can take a while to
+    /// serialize a few MB of it, and the frame shouldn't wait.
     pub fn save_pipeline_cache(&self) {
-        let (Some(file), Some(data)) = (&self.pipeline_cache_file, self.pipelines.cache_data())
-        else {
+        let (Some(file), Some(cache)) = (
+            self.pipeline_cache_file.clone(),
+            self.pipelines.cache().cloned(),
+        ) else {
             return;
         };
-        // Through a temporary file, so a crash mid-write never leaves a torn cache.
-        let temp = file.with_extension("tmp");
-        let result = file
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::write(&temp, &data))
-            .and_then(|()| std::fs::rename(&temp, file));
-        match result {
-            Ok(()) => log::info!(
-                "[egor] saved pipeline cache {} ({} bytes)",
-                file.display(),
-                data.len()
-            ),
-            Err(error) => log::warn!(
-                "[egor] saving pipeline cache {} failed: {error}",
-                file.display()
-            ),
+        let save = move || {
+            // One save at a time, so two never write the temporary file at once.
+            static SAVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _saving = SAVING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(data) = cache.get_data() else {
+                return;
+            };
+            // Through a temporary file, so a crash mid-write never leaves a torn cache.
+            let temp = file.with_extension("tmp");
+            let result = file
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&temp, &data))
+                .and_then(|()| std::fs::rename(&temp, &file));
+            match result {
+                Ok(()) => log::info!(
+                    "[egor] saved pipeline cache {} ({} bytes)",
+                    file.display(),
+                    data.len()
+                ),
+                Err(error) => log::warn!(
+                    "[egor] saving pipeline cache {} failed: {error}",
+                    file.display()
+                ),
+            }
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Err(error) = std::thread::Builder::new()
+            .name("egor pipeline cache".to_owned())
+            .spawn(save)
+        {
+            log::warn!("[egor] couldn't start saving the pipeline cache: {error}");
         }
+        #[cfg(target_arch = "wasm32")]
+        save();
     }
 
     /// Points texture `index` of a shader from [`Self::add_shader_with_textures`] at a 2D texture,

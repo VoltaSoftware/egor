@@ -725,6 +725,7 @@ impl App {
         width: u32,
         height: u32,
     ) {
+        let started_at = Instant::now();
         let (device, queue) = (renderer.device().clone(), renderer.queue().clone());
         let turn = self
             .backbuffer
@@ -738,6 +739,7 @@ impl App {
         let target = WatchFrameTarget::new(&device, width, height, format);
         let presented = CaptureFrameTarget::new(&device, width, height, format);
         renderer.ensure_depth_size(width, height);
+        let targets_made_in = started_at.elapsed();
         let depth_view = renderer.depth_view().clone();
         let mut encoder = device.create_command_encoder(&Default::default());
         let mut batch = egor_render::batch::GeometryBatch::new(4, 6);
@@ -801,6 +803,11 @@ impl App {
         }
         self.screen_capture.release_buffers();
         self.watch_frame_target = Some(target);
+        log::info!(
+            "[egor] watch renderer warmed up in {} ms ({} ms making its {width}x{height} targets)",
+            started_at.elapsed().as_millis(),
+            targets_made_in.as_millis()
+        );
     }
 
     /// Set window icon

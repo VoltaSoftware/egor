@@ -861,9 +861,9 @@ impl Pipelines {
         id
     }
 
-    /// The driver's compiled pipelines so far, to keep for the next run.
-    pub fn cache_data(&self) -> Option<Vec<u8>> {
-        self.cache.as_ref()?.get_data()
+    /// The cache of the driver's compiled pipelines, to keep for the next run.
+    pub fn cache(&self) -> Option<&PipelineCache> {
+        self.cache.as_ref()
     }
 
     /// Creates a custom shader pipeline from WGSL source
@@ -983,6 +983,11 @@ impl Pipelines {
         texture_array: bool,
     ) -> Option<&RenderPipeline> {
         self.ready(OUTLINE)?.pick(watch_overlay, texture_array)
+    }
+
+    /// Whether the device can draw the watch overlay beside a frame, compiled yet or not.
+    pub fn watch_overlay_supported(&self) -> bool {
+        self.watch_overlay_supported
     }
 
     pub fn supports_watch_overlay(&self, shader_id: Option<usize>) -> bool {
