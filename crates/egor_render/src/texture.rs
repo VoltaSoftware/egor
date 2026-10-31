@@ -348,6 +348,16 @@ impl Texture {
     }
 }
 
+/// An empty texture array: made, or being made on another thread ([`crate::Renderer::start_empty_texture_array`]).
+pub struct EmptyTextureArray(EmptyArray);
+
+enum EmptyArray {
+    Made(usize),
+    #[cfg(not(target_arch = "wasm32"))]
+    Making(std::sync::mpsc::Receiver<Texture>),
+    Taken,
+}
+
 pub(crate) struct Textures {
     layouts: [BindGroupLayout; 2],
     default_sampler: Sampler,
@@ -587,6 +597,77 @@ impl Textures {
             Some("Egor Texture Array"),
         );
         Ok(self.push(texture))
+    }
+
+    /// Makes an empty `w`×`h` array of `layers`, on another thread when `on_thread`.
+    pub fn start_empty_array(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        w: u32,
+        h: u32,
+        layers: u32,
+        on_thread: bool,
+    ) -> Result<EmptyTextureArray, String> {
+        Texture::validate_size(device, w, h)?;
+        let storage_layers = Texture::storage_layer_count(device, w, h, layers);
+        let max_layers = device.limits().max_texture_array_layers;
+        if layers == 0 || storage_layers > max_layers {
+            return Err(format!(
+                "Texture array with {layers} layers requires {storage_layers} storage layers; device limit is {max_layers}"
+            ));
+        }
+        let layout = self.layouts[usize::from(layers > 1)].clone();
+        let sampler = self.nearest_sampler.clone();
+        let make = move |device: &Device, queue: &Queue| {
+            Texture::from_array_bytes(
+                device,
+                queue,
+                &layout,
+                &sampler,
+                &[],
+                w,
+                h,
+                0,
+                layers,
+                Some("Egor Texture Array"),
+            )
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        if on_thread {
+            let (device, queue) = (device.clone(), queue.clone());
+            let (sender, made) = std::sync::mpsc::channel();
+            std::thread::Builder::new()
+                .name("egor texture".to_owned())
+                .spawn(move || {
+                    let _ = sender.send(make(&device, &queue));
+                })
+                .map_err(|error| format!("Couldn't start the texture thread: {error}"))?;
+            return Ok(EmptyTextureArray(EmptyArray::Making(made)));
+        }
+        let _ = on_thread;
+        Ok(EmptyTextureArray(EmptyArray::Made(
+            self.push(make(device, queue)),
+        )))
+    }
+
+    /// `array`'s id, once it is made. Each array gives its id once.
+    pub fn take_empty_array(&mut self, array: &mut EmptyTextureArray) -> Option<usize> {
+        match std::mem::replace(&mut array.0, EmptyArray::Taken) {
+            EmptyArray::Made(id) => Some(id),
+            #[cfg(not(target_arch = "wasm32"))]
+            EmptyArray::Making(made) => match made.try_recv() {
+                Ok(texture) => Some(self.push(texture)),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    array.0 = EmptyArray::Making(made);
+                    None
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!("[egor] making a texture array failed")
+                }
+            },
+            EmptyArray::Taken => None,
+        }
     }
 
     /// Overwrites a `w`×`h` RGBA8 region of one layer of texture `id`.

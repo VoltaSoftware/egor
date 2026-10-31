@@ -1105,6 +1105,59 @@ impl ReadbackWorker {
     }
 }
 
+/// The downsample blits a capture draws with, and what binds their source.
+struct BlitPipelines {
+    plain: egor_render::wgpu::RenderPipeline,
+    gray: egor_render::wgpu::RenderPipeline,
+    gray_alpha: egor_render::wgpu::RenderPipeline,
+    encode: egor_render::wgpu::RenderPipeline,
+    gray_encode: egor_render::wgpu::RenderPipeline,
+    gray_alpha_encode: egor_render::wgpu::RenderPipeline,
+    sampler: egor_render::wgpu::Sampler,
+    bind_group_layout: egor_render::wgpu::BindGroupLayout,
+}
+
+/// The pipelines a watch capture reads its overlay with.
+struct WatchCapturePipelines {
+    plain: egor_render::wgpu::RenderPipeline,
+    gray: egor_render::wgpu::RenderPipeline,
+    encode: egor_render::wgpu::RenderPipeline,
+    gray_encode: egor_render::wgpu::RenderPipeline,
+    bind_group_layout: egor_render::wgpu::BindGroupLayout,
+}
+
+/// What a worker thread compiled: the families still missing, and the present pipeline for `key`.
+#[cfg(not(target_arch = "wasm32"))]
+struct BuiltCapturePipelines {
+    blits: Option<BlitPipelines>,
+    watch: Option<WatchCapturePipelines>,
+    present: egor_render::wgpu::RenderPipeline,
+    key: (TextureFormat, SurfaceTransform),
+}
+
+/// The capture pipelines compiling for a surface format and turn.
+enum PipelineBuild {
+    Idle,
+    /// A family a frame, on the thread that draws (OpenGL, browsers).
+    Frames((TextureFormat, SurfaceTransform)),
+    #[cfg(not(target_arch = "wasm32"))]
+    Thread(
+        (TextureFormat, SurfaceTransform),
+        std::sync::mpsc::Receiver<BuiltCapturePipelines>,
+    ),
+}
+
+impl PipelineBuild {
+    fn building(&self) -> Option<(TextureFormat, SurfaceTransform)> {
+        match self {
+            Self::Idle => None,
+            Self::Frames(key) => Some(*key),
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Thread(key, _) => Some(*key),
+        }
+    }
+}
+
 /// Asynchronous screen capture with GPU blit-downsample, a ring buffer of
 /// staging buffers, and asynchronous readback through wgpu. Native conversion
 /// runs on a worker. An occupied ring skips new requests instead of waiting
@@ -1147,6 +1200,7 @@ pub struct ScreenCaptureState {
     present_pipeline_key: Option<(TextureFormat, SurfaceTransform)>,
     composite_pipeline: Option<egor_render::wgpu::RenderPipeline>,
     composite_pipeline_key: Option<(TextureFormat, SurfaceTransform)>,
+    pipeline_build: PipelineBuild,
     // Intermediate copy of the backbuffer with TEXTURE_BINDING
     // (surface textures may lack TEXTURE_BINDING on some backends like DX12).
     source_copy: Option<Texture>,
@@ -1221,6 +1275,7 @@ impl ScreenCaptureState {
             present_pipeline_key: None,
             composite_pipeline: None,
             composite_pipeline_key: None,
+            pipeline_build: PipelineBuild::Idle,
             source_copy: None,
             source_copy_view: None,
             source_copy_w: 0,
@@ -1472,20 +1527,130 @@ impl ScreenCaptureState {
         device: &Device,
         format: TextureFormat,
         turn: SurfaceTransform,
+        on_thread: bool,
     ) {
         // Thread creation can stall native presentation. Pay that cost during
         // renderer initialization and keep the worker across watch stop/start.
         #[cfg(not(target_arch = "wasm32"))]
         self.readback_worker.get_or_insert_with(ReadbackWorker::new);
-        self.ensure_watch_capture_pipeline(device);
-        self.ensure_present_pipeline(device, format, turn);
+        self.build_pipelines(device, format, turn, on_thread);
+    }
+
+    /// Whether every pipeline a capture of a `format` surface turned `turn` draws with is compiled.
+    pub(crate) fn pipelines_ready(&self, format: TextureFormat, turn: SurfaceTransform) -> bool {
+        self.blit_pipeline.is_some()
+            && self.watch_capture_pipeline.is_some()
+            && self.present_pipeline.is_some()
+            && self.present_pipeline_key == Some((format, turn))
+    }
+
+    /// Starts compiling the pipelines a capture of a `format` surface turned `turn` draws with, unless they are
+    /// compiled or compiling: on a worker thread when `on_thread`, otherwise a family a frame through
+    /// [`Self::advance_pipeline_build`]. A capture compiling them on the frame that asks would hold that frame
+    /// for as long as the driver takes, behind every other compile it has queued.
+    pub(crate) fn build_pipelines(
+        &mut self,
+        device: &Device,
+        format: TextureFormat,
+        turn: SurfaceTransform,
+        on_thread: bool,
+    ) {
+        let key = (format, turn);
+        if self.pipelines_ready(format, turn) || self.pipeline_build.building() == Some(key) {
+            return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if on_thread {
+            let device = device.clone();
+            let blit_layout = self.blit_bind_group_layout.clone();
+            let build_watch = self.watch_capture_pipeline.is_none();
+            let (sender, finished) = std::sync::mpsc::channel();
+            std::thread::Builder::new()
+                .name("egor capture pipelines".to_owned())
+                .spawn(move || {
+                    let blits = blit_layout
+                        .is_none()
+                        .then(|| Self::build_blit_pipelines(&device));
+                    let layout = blits
+                        .as_ref()
+                        .map(|blits| &blits.bind_group_layout)
+                        .or(blit_layout.as_ref())
+                        .expect("blit layout");
+                    let present = Self::build_present_pipeline(&device, layout, format, turn);
+                    let watch = build_watch.then(|| Self::build_watch_capture_pipelines(&device));
+                    let _ = sender.send(BuiltCapturePipelines {
+                        blits,
+                        watch,
+                        present,
+                        key,
+                    });
+                })
+                .expect("spawn the capture pipeline thread");
+            self.pipeline_build = PipelineBuild::Thread(key, finished);
+            return;
+        }
+        let _ = (device, on_thread);
+        self.pipeline_build = PipelineBuild::Frames(key);
+    }
+
+    /// Takes in the capture pipelines a worker thread finished, or compiles the next family of them on this
+    /// thread.
+    pub(crate) fn advance_pipeline_build(&mut self, device: &Device) {
+        match std::mem::replace(&mut self.pipeline_build, PipelineBuild::Idle) {
+            PipelineBuild::Idle => {}
+            PipelineBuild::Frames((format, turn)) => {
+                if self.blit_pipeline.is_none() {
+                    self.ensure_pipeline(device);
+                } else if self.watch_capture_pipeline.is_none() {
+                    self.ensure_watch_capture_pipeline(device);
+                } else {
+                    self.ensure_present_pipeline(device, format, turn);
+                }
+                if !self.pipelines_ready(format, turn) {
+                    self.pipeline_build = PipelineBuild::Frames((format, turn));
+                }
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            PipelineBuild::Thread(key, finished) => match finished.try_recv() {
+                Ok(built) => {
+                    // A present pipeline only binds groups made from the layout it was built with.
+                    if let Some(blits) = built.blits {
+                        self.install_blits(blits);
+                    }
+                    if let Some(watch) = built.watch {
+                        self.install_watch_capture(watch);
+                    }
+                    self.present_pipeline = Some(built.present);
+                    self.present_pipeline_key = Some(built.key);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.pipeline_build = PipelineBuild::Thread(key, finished);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!("[egor] compiling the capture pipelines failed")
+                }
+            },
+        }
     }
 
     fn ensure_pipeline(&mut self, device: &Device) {
-        if self.blit_pipeline.is_some() {
-            return;
+        if self.blit_pipeline.is_none() {
+            self.install_blits(Self::build_blit_pipelines(device));
         }
+    }
 
+    fn install_blits(&mut self, blits: BlitPipelines) {
+        self.blit_pipeline = Some(blits.plain);
+        self.blit_gray_pipeline = Some(blits.gray);
+        self.blit_gray_alpha_pipeline = Some(blits.gray_alpha);
+        self.blit_encode_pipeline = Some(blits.encode);
+        self.blit_gray_encode_pipeline = Some(blits.gray_encode);
+        self.blit_gray_alpha_encode_pipeline = Some(blits.gray_alpha_encode);
+        self.blit_sampler = Some(blits.sampler);
+        self.blit_bind_group_layout = Some(blits.bind_group_layout);
+    }
+
+    fn build_blit_pipelines(device: &Device) -> BlitPipelines {
         let shader = device.create_shader_module(egor_render::wgpu::ShaderModuleDescriptor {
             label: None,
             source: egor_render::wgpu::ShaderSource::Wgsl(BLIT_SHADER_WGSL.into()),
@@ -1604,14 +1769,16 @@ impl ScreenCaptureState {
             ..Default::default()
         });
 
-        self.blit_pipeline = Some(pipeline);
-        self.blit_gray_pipeline = Some(gray_pipeline);
-        self.blit_gray_alpha_pipeline = Some(gray_alpha_pipeline);
-        self.blit_encode_pipeline = Some(encode_pipeline);
-        self.blit_gray_encode_pipeline = Some(gray_encode_pipeline);
-        self.blit_gray_alpha_encode_pipeline = Some(gray_alpha_encode_pipeline);
-        self.blit_sampler = Some(sampler);
-        self.blit_bind_group_layout = Some(bind_group_layout);
+        BlitPipelines {
+            plain: pipeline,
+            gray: gray_pipeline,
+            gray_alpha: gray_alpha_pipeline,
+            encode: encode_pipeline,
+            gray_encode: gray_encode_pipeline,
+            gray_alpha_encode: gray_alpha_encode_pipeline,
+            sampler,
+            bind_group_layout,
+        }
     }
 
     fn ensure_capture_texture(
@@ -1764,10 +1931,22 @@ impl ScreenCaptureState {
     }
 
     fn ensure_watch_capture_pipeline(&mut self, device: &Device) {
-        if self.watch_capture_pipeline.is_some() {
-            return;
+        if self.watch_capture_pipeline.is_none() {
+            self.install_watch_capture(Self::build_watch_capture_pipelines(device));
         }
+    }
 
+    fn install_watch_capture(&mut self, watch: WatchCapturePipelines) {
+        self.watch_capture_pipeline = Some(watch.plain);
+        self.watch_capture_gray_pipeline = Some(watch.gray);
+        self.watch_capture_encode_pipeline = Some(watch.encode);
+        self.watch_capture_gray_encode_pipeline = Some(watch.gray_encode);
+        self.watch_capture_bind_group_layout = Some(watch.bind_group_layout);
+        // Made from the layout this replaces.
+        self.watch_capture_binding = None;
+    }
+
+    fn build_watch_capture_pipelines(device: &Device) -> WatchCapturePipelines {
         let shader = device.create_shader_module(egor_render::wgpu::ShaderModuleDescriptor {
             label: Some("Watch Capture Shader"),
             source: egor_render::wgpu::ShaderSource::Wgsl(WATCH_CAPTURE_SHADER_WGSL.into()),
@@ -1858,27 +2037,25 @@ impl ScreenCaptureState {
             })
         };
 
-        self.watch_capture_pipeline = Some(make_pipeline(
-            Some("Watch Capture"),
-            &shader,
-            TextureFormat::Rgba8Unorm,
-        ));
-        self.watch_capture_gray_pipeline = Some(make_pipeline(
-            Some("Watch Capture Gray"),
-            &gray_shader,
-            TextureFormat::Rg8Unorm,
-        ));
-        self.watch_capture_encode_pipeline = Some(make_pipeline(
-            Some("Watch Capture Encode"),
-            &encode_shader,
-            TextureFormat::Rgba8Unorm,
-        ));
-        self.watch_capture_gray_encode_pipeline = Some(make_pipeline(
-            Some("Watch Capture Gray Encode"),
-            &gray_encode_shader,
-            TextureFormat::Rg8Unorm,
-        ));
-        self.watch_capture_bind_group_layout = Some(bind_group_layout);
+        WatchCapturePipelines {
+            plain: make_pipeline(Some("Watch Capture"), &shader, TextureFormat::Rgba8Unorm),
+            gray: make_pipeline(
+                Some("Watch Capture Gray"),
+                &gray_shader,
+                TextureFormat::Rg8Unorm,
+            ),
+            encode: make_pipeline(
+                Some("Watch Capture Encode"),
+                &encode_shader,
+                TextureFormat::Rgba8Unorm,
+            ),
+            gray_encode: make_pipeline(
+                Some("Watch Capture Gray Encode"),
+                &gray_encode_shader,
+                TextureFormat::Rg8Unorm,
+            ),
+            bind_group_layout,
+        }
     }
 
     fn watch_capture_bind_group(
@@ -2304,12 +2481,26 @@ impl ScreenCaptureState {
         }
 
         self.ensure_pipeline(device);
+        let bind_group_layout = self.blit_bind_group_layout.as_ref().expect("pipeline init");
+        self.present_pipeline = Some(Self::build_present_pipeline(
+            device,
+            bind_group_layout,
+            format,
+            turn,
+        ));
+        self.present_pipeline_key = Some((format, turn));
+    }
 
+    fn build_present_pipeline(
+        device: &Device,
+        bind_group_layout: &egor_render::wgpu::BindGroupLayout,
+        format: TextureFormat,
+        turn: SurfaceTransform,
+    ) -> egor_render::wgpu::RenderPipeline {
         let shader = device.create_shader_module(egor_render::wgpu::ShaderModuleDescriptor {
             label: None,
             source: egor_render::wgpu::ShaderSource::Wgsl(BLIT_SHADER_WGSL.into()),
         });
-        let bind_group_layout = self.blit_bind_group_layout.as_ref().expect("pipeline init");
         let turn_constants = blit_turn_constants(turn);
         let pipeline_layout =
             device.create_pipeline_layout(&egor_render::wgpu::PipelineLayoutDescriptor {
@@ -2318,7 +2509,7 @@ impl ScreenCaptureState {
                 immediate_size: 0,
             });
 
-        self.present_pipeline = Some(device.create_render_pipeline(
+        device.create_render_pipeline(
             &egor_render::wgpu::RenderPipelineDescriptor {
                 label: None,
                 layout: Some(&pipeline_layout),
@@ -2347,8 +2538,7 @@ impl ScreenCaptureState {
                 multiview_mask: None,
                 cache: None,
             },
-        ));
-        self.present_pipeline_key = Some((format, turn));
+        )
     }
 
     fn ensure_composite_pipeline(
@@ -3327,6 +3517,25 @@ impl<'a> Graphics<'a> {
     ) -> Result<usize, String> {
         self.renderer
             .add_texture_array_raw_with_spare_layers(w, h, layers, spare_layers, data)
+    }
+
+    /// Starts making an empty `w`×`h` texture array of `layers`, off this thread where the backend allows; filled
+    /// later with [`Self::write_texture_region`] once [`Self::take_empty_texture_array`] has its id.
+    pub fn start_empty_texture_array(
+        &mut self,
+        w: u32,
+        h: u32,
+        layers: u32,
+    ) -> Result<egor_render::EmptyTextureArray, String> {
+        self.renderer.start_empty_texture_array(w, h, layers)
+    }
+
+    /// The texture array's id, once it is made.
+    pub fn take_empty_texture_array(
+        &mut self,
+        array: &mut egor_render::EmptyTextureArray,
+    ) -> Option<usize> {
+        self.renderer.take_empty_texture_array(array)
     }
 
     /// Overwrite a `w`×`h` RGBA8 region of one layer of an existing texture.

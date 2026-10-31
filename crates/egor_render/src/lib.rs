@@ -18,6 +18,7 @@ use std::sync::{
 };
 
 pub use instance_upload::InstanceUploadMetrics;
+pub use texture::EmptyTextureArray;
 
 pub use wgpu::{
     self, AdapterInfo, Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, Extent3d,
@@ -1631,6 +1632,33 @@ impl Renderer {
     /// that adds them.
     pub fn shader_compiles(&self) -> (usize, usize) {
         self.pipelines.compiles()
+    }
+
+    /// Whether other threads can use the GPU: Vulkan, Metal and DX12. OpenGL's context belongs to one thread at a
+    /// time, and browsers have no threads to give.
+    pub fn allows_worker_threads(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.shader_compile_threads > 0;
+        #[cfg(target_arch = "wasm32")]
+        false
+    }
+
+    /// Starts making an empty `w`×`h` texture array of `layers`, which the GPU clears on first use. Allocating a big
+    /// one took a Samsung A16's driver 0.19 s, so where other threads can use the GPU, one makes it.
+    pub fn start_empty_texture_array(
+        &mut self,
+        w: u32,
+        h: u32,
+        layers: u32,
+    ) -> Result<EmptyTextureArray, String> {
+        let on_thread = self.allows_worker_threads();
+        self.textures
+            .start_empty_array(&self.gpu.device, &self.gpu.queue, w, h, layers, on_thread)
+    }
+
+    /// The texture array's id, once it is made.
+    pub fn take_empty_texture_array(&mut self, array: &mut EmptyTextureArray) -> Option<usize> {
+        self.textures.take_empty_array(array)
     }
 
     /// Takes in finished compiles and says whether egor's own pipelines, which every frame draws with, are
