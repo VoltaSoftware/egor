@@ -462,7 +462,6 @@ impl Renderer {
             "[egor] renderer init: watch overlay capture MRT supported: {watch_overlay_supported}"
         );
         log::info!("[egor] renderer init: creating pipelines and core buffers");
-        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
         let mut pipelines = Pipelines::new(
             &device,
             surface_format,
@@ -484,6 +483,15 @@ impl Renderer {
             pipelines.compile_in_background(shader_compile_threads);
             log::info!(
                 "[egor] renderer init: compiling custom shaders on {shader_compile_threads} threads"
+            );
+        }
+        // Browsers compile pipelines away from the page's main thread when asked through
+        // `createRenderPipelineAsync`; WebGL has no such call.
+        #[cfg(target_arch = "wasm32")]
+        if adapter.get_info().backend == wgpu::Backend::BrowserWebGpu {
+            pipelines.compile_async();
+            log::info!(
+                "[egor] renderer init: compiling custom shaders through the browser's async pipelines"
             );
         }
 
