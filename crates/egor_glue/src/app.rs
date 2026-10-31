@@ -1709,6 +1709,9 @@ impl AppHandler<Renderer> for App {
         // egor's built-in pipelines compile off this thread at startup. Until they are in, a frame runs the app but
         // draws nothing, rather than wait for them (the platform's launch screen stays up meanwhile).
         if !renderer.startup_pipelines_ready() {
+            // The frame's uploads, such as a loading screen's texture pages, still go to the GPU: queued, they would
+            // hold their staging memory until the first drawn frame and all land in it.
+            renderer.queue().submit(std::iter::empty());
             self.primitive_batch.recycle(batches);
             self.finish_frame_stats(frame_stats, egor_frame_started_at);
             return;
