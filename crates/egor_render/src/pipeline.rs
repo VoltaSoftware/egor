@@ -377,18 +377,37 @@ impl CustomCompile {
 #[cfg(not(target_arch = "wasm32"))]
 type FinishedCompile = (usize, std::thread::Result<CompiledCustomPipeline>);
 
+/// A compile waiting for a worker thread. The thread that wants its shader takes it over if no worker has
+/// started it, rather than waiting behind every compile queued before it.
+#[cfg(not(target_arch = "wasm32"))]
+struct QueuedCompile {
+    compile: CustomCompile,
+    claimed: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl QueuedCompile {
+    /// True for the one thread that gets to run it.
+    fn claim(&self) -> bool {
+        !self.claimed.swap(true, std::sync::atomic::Ordering::AcqRel)
+    }
+}
+
 /// Worker threads compiling custom shaders. Dropping it lets them finish the compile they are on and stop,
 /// without waiting for them.
 #[cfg(not(target_arch = "wasm32"))]
 struct BackgroundCompiles {
-    jobs: std::sync::mpsc::Sender<(usize, CustomCompile)>,
+    jobs: std::sync::mpsc::Sender<(usize, std::sync::Arc<QueuedCompile>)>,
     finished: std::sync::mpsc::Receiver<FinishedCompile>,
+    /// The compiles still waiting for a worker or running on one, by compiled slot.
+    queued: HashMap<usize, std::sync::Arc<QueuedCompile>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl BackgroundCompiles {
     fn start(threads: usize) -> Self {
-        let (jobs, job_queue) = std::sync::mpsc::channel::<(usize, CustomCompile)>();
+        let (jobs, job_queue) =
+            std::sync::mpsc::channel::<(usize, std::sync::Arc<QueuedCompile>)>();
         let (done, finished) = std::sync::mpsc::channel();
         let job_queue = std::sync::Arc::new(std::sync::Mutex::new(job_queue));
         for index in 0..threads {
@@ -402,11 +421,14 @@ impl BackgroundCompiles {
                             .lock()
                             .unwrap_or_else(|poison| poison.into_inner())
                             .recv();
-                        let Ok((id, compile)) = job else { break };
+                        let Ok((id, job)) = job else { break };
+                        if !job.claim() {
+                            continue;
+                        }
                         // A panic (a wgpu validation error) goes back to the thread that wants the shader, where
                         // it would have happened without the worker.
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            compile.run()
+                            job.compile.run()
                         }));
                         if done.send((id, result)).is_err() {
                             break;
@@ -417,7 +439,11 @@ impl BackgroundCompiles {
                 log::warn!("[egor] shader compile thread {index} did not start: {error}");
             }
         }
-        Self { jobs, finished }
+        Self {
+            jobs,
+            finished,
+            queued: HashMap::new(),
+        }
     }
 }
 
@@ -581,11 +607,22 @@ impl Pipelines {
         if let Some(Some(custom)) = self.custom.get(id) {
             let compiled_id = custom.compiled_pipeline_id;
             while matches!(self.compiled_custom[compiled_id], CompiledSlot::Compiling) {
-                let Some(Ok((id, result))) = self
-                    .background
-                    .as_ref()
-                    .map(|background| background.finished.recv())
-                else {
+                let Some(background) = self.background.as_mut() else {
+                    break;
+                };
+                // No worker has started it: compiling it here beats waiting for every compile queued first.
+                if let Some(job) = background
+                    .queued
+                    .get(&compiled_id)
+                    .filter(|job| job.claim())
+                    .cloned()
+                {
+                    background.queued.remove(&compiled_id);
+                    self.compiled_custom[compiled_id] = CompiledSlot::Ready(job.compile.run());
+                    self.compiles_finished += 1;
+                    break;
+                }
+                let Ok((id, result)) = background.finished.recv() else {
                     break;
                 };
                 self.finish_compile(id, result);
@@ -595,6 +632,9 @@ impl Pipelines {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn finish_compile(&mut self, id: usize, result: std::thread::Result<CompiledCustomPipeline>) {
+        if let Some(background) = self.background.as_mut() {
+            background.queued.remove(&id);
+        }
         match result {
             Ok(compiled) => self.compiled_custom[id] = CompiledSlot::Ready(compiled),
             Err(panic) => std::panic::resume_unwind(panic),
@@ -607,17 +647,22 @@ impl Pipelines {
         let id = self.compiled_custom.len();
         self.compiles_started += 1;
         #[cfg(not(target_arch = "wasm32"))]
-        let compile = match &self.background {
-            Some(background) => match background.jobs.send((id, compile)) {
-                Ok(()) => {
-                    self.compiled_custom.push(CompiledSlot::Compiling);
-                    return id;
-                }
+        if let Some(background) = self.background.as_mut() {
+            let job = std::sync::Arc::new(QueuedCompile {
+                compile,
+                claimed: false.into(),
+            });
+            if background.jobs.send((id, job.clone())).is_ok() {
+                background.queued.insert(id, job);
+                self.compiled_custom.push(CompiledSlot::Compiling);
+            } else {
                 // No worker thread started.
-                Err(std::sync::mpsc::SendError((_, compile))) => compile,
-            },
-            None => compile,
-        };
+                self.compiled_custom
+                    .push(CompiledSlot::Ready(job.compile.run()));
+                self.compiles_finished += 1;
+            }
+            return id;
+        }
         self.compiled_custom
             .push(CompiledSlot::Ready(compile.run()));
         self.compiles_finished += 1;
