@@ -20,6 +20,9 @@ fn watch_overlay_preserves_transparency_behind_foreground() {
     );
     let mut renderer = pollster::block_on(Renderer::new(window, &wgpu::MemoryHints::default()));
     assert!(renderer.supports_watch_overlay_capture());
+    while !renderer.startup_pipelines_ready() {
+        std::thread::sleep(Duration::from_millis(1));
+    }
     renderer.upload_camera_matrix([
         [1.0, 0.0, 0.0, 0.0],
         [0.0, 1.0, 0.0, 0.0],

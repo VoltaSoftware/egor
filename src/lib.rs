@@ -75,7 +75,7 @@ pub mod render {
     };
     pub use egor_render::wgpu::FilterMode;
     pub use egor_render::{
-        MemoryHints, RendererBackendPreference, prepare_texture_shader,
+        EmptyTextureArray, MemoryHints, RendererBackendPreference, prepare_texture_shader,
         target::{OffscreenTarget, RenderTarget},
         vertex::Vertex,
     };
