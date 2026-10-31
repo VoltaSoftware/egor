@@ -95,6 +95,9 @@ impl RendererBackendPreference {
 fn renderer_instance_descriptor() -> InstanceDescriptor {
     let mut desc = InstanceDescriptor::new_without_display_handle();
     desc.flags = desc.flags.with_env();
+    // egor never draws or dispatches indirectly, and validating those calls compiles compute pipelines while the
+    // device is created: 60-100 ms of an iPhone's launch with a cold shader cache, and 0.5 s once after an install.
+    desc.flags.remove(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL);
     configure_renderer_instance_flags(&mut desc);
     desc
 }
