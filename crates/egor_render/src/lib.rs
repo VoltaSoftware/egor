@@ -238,6 +238,27 @@ pub struct Renderer {
     surface_transform: wgpu::SurfaceTransform,
     /// Where `save_pipeline_cache` keeps the driver's compiled pipelines.
     pipeline_cache_file: Option<std::path::PathBuf>,
+    /// Threads compiling custom shaders; 0 when they compile on the thread that adds them.
+    #[cfg(not(target_arch = "wasm32"))]
+    shader_compile_threads: usize,
+    /// The background compiles not all finished yet.
+    #[cfg(not(target_arch = "wasm32"))]
+    compile_batch: Option<CompileBatch>,
+}
+
+/// Custom shaders compiling on worker threads, from the first to start while none were.
+#[cfg(not(target_arch = "wasm32"))]
+struct CompileBatch {
+    started_at: std::time::Instant,
+    first: usize,
+}
+
+/// Threads for compiling custom shaders: several at once, without taking every core from the frame.
+#[cfg(not(target_arch = "wasm32"))]
+fn shader_compile_threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, |cores| cores.get() / 2)
+        .clamp(1, 3)
 }
 
 impl Renderer {
@@ -441,12 +462,30 @@ impl Renderer {
             "[egor] renderer init: watch overlay capture MRT supported: {watch_overlay_supported}"
         );
         log::info!("[egor] renderer init: creating pipelines and core buffers");
-        let pipelines = Pipelines::new(
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+        let mut pipelines = Pipelines::new(
             &device,
             surface_format,
             watch_overlay_supported,
             pipeline_cache,
         );
+        // A pipeline takes tens of milliseconds to compile on a phone, so custom shaders compile on worker threads
+        // where the backend allows it: OpenGL's context belongs to one thread at a time, and wgpu gives up
+        // waiting for it after a second; browsers have no threads to give.
+        #[cfg(not(target_arch = "wasm32"))]
+        let shader_compile_threads = match adapter.get_info().backend {
+            wgpu::Backend::Vulkan | wgpu::Backend::Metal | wgpu::Backend::Dx12 => {
+                shader_compile_threads()
+            }
+            _ => 0,
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        if shader_compile_threads > 0 {
+            pipelines.compile_in_background(shader_compile_threads);
+            log::info!(
+                "[egor] renderer init: compiling custom shaders on {shader_compile_threads} threads"
+            );
+        }
 
         let quad_vertex_buffer = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("Static Unit Quad VB"),
@@ -529,6 +568,10 @@ impl Renderer {
             last_camera: [[[0.0; 4]; 4]; 8],
             surface_transform: wgpu::SurfaceTransform::Identity,
             pipeline_cache_file,
+            #[cfg(not(target_arch = "wasm32"))]
+            shader_compile_threads,
+            #[cfg(not(target_arch = "wasm32"))]
+            compile_batch: None,
         })
     }
 
@@ -650,6 +693,7 @@ impl Renderer {
         &mut self,
         target: &mut dyn RenderTarget,
     ) -> Result<Option<Frame>, RendererFrameError> {
+        self.take_finished_compiles();
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let (view, presentable) = target.acquire(&self.gpu.device)?;
             let encoder = self.gpu.device.create_command_encoder(&Default::default());
@@ -1537,13 +1581,61 @@ impl Renderer {
                 texture_count,
             ))
             .collect();
-        self.pipelines.add_custom(
+        let (finished, started) = self.pipelines.compiles();
+        let id = self.pipelines.add_custom(
             &self.gpu.device,
             self.surface_format,
             wgsl_source,
             &layouts,
             bindings,
-        )
+        );
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.shader_compile_threads > 0
+            && finished == started
+            && self.pipelines.compiles().1 > started
+        {
+            self.compile_batch = Some(CompileBatch {
+                started_at: std::time::Instant::now(),
+                first: started,
+            });
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = (finished, started);
+        id
+    }
+
+    /// Waits for custom shader `id`'s pipelines, if a compile thread is still on them. A draw needs them, so
+    /// `Graphics` waits before a shader can be drawn with.
+    pub fn wait_for_shader(&mut self, id: usize) {
+        self.pipelines.wait_for_custom(id);
+    }
+
+    /// Custom shader compiles finished, and started; they all finish at once where shaders compile on the
+    /// thread that adds them.
+    pub fn shader_compiles(&self) -> (usize, usize) {
+        self.pipelines.compiles()
+    }
+
+    /// Takes in the custom shaders the compile threads finished. Once all of a batch are in, it saves the
+    /// driver's compiled pipelines for the next run, as [`Self::save_pipeline_cache`] after compiling them on
+    /// this thread would.
+    fn take_finished_compiles(&mut self) {
+        self.pipelines.take_finished_compiles();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let (finished, started) = self.pipelines.compiles();
+            if finished == started
+                && let Some(batch) = self.compile_batch.take()
+            {
+                log::info!(
+                    "[egor] compiled {} custom shaders on {} threads in {} ms",
+                    finished - batch.first,
+                    self.shader_compile_threads,
+                    batch.started_at.elapsed().as_millis()
+                );
+                self.save_pipeline_cache();
+            }
+        }
     }
 
     /// Writes the driver's compiled pipelines to the pipeline cache file, so the next run starts with them.

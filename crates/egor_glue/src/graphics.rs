@@ -3401,6 +3401,7 @@ impl<'a> Graphics<'a> {
     ///
     /// The shader is automatically reset to default after the closure drops
     pub fn with_shader(&mut self, shader_id: usize, mut render_fn: impl FnMut(&mut Self)) {
+        self.renderer.wait_for_shader(shader_id);
         let previous_shader = self.current_shader;
         self.current_shader = Some(shader_id);
         render_fn(self);
@@ -3409,7 +3410,16 @@ impl<'a> Graphics<'a> {
 
     /// Directly set (or clear) the active shader for subsequent draw commands.
     pub fn set_current_shader(&mut self, shader_id: Option<usize>) {
+        if let Some(id) = shader_id {
+            self.renderer.wait_for_shader(id);
+        }
         self.current_shader = shader_id;
+    }
+
+    /// Custom shader compiles finished, and started. On Vulkan, Metal and DX12 they run on worker threads, and
+    /// drawing with a shader before it is done waits for it.
+    pub fn shader_compiles(&self) -> (usize, usize) {
+        self.renderer.shader_compiles()
     }
 
     /// Keeps the pipelines compiled so far for the next run (see `App::pipeline_cache_dir`).

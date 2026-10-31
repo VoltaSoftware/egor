@@ -311,6 +311,116 @@ struct CompiledCustomPipeline {
     watch_pipeline: [Option<RenderPipeline>; 2],
 }
 
+/// A custom shader's pipelines, or a worker thread still compiling them.
+enum CompiledSlot {
+    Ready(CompiledCustomPipeline),
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    Compiling,
+}
+
+/// Everything compiling one custom shader takes, so it can run on a worker thread.
+struct CustomCompile {
+    device: Device,
+    surface_format: TextureFormat,
+    texture_layout: [BindGroupLayout; 2],
+    camera_layout: BindGroupLayout,
+    uniform_layouts: Vec<BindGroupLayout>,
+    wgsl_source: String,
+    cache: Option<PipelineCache>,
+    watch_overlay_supported: bool,
+}
+
+impl CustomCompile {
+    fn run(&self) -> CompiledCustomPipeline {
+        let uniform_layouts: Vec<&BindGroupLayout> = self.uniform_layouts.iter().collect();
+        let build = |array| {
+            let source = crate::prepare_texture_shader(&self.wgsl_source, array);
+            let texture_layout = &self.texture_layout[usize::from(array)];
+            let pipeline = create_custom_pipeline(
+                &self.device,
+                self.surface_format,
+                texture_layout,
+                &self.camera_layout,
+                &uniform_layouts,
+                &source,
+                self.cache.as_ref(),
+            );
+            let watch = if self.watch_overlay_supported {
+                create_custom_watch_pipeline(
+                    &self.device,
+                    self.surface_format,
+                    texture_layout,
+                    &self.camera_layout,
+                    &uniform_layouts,
+                    &source,
+                    self.cache.as_ref(),
+                )
+            } else {
+                None
+            };
+            (pipeline, watch)
+        };
+        let (normal, normal_watch) = build(false);
+        let (array, array_watch) = if self.wgsl_source.contains("// EGOR_TEXTURE_SAMPLING") {
+            build(true)
+        } else {
+            (normal.clone(), normal_watch.clone())
+        };
+        CompiledCustomPipeline {
+            pipeline: [normal, array],
+            watch_pipeline: [normal_watch, array_watch],
+        }
+    }
+}
+
+/// What a compile thread hands back: the compiled slot's index, and its pipelines or the panic that stopped them.
+#[cfg(not(target_arch = "wasm32"))]
+type FinishedCompile = (usize, std::thread::Result<CompiledCustomPipeline>);
+
+/// Worker threads compiling custom shaders. Dropping it lets them finish the compile they are on and stop,
+/// without waiting for them.
+#[cfg(not(target_arch = "wasm32"))]
+struct BackgroundCompiles {
+    jobs: std::sync::mpsc::Sender<(usize, CustomCompile)>,
+    finished: std::sync::mpsc::Receiver<FinishedCompile>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl BackgroundCompiles {
+    fn start(threads: usize) -> Self {
+        let (jobs, job_queue) = std::sync::mpsc::channel::<(usize, CustomCompile)>();
+        let (done, finished) = std::sync::mpsc::channel();
+        let job_queue = std::sync::Arc::new(std::sync::Mutex::new(job_queue));
+        for index in 0..threads {
+            let job_queue = job_queue.clone();
+            let done = done.clone();
+            let spawned = std::thread::Builder::new()
+                .name(format!("egor-shaders-{index}"))
+                .spawn(move || {
+                    loop {
+                        let job = job_queue
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .recv();
+                        let Ok((id, compile)) = job else { break };
+                        // A panic (a wgpu validation error) goes back to the thread that wants the shader, where
+                        // it would have happened without the worker.
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            compile.run()
+                        }));
+                        if done.send((id, result)).is_err() {
+                            break;
+                        }
+                    }
+                });
+            if let Err(error) = spawned {
+                log::warn!("[egor] shader compile thread {index} did not start: {error}");
+            }
+        }
+        Self { jobs, finished }
+    }
+}
+
 /// One logical custom material. Its compiled pipeline may be shared with other
 /// materials while its bindings remain independent.
 struct CustomPipelineBinding {
@@ -353,13 +463,18 @@ pub(crate) struct Pipelines {
     custom: Vec<Option<CustomPipelineBinding>>,
     /// Slots of removed custom shaders, which the next ones reuse. Their compiled pipelines stay cached.
     free_custom_slots: Vec<usize>,
-    compiled_custom: Vec<CompiledCustomPipeline>,
+    compiled_custom: Vec<CompiledSlot>,
     custom_cache: HashMap<CustomPipelineKey, usize>,
     texture_layout: [BindGroupLayout; 2],
     pub camera_layout: BindGroupLayout,
     watch_overlay_supported: bool,
     /// The driver's compiled pipelines, kept between runs (`Renderer::save_pipeline_cache`).
     cache: Option<PipelineCache>,
+    #[cfg(not(target_arch = "wasm32"))]
+    background: Option<BackgroundCompiles>,
+    /// Custom shader compiles started and finished.
+    compiles_started: usize,
+    compiles_finished: usize,
 }
 
 impl Pipelines {
@@ -425,7 +540,88 @@ impl Pipelines {
             camera_layout,
             watch_overlay_supported,
             cache,
+            #[cfg(not(target_arch = "wasm32"))]
+            background: None,
+            compiles_started: 0,
+            compiles_finished: 0,
         }
+    }
+
+    /// From now on custom shaders compile on `threads` worker threads, and [`Self::add_custom`] returns before
+    /// they are ready; [`Self::wait_for_custom`] waits for one.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn compile_in_background(&mut self, threads: usize) {
+        self.background = Some(BackgroundCompiles::start(threads));
+    }
+
+    /// Custom shader compiles finished, and started.
+    pub fn compiles(&self) -> (usize, usize) {
+        (self.compiles_finished, self.compiles_started)
+    }
+
+    /// Takes in the compiles the worker threads have finished.
+    pub fn take_finished_compiles(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        while let Some(Ok((id, result))) = self
+            .background
+            .as_ref()
+            .map(|background| background.finished.try_recv())
+        {
+            self.finish_compile(id, result);
+        }
+    }
+
+    /// Waits until custom shader `id`'s pipelines are compiled, if a worker thread is still on them.
+    #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
+    pub fn wait_for_custom(&mut self, id: usize) {
+        if self.compiles_finished == self.compiles_started {
+            return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(Some(custom)) = self.custom.get(id) {
+            let compiled_id = custom.compiled_pipeline_id;
+            while matches!(self.compiled_custom[compiled_id], CompiledSlot::Compiling) {
+                let Some(Ok((id, result))) = self
+                    .background
+                    .as_ref()
+                    .map(|background| background.finished.recv())
+                else {
+                    break;
+                };
+                self.finish_compile(id, result);
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn finish_compile(&mut self, id: usize, result: std::thread::Result<CompiledCustomPipeline>) {
+        match result {
+            Ok(compiled) => self.compiled_custom[id] = CompiledSlot::Ready(compiled),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+        self.compiles_finished += 1;
+    }
+
+    /// Compiles `compile` on a worker thread when there are any, else here; the index of its slot.
+    fn start_compile(&mut self, compile: CustomCompile) -> usize {
+        let id = self.compiled_custom.len();
+        self.compiles_started += 1;
+        #[cfg(not(target_arch = "wasm32"))]
+        let compile = match &self.background {
+            Some(background) => match background.jobs.send((id, compile)) {
+                Ok(()) => {
+                    self.compiled_custom.push(CompiledSlot::Compiling);
+                    return id;
+                }
+                // No worker thread started.
+                Err(std::sync::mpsc::SendError((_, compile))) => compile,
+            },
+            None => compile,
+        };
+        self.compiled_custom
+            .push(CompiledSlot::Ready(compile.run()));
+        self.compiles_finished += 1;
+        id
     }
 
     /// The driver's compiled pipelines so far, to keep for the next run.
@@ -459,45 +655,15 @@ impl Pipelines {
         let compiled_pipeline_id = if let Some(&id) = self.custom_cache.get(&cache_key) {
             id
         } else {
-            let build = |array| {
-                let source = crate::prepare_texture_shader(wgsl_source, array);
-                let pipeline = create_custom_pipeline(
-                    device,
-                    surface_format,
-                    &self.texture_layout[usize::from(array)],
-                    &self.camera_layout,
-                    uniform_layouts,
-                    &source,
-                    self.cache.as_ref(),
-                );
-                let watch = if self.watch_overlay_supported {
-                    create_custom_watch_pipeline(
-                        device,
-                        surface_format,
-                        &self.texture_layout[usize::from(array)],
-                        &self.camera_layout,
-                        uniform_layouts,
-                        &source,
-                        self.cache.as_ref(),
-                    )
-                } else {
-                    None
-                };
-                (pipeline, watch)
-            };
-            let (normal, normal_watch) = build(false);
-            let (array, array_watch) = if wgsl_source.contains("// EGOR_TEXTURE_SAMPLING") {
-                build(true)
-            } else {
-                (normal.clone(), normal_watch.clone())
-            };
-            let pipeline = [normal, array];
-            let watch_pipeline = [normal_watch, array_watch];
-
-            let id = self.compiled_custom.len();
-            self.compiled_custom.push(CompiledCustomPipeline {
-                pipeline,
-                watch_pipeline,
+            let id = self.start_compile(CustomCompile {
+                device: device.clone(),
+                surface_format,
+                texture_layout: self.texture_layout.clone(),
+                camera_layout: self.camera_layout.clone(),
+                uniform_layouts: cache_key.uniform_layouts.clone(),
+                wgsl_source: cache_key.wgsl_source.clone(),
+                cache: self.cache.clone(),
+                watch_overlay_supported: self.watch_overlay_supported,
             });
             self.custom_cache.insert(cache_key, id);
             id
@@ -565,7 +731,11 @@ impl Pipelines {
             ));
         }
         if let Some(custom) = shader_id.and_then(|id| self.custom.get(id)?.as_ref()) {
-            let compiled = self.compiled_custom.get(custom.compiled_pipeline_id)?;
+            let CompiledSlot::Ready(compiled) =
+                self.compiled_custom.get(custom.compiled_pipeline_id)?
+            else {
+                return None;
+            };
             if watch_overlay {
                 compiled.watch_pipeline[kind]
                     .as_ref()
@@ -603,7 +773,12 @@ impl Pipelines {
                     .get(id)
                     .and_then(Option::as_ref)
                     .and_then(|custom| self.compiled_custom.get(custom.compiled_pipeline_id))
-                    .is_some_and(|compiled| compiled.watch_pipeline.iter().all(Option::is_some)),
+                    .is_some_and(|compiled| match compiled {
+                        CompiledSlot::Ready(compiled) => {
+                            compiled.watch_pipeline.iter().all(Option::is_some)
+                        }
+                        CompiledSlot::Compiling => false,
+                    }),
                 None => {
                     self.primitive_watch.iter().all(Option::is_some)
                         && self.primitive_replace_watch.iter().all(Option::is_some)
@@ -970,6 +1145,41 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
         assert!(wrapped.contains("@location(1) overlay: vec4<f32>"));
         assert!(wrapped.contains("input.watch_overlay"));
+    }
+
+    #[test]
+    fn background_compiles_hand_their_pipelines_to_the_shaders_waiting_for_them() {
+        let (device, _queue) = Device::noop(&wgpu::DeviceDescriptor::default());
+        let surface_format = TextureFormat::Rgba8Unorm;
+        let mut pipelines = Pipelines::new(&device, surface_format, true, None);
+        pipelines.compile_in_background(2);
+        let uniform_layout = create_camera_bind_group_layout(&device);
+        let mut add = |source, uniform| {
+            pipelines.add_custom(
+                &device,
+                surface_format,
+                source,
+                &[&uniform_layout],
+                vec![CustomBinding::Uniform(uniform)],
+            )
+        };
+        let first = add(CUSTOM_SHADER_WITH_OVERLAY, 1);
+        let same_program = add(CUSTOM_SHADER_WITH_OVERLAY, 2);
+        let other = add(CUSTOM_SHADER_WITHOUT_OVERLAY, 3);
+
+        // One compile per program, however many shaders share it.
+        assert_eq!(pipelines.compiles().1, 2);
+        for id in [first, same_program, other] {
+            pipelines.wait_for_custom(id);
+            assert!(
+                pipelines
+                    .resolve_with_replace(Some(id), false, false, false)
+                    .is_some()
+            );
+        }
+        assert_eq!(pipelines.compiles(), (2, 2));
+        assert!(pipelines.supports_watch_overlay(Some(first)));
+        assert!(!pipelines.supports_watch_overlay(Some(other)));
     }
 
     #[test]
