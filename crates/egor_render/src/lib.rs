@@ -208,6 +208,11 @@ pub struct Renderer {
     /// The background compiles not all finished yet.
     #[cfg(not(target_arch = "wasm32"))]
     compile_batch: Option<CompileBatch>,
+    /// Compiles finished as the last frame began, and as the pipeline cache was last saved.
+    #[cfg(not(target_arch = "wasm32"))]
+    compiles_last_frame: usize,
+    #[cfg(not(target_arch = "wasm32"))]
+    compiles_saved: usize,
 }
 
 /// Custom shaders compiling on worker threads, from the first to start while none were.
@@ -256,7 +261,8 @@ impl Renderer {
             .await
     }
 
-    /// `pipeline_cache_dir` keeps the driver's compiled pipelines between runs, where the driver can (Vulkan):
+    /// `pipeline_cache_dir` keeps the driver's compiled pipelines between runs, where the driver can (Vulkan,
+    /// and OpenGL's program binaries):
     /// compiling a pipeline can take tens of milliseconds on a phone. Save it with
     /// [`Self::save_pipeline_cache`].
     pub async fn try_new_with_backend(
@@ -354,7 +360,8 @@ impl Renderer {
             wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter_limits);
         #[cfg(not(target_arch = "wasm32"))]
         let required_limits = adapter_limits;
-        // Where the driver's compiled pipelines are kept between runs, for drivers that can (Vulkan).
+        // Where the driver's compiled pipelines are kept between runs, for drivers that can (Vulkan, and OpenGL's
+        // program binaries).
         let pipeline_cache_file = pipeline_cache_dir
             .zip(wgpu::util::pipeline_cache_key(&adapter.get_info()))
             .filter(|_| adapter.features().contains(wgpu::Features::PIPELINE_CACHE))
@@ -542,6 +549,10 @@ impl Renderer {
                 started_at: std::time::Instant::now(),
                 first: 0,
             }),
+            #[cfg(not(target_arch = "wasm32"))]
+            compiles_last_frame: 0,
+            #[cfg(not(target_arch = "wasm32"))]
+            compiles_saved: 0,
         })
     }
 
@@ -1440,9 +1451,10 @@ impl Renderer {
         self.pipelines.builtins_ready()
     }
 
-    /// Takes in the custom shaders the compile threads finished. Once all of a batch are in, it saves the
-    /// driver's compiled pipelines for the next run, as [`Self::save_pipeline_cache`] after compiling them on
-    /// this thread would.
+    /// Takes in the custom shaders the compile threads finished. Once every compile is in and a frame has
+    /// passed without another, it saves the driver's compiled pipelines for the next run
+    /// ([`Self::save_pipeline_cache`]): after a batch on the threads, or a run of frames compiling on this one
+    /// (OpenGL).
     fn take_finished_compiles(&mut self) {
         self.pipelines.take_finished_compiles();
         #[cfg(not(target_arch = "wasm32"))]
@@ -1457,8 +1469,15 @@ impl Renderer {
                     self.shader_compile_threads,
                     batch.started_at.elapsed().as_millis()
                 );
+            }
+            if finished == started
+                && finished == self.compiles_last_frame
+                && finished > self.compiles_saved
+            {
+                self.compiles_saved = finished;
                 self.save_pipeline_cache();
             }
+            self.compiles_last_frame = finished;
         }
     }
 

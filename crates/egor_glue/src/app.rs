@@ -577,8 +577,8 @@ impl App {
     }
 
     /// Keeps the GPU driver's compiled pipelines in this directory between runs, where the driver can
-    /// (Vulkan), so pipelines compiled once don't cost a phone tens of milliseconds each again. Save it with
-    /// `Graphics::save_pipeline_cache` after compiling them.
+    /// (Vulkan, and OpenGL's program binaries), so pipelines compiled once don't cost a phone tens of
+    /// milliseconds each again. egor saves it after compiling; `Graphics::save_pipeline_cache` saves it now.
     pub fn pipeline_cache_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
         self.pipeline_cache_dir = Some(dir.into());
         self
