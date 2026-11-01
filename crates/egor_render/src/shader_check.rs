@@ -90,7 +90,9 @@ pub fn check_custom_shader_with_textures(
 }
 
 /// egor's uniform layouts leave the binding size open, so wgpu only rejects a uniform the shader reads past
-/// the end of when it is drawn.
+/// the end of when it is drawn. WebGL also takes uniforms only in multiples of 16 bytes: without
+/// `DownlevelFlags::BUFFER_BINDINGS_NOT_16_BYTE_ALIGNED` wgpu builds no pipeline for a shader declaring another
+/// size, but the no-op device the pipelines are checked on has that flag.
 fn check_uniform_sizes(wgsl_source: &str, uniform_sizes: &[u64]) -> Vec<String> {
     // wgpu already reported parse errors.
     let Ok(module) =
@@ -101,16 +103,25 @@ fn check_uniform_sizes(wgsl_source: &str, uniform_sizes: &[u64]) -> Vec<String> 
     let mut errors = Vec::new();
     for (index, &bound) in uniform_sizes.iter().enumerate() {
         let group = index as u32 + 2;
-        let needed = module
-            .global_variables
-            .iter()
-            .filter(|(_, var)| {
-                var.binding
-                    .as_ref()
-                    .is_some_and(|binding| binding.group == group)
-            })
-            .map(|(_, var)| u64::from(module.types[var.ty].inner.size(module.to_ctx())))
-            .max();
+        let mut needed = None;
+        for (_, var) in module.global_variables.iter() {
+            let Some(binding) = var
+                .binding
+                .as_ref()
+                .filter(|binding| binding.group == group)
+            else {
+                continue;
+            };
+            let size = u64::from(module.types[var.ty].inner.size(module.to_ctx()));
+            if matches!(var.space, naga::AddressSpace::Uniform) && size % 16 != 0 {
+                errors.push(format!(
+                    "@group({group}) @binding({}) uniform is {size} bytes, but WebGL takes uniforms only in \
+                     multiples of 16 bytes",
+                    binding.binding
+                ));
+            }
+            needed = needed.max(Some(size));
+        }
         if let Some(needed) = needed.filter(|&needed| needed > bound) {
             errors.push(format!(
                 "@group({group}) uniform needs {needed} bytes but is bound with {bound}"
@@ -397,6 +408,36 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         assert_eq!(
             check_custom_shader(&source, &[8]),
             ["@group(2) uniform needs 16 bytes but is bound with 8"]
+        );
+    }
+
+    #[test]
+    fn rejects_uniforms_webgl_cannot_bind() {
+        let uniform = |fields: usize| {
+            let members: String = (0..fields)
+                .map(|field| format!("    f{field}: f32,\n"))
+                .collect();
+            VALID
+                .replace(
+                    "@vertex",
+                    &format!("struct Params {{\n{members}}};\n@group(2) @binding(0) var<uniform> params: Params;\n\n@vertex"),
+                )
+                .replace("input.watch_overlay, 0.0", "input.watch_overlay, params.f0")
+        };
+        assert_eq!(
+            check_custom_shader(&uniform(10), &[48]),
+            [
+                "@group(2) @binding(0) uniform is 40 bytes, but WebGL takes uniforms only in multiples of 16 bytes"
+            ]
+        );
+        // A client buffer larger than the shader reads is fine; the shader's own size is what WebGL judges.
+        assert_eq!(
+            check_custom_shader(&uniform(8), &[40]),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            check_custom_shader(&uniform(12), &[48]),
+            Vec::<String>::new()
         );
     }
 
