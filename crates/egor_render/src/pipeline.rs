@@ -11,8 +11,6 @@ use wgpu::{
 
 use crate::{instance::Instance, vertex::Vertex};
 
-const WATCH_OVERLAY_FORMAT: TextureFormat = TextureFormat::Rgba8Unorm;
-
 const SRGB_OUTPUT_HELPERS: &str = r#"
 fn egor_linear_to_srgb_channel(value: f32) -> f32 {
     let clamped = clamp(value, 0.0, 1.0);
@@ -166,159 +164,13 @@ pub(crate) fn custom_shader_source(
     }
 }
 
-fn first_fragment_argument_name(params: &str) -> Option<String> {
-    let first = params
-        .split(',')
-        .map(str::trim)
-        .find(|param| !param.is_empty())?;
-    let (name, _) = first.split_once(':')?;
-    Some(name.trim().to_owned())
-}
-
-pub(crate) fn wrap_custom_shader_for_watch_output(
-    wgsl_source: &str,
-    encode_srgb: bool,
-) -> Option<Cow<'_, str>> {
-    const FRAGMENT_ATTR: &str = "@fragment";
-    const USER_FN: &str = "fn fs_main";
-    const RETURN_LOCATION: &str = "@location(0)";
-    const RETURN_TYPE: &str = "vec4<f32>";
-
-    let Some(fn_pos) = wgsl_source.find(USER_FN) else {
-        log::warn!(
-            "[egor] custom shader has no fs_main entrypoint; watch overlay output was not applied"
-        );
-        return None;
-    };
-    let Some(attr_pos) = wgsl_source[..fn_pos].rfind(FRAGMENT_ATTR) else {
-        log::warn!(
-            "[egor] custom shader fs_main has no @fragment attribute; watch overlay output was not applied"
-        );
-        return None;
-    };
-    if !wgsl_source[attr_pos + FRAGMENT_ATTR.len()..fn_pos]
-        .trim()
-        .is_empty()
-    {
-        log::warn!(
-            "[egor] custom shader @fragment attribute could not be matched to fs_main; watch overlay output was not applied"
-        );
-        return None;
-    }
-
-    let Some(params_start) = wgsl_source[fn_pos..]
-        .find('(')
-        .map(|offset| fn_pos + offset)
-    else {
-        log::warn!(
-            "[egor] custom shader fs_main params could not be parsed; watch overlay output was not applied"
-        );
-        return None;
-    };
-    let Some(params_end) = wgsl_source[params_start..]
-        .find(')')
-        .map(|offset| params_start + offset)
-    else {
-        log::warn!(
-            "[egor] custom shader fs_main params could not be parsed; watch overlay output was not applied"
-        );
-        return None;
-    };
-    let params = &wgsl_source[params_start + 1..params_end];
-    let Some(argument_names) = parse_fragment_argument_names(params) else {
-        log::warn!(
-            "[egor] custom shader fs_main arguments could not be parsed; watch overlay output was not applied"
-        );
-        return None;
-    };
-    let Some(first_argument_name) = first_fragment_argument_name(params) else {
-        log::warn!(
-            "[egor] custom shader fs_main first argument could not be parsed; watch overlay output was not applied"
-        );
-        return None;
-    };
-    if !wgsl_source.contains("watch_overlay") {
-        log::warn!(
-            "[egor] custom shader has no watch_overlay fragment input; watch overlay output was not applied"
-        );
-        return None;
-    };
-
-    let mut cursor = skip_ascii_whitespace(wgsl_source, params_end + 1);
-    if !wgsl_source[cursor..].starts_with("->") {
-        log::warn!(
-            "[egor] custom shader fs_main return type could not be parsed; watch overlay output was not applied"
-        );
-        return None;
-    }
-    cursor = skip_ascii_whitespace(wgsl_source, cursor + 2);
-    if !wgsl_source[cursor..].starts_with(RETURN_LOCATION) {
-        log::warn!(
-            "[egor] custom shader fs_main return location could not be parsed; watch overlay output was not applied"
-        );
-        return None;
-    }
-    cursor = skip_ascii_whitespace(wgsl_source, cursor + RETURN_LOCATION.len());
-    if !wgsl_source[cursor..].starts_with(RETURN_TYPE) {
-        log::warn!(
-            "[egor] custom shader fs_main return type is not vec4<f32>; watch overlay output was not applied"
-        );
-        return None;
-    }
-    let return_type_end = cursor + RETURN_TYPE.len();
-
-    let mut wrapped = String::with_capacity(wgsl_source.len() + SRGB_OUTPUT_HELPERS.len() + 360);
-    wrapped.push_str(&wgsl_source[..attr_pos]);
-    wrapped.push_str("fn egor_user_fs_main");
-    wrapped.push_str(&wgsl_source[params_start..params_end + 1]);
-    wrapped.push_str(" -> vec4<f32>");
-    wrapped.push_str(&wgsl_source[return_type_end..]);
-    if encode_srgb {
-        wrapped.push_str(SRGB_OUTPUT_HELPERS);
-    }
-    wrapped.push_str(
-        r#"
-struct EgorWatchFragmentOutput {
-    @location(0) color: vec4<f32>,
-    @location(1) overlay: vec4<f32>,
-};
-
-@fragment
-fn fs_main("#,
-    );
-    wrapped.push_str(params);
-    wrapped.push_str(") -> EgorWatchFragmentOutput {\n    let user_color = egor_user_fs_main(");
-    wrapped.push_str(&argument_names);
-    wrapped.push_str(");\n    var out: EgorWatchFragmentOutput;\n");
-    if encode_srgb {
-        wrapped.push_str("    out.color = egor_linear_to_srgb(user_color);\n");
-        wrapped.push_str("    out.overlay = vec4<f32>(out.color.rgb, user_color.a * ");
-        wrapped.push_str(&first_argument_name);
-        wrapped.push_str(".watch_overlay);\n");
-    } else {
-        wrapped.push_str("    out.color = user_color;\n");
-        wrapped.push_str("    out.overlay = vec4<f32>(user_color.rgb, user_color.a * ");
-        wrapped.push_str(&first_argument_name);
-        wrapped.push_str(".watch_overlay);\n");
-    }
-    wrapped.push_str("    return out;\n}\n");
-
-    Some(Cow::Owned(wrapped))
-}
-
 struct CompiledCustomPipeline {
     pipeline: [RenderPipeline; 2],
-    watch_pipeline: [Option<RenderPipeline>; 2],
 }
 
 impl CompiledCustomPipeline {
-    fn pick(&self, watch_overlay: bool, texture_array: bool) -> Option<&RenderPipeline> {
-        let kind = usize::from(texture_array);
-        if watch_overlay {
-            self.watch_pipeline[kind].as_ref()
-        } else {
-            Some(&self.pipeline[kind])
-        }
+    fn pick(&self, texture_array: bool) -> &RenderPipeline {
+        &self.pipeline[usize::from(texture_array)]
     }
 }
 
@@ -336,7 +188,6 @@ struct PipelineCompile {
     texture_layout: [BindGroupLayout; 2],
     camera_layout: BindGroupLayout,
     cache: Option<PipelineCache>,
-    watch_overlay_supported: bool,
     program: Program,
 }
 
@@ -379,19 +230,15 @@ const BUILTINS: [(usize, PrimitiveFragment); 3] = [
 /// A family's pipelines as they were asked for: pipelines, or futures of them.
 struct BuiltPipelines<R> {
     normal: R,
-    normal_watch: Option<R>,
     /// The texture-array variant, for shaders that sample egor's texture.
-    array: Option<(R, Option<R>)>,
+    array: Option<R>,
 }
 
 impl BuiltPipelines<RenderPipeline> {
     fn into_compiled(self) -> CompiledCustomPipeline {
-        let (array, array_watch) = self
-            .array
-            .unwrap_or_else(|| (self.normal.clone(), self.normal_watch.clone()));
+        let array = self.array.unwrap_or_else(|| self.normal.clone());
         CompiledCustomPipeline {
             pipeline: [self.normal, array],
-            watch_pipeline: [self.normal_watch, array_watch],
         }
     }
 }
@@ -404,64 +251,43 @@ impl PipelineCompile {
                 uniform_layouts,
             } => (wgsl_source, uniform_layouts),
             Program::Builtin(fragment) => {
-                let primitive = |watch_overlay, array: bool| {
+                let primitive = |array: bool| {
                     create_primitive_pipeline(
                         &self.device,
                         self.surface_format,
                         &self.texture_layout[usize::from(array)],
                         &self.camera_layout,
                         *fragment,
-                        watch_overlay,
                         array,
                         self.cache.as_ref(),
                         create,
                     )
                 };
-                let watch = |array| self.watch_overlay_supported.then(|| primitive(true, array));
                 return BuiltPipelines {
-                    normal: primitive(false, false),
-                    normal_watch: watch(false),
-                    array: Some((primitive(false, true), watch(true))),
+                    normal: primitive(false),
+                    array: Some(primitive(true)),
                 };
             }
         };
         let uniform_layouts: Vec<&BindGroupLayout> = uniform_layouts.iter().collect();
         let build = |array| {
             let source = crate::prepare_texture_shader(wgsl_source, array);
-            let texture_layout = &self.texture_layout[usize::from(array)];
-            let pipeline = create_custom_pipeline(
+            create_custom_pipeline(
                 &self.device,
                 self.surface_format,
-                texture_layout,
+                &self.texture_layout[usize::from(array)],
                 &self.camera_layout,
                 &uniform_layouts,
                 &source,
                 self.cache.as_ref(),
                 create,
-            );
-            let watch = if self.watch_overlay_supported {
-                create_custom_watch_pipeline(
-                    &self.device,
-                    self.surface_format,
-                    texture_layout,
-                    &self.camera_layout,
-                    &uniform_layouts,
-                    &source,
-                    self.cache.as_ref(),
-                    create,
-                )
-            } else {
-                None
-            };
-            (pipeline, watch)
+            )
         };
-        let (normal, normal_watch) = build(false);
         let array = wgsl_source
             .contains("// EGOR_TEXTURE_SAMPLING")
             .then(|| build(true));
         BuiltPipelines {
-            normal,
-            normal_watch,
+            normal: build(false),
             array,
         }
     }
@@ -477,26 +303,11 @@ impl PipelineCompile {
     async fn run_async(&self) -> CompiledCustomPipeline {
         let built = self.build(&|device, desc| device.create_render_pipeline_async(desc));
         let normal = built.normal.await;
-        let normal_watch = match built.normal_watch {
-            Some(watch) => Some(watch.await),
-            None => None,
-        };
         let array = match built.array {
-            Some((pipeline, watch)) => Some((
-                pipeline.await,
-                match watch {
-                    Some(watch) => Some(watch.await),
-                    None => None,
-                },
-            )),
+            Some(pipeline) => Some(pipeline.await),
             None => None,
         };
-        BuiltPipelines {
-            normal,
-            normal_watch,
-            array,
-        }
-        .into_compiled()
+        BuiltPipelines { normal, array }.into_compiled()
     }
 }
 
@@ -624,7 +435,6 @@ pub(crate) struct Pipelines {
     custom_cache: HashMap<CustomPipelineKey, usize>,
     texture_layout: [BindGroupLayout; 2],
     pub camera_layout: BindGroupLayout,
-    watch_overlay_supported: bool,
     /// The driver's compiled pipelines, kept between runs (`Renderer::save_pipeline_cache`).
     cache: Option<PipelineCache>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -643,16 +453,9 @@ impl Pipelines {
     pub fn new(
         device: &Device,
         surface_format: TextureFormat,
-        watch_overlay_supported: bool,
         cache: Option<PipelineCache>,
     ) -> Self {
-        Self::new_with(
-            device,
-            surface_format,
-            watch_overlay_supported,
-            cache,
-            CompileMode::Here,
-        )
+        Self::new_with(device, surface_format, cache, CompileMode::Here)
     }
 
     /// Like [`Self::new`], with every pipeline compiling where `mode` says. Unless that is here, the built-in
@@ -660,7 +463,6 @@ impl Pipelines {
     pub fn new_with(
         device: &Device,
         surface_format: TextureFormat,
-        watch_overlay_supported: bool,
         cache: Option<PipelineCache>,
         mode: CompileMode,
     ) -> Self {
@@ -675,7 +477,6 @@ impl Pipelines {
             custom_cache: HashMap::new(),
             texture_layout,
             camera_layout,
-            watch_overlay_supported,
             cache,
             #[cfg(not(target_arch = "wasm32"))]
             background: None,
@@ -706,7 +507,6 @@ impl Pipelines {
                 texture_layout: pipelines.texture_layout.clone(),
                 camera_layout: pipelines.camera_layout.clone(),
                 cache: pipelines.cache.clone(),
-                watch_overlay_supported,
                 program: Program::Builtin(fragment),
             };
             if frames {
@@ -898,7 +698,6 @@ impl Pipelines {
                 texture_layout: self.texture_layout.clone(),
                 camera_layout: self.camera_layout.clone(),
                 cache: self.cache.clone(),
-                watch_overlay_supported: self.watch_overlay_supported,
                 program: Program::Custom {
                     wgsl_source: cache_key.wgsl_source.clone(),
                     uniform_layouts: cache_key.uniform_layouts.clone(),
@@ -955,60 +754,23 @@ impl Pipelines {
         &self,
         shader_id: Option<usize>,
         replace_blend: bool,
-        watch_overlay: bool,
         texture_array: bool,
     ) -> Option<(&RenderPipeline, &[CustomBinding])> {
         if replace_blend && shader_id.is_none() {
-            return Some((
-                self.ready(REPLACE)?.pick(watch_overlay, texture_array)?,
-                &[],
-            ));
+            return Some((self.ready(REPLACE)?.pick(texture_array), &[]));
         }
         if let Some(custom) = shader_id.and_then(|id| self.custom.get(id)?.as_ref()) {
             let compiled = self.ready(custom.compiled_pipeline_id)?;
-            Some((
-                compiled.pick(watch_overlay, texture_array)?,
-                custom.bindings.as_slice(),
-            ))
+            Some((compiled.pick(texture_array), custom.bindings.as_slice()))
         } else {
-            Some((self.ready(PLAIN)?.pick(watch_overlay, texture_array)?, &[]))
+            Some((self.ready(PLAIN)?.pick(texture_array), &[]))
         }
     }
 
     /// The default shader's outlined-text pipeline, for instances with an outline; `resolve_with_replace` gives
     /// the plain one, which every other default draw uses.
-    pub fn resolve_outline(
-        &self,
-        watch_overlay: bool,
-        texture_array: bool,
-    ) -> Option<&RenderPipeline> {
-        self.ready(OUTLINE)?.pick(watch_overlay, texture_array)
-    }
-
-    /// Whether the device can draw the watch overlay beside a frame, compiled yet or not.
-    pub fn watch_overlay_supported(&self) -> bool {
-        self.watch_overlay_supported
-    }
-
-    pub fn supports_watch_overlay(&self, shader_id: Option<usize>) -> bool {
-        self.watch_overlay_supported
-            && match shader_id {
-                Some(id) => self
-                    .custom
-                    .get(id)
-                    .and_then(Option::as_ref)
-                    .and_then(|custom| self.compiled_custom.get(custom.compiled_pipeline_id))
-                    .is_some_and(|compiled| match compiled {
-                        CompiledSlot::Ready(compiled) => {
-                            compiled.watch_pipeline.iter().all(Option::is_some)
-                        }
-                        CompiledSlot::Compiling => false,
-                    }),
-                None => [PLAIN, REPLACE].iter().all(|&slot| {
-                    self.ready(slot)
-                        .is_some_and(|compiled| compiled.watch_pipeline.iter().all(Option::is_some))
-                }),
-            }
+    pub fn resolve_outline(&self, texture_array: bool) -> Option<&RenderPipeline> {
+        Some(self.ready(OUTLINE)?.pick(texture_array))
     }
 }
 
@@ -1103,7 +865,6 @@ fn create_primitive_pipeline<R>(
     texture_layout: &BindGroupLayout,
     camera_layout: &BindGroupLayout,
     fragment: PrimitiveFragment,
-    watch_overlay: bool,
     texture_array: bool,
     cache: Option<&PipelineCache>,
     create: CreatePipeline<'_, R>,
@@ -1120,31 +881,20 @@ fn create_primitive_pipeline<R>(
         source: ShaderSource::Wgsl(source.into()),
     });
     let fragment_entry_point = format!(
-        "fs_{}{}{}",
+        "fs_{}{}",
         fragment.entry_name(),
         if surface_needs_srgb_encode(surface_format) {
             "_srgb_encoded"
         } else {
             ""
         },
-        if watch_overlay { "_watch" } else { "" },
     );
-    let mut targets = vec![Some(ColorTargetState {
+    let targets = [Some(ColorTargetState {
         format: surface_format,
         blend,
         write_mask: ColorWrites::ALL,
     })];
-    if watch_overlay {
-        targets.push(Some(ColorTargetState {
-            format: WATCH_OVERLAY_FORMAT,
-            blend,
-            write_mask: ColorWrites::ALL,
-        }));
-    }
-    let pipeline_label = format!(
-        "Primitive {fragment:?}{} Pipeline",
-        if watch_overlay { " Watch Overlay" } else { "" }
-    );
+    let pipeline_label = format!("Primitive {fragment:?} Pipeline");
     let pipeline_layout_label = format!("{pipeline_label} Layout");
 
     let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
@@ -1261,103 +1011,31 @@ fn create_custom_pipeline<R>(
     )
 }
 
-fn create_custom_watch_pipeline<R>(
-    device: &Device,
-    surface_format: TextureFormat,
-    texture_layout: &BindGroupLayout,
-    camera_layout: &BindGroupLayout,
-    extra_layouts: &[&BindGroupLayout],
-    wgsl_source: &str,
-    cache: Option<&PipelineCache>,
-    create: CreatePipeline<'_, R>,
-) -> Option<R> {
-    let wgsl_source = wrap_custom_shader_for_watch_output(
-        wgsl_source,
-        surface_needs_srgb_encode(surface_format),
-    )?;
-    let shader = device.create_shader_module(ShaderModuleDescriptor {
-        label: Some("Custom Watch Shader"),
-        source: ShaderSource::Wgsl(wgsl_source),
-    });
-
-    let mut layouts: Vec<Option<&BindGroupLayout>> =
-        vec![Some(texture_layout), Some(camera_layout)];
-    layouts.extend(extra_layouts.iter().map(|l| Some(*l)));
-
-    let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-        label: Some("Custom Watch Pipeline Layout"),
-        bind_group_layouts: &layouts,
-        immediate_size: 0,
-    });
-
-    Some(create(
-        device,
-        &RenderPipelineDescriptor {
-            label: Some("Custom Watch Pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[Some(Vertex::desc()), Some(Instance::desc())],
-                compilation_options: Default::default(),
-            },
-            primitive: Default::default(),
-            depth_stencil: Some(DepthStencilState {
-                format: crate::Renderer::DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(CompareFunction::LessEqual),
-                stencil: StencilState::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            fragment: Some(FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[
-                    Some(ColorTargetState {
-                        format: surface_format,
-                        blend: Some(BlendState::ALPHA_BLENDING),
-                        write_mask: ColorWrites::ALL,
-                    }),
-                    Some(ColorTargetState {
-                        format: WATCH_OVERLAY_FORMAT,
-                        blend: Some(BlendState::ALPHA_BLENDING),
-                        write_mask: ColorWrites::ALL,
-                    }),
-                ],
-                compilation_options: Default::default(),
-            }),
-            multiview_mask: None,
-            cache,
-        },
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const CUSTOM_SHADER_WITH_OVERLAY: &str = r#"
+    const CUSTOM_SHADER: &str = r#"
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
-    @location(1) @interpolate(flat) watch_overlay: f32,
+    @location(1) @interpolate(flat) shade: f32,
 };
 
 @vertex
 fn vs_main() -> VertexOutput {
     var out: VertexOutput;
     out.position = vec4<f32>(0.0);
-    out.watch_overlay = 1.0;
+    out.shade = 1.0;
     return out;
 }
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(input.watch_overlay, 0.0, 0.0, 1.0);
+    return vec4<f32>(input.shade, 0.0, 0.0, 1.0);
 }
 "#;
 
-    const CUSTOM_SHADER_WITHOUT_OVERLAY: &str = r#"
+    const OTHER_CUSTOM_SHADER: &str = r#"
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
 };
@@ -1376,27 +1054,11 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 "#;
 
     #[test]
-    fn custom_watch_wrapper_requires_overlay_factor() {
-        assert!(
-            wrap_custom_shader_for_watch_output(CUSTOM_SHADER_WITHOUT_OVERLAY, false).is_none()
-        );
-    }
-
-    #[test]
-    fn custom_watch_wrapper_emits_overlay_attachment() {
-        let wrapped = wrap_custom_shader_for_watch_output(CUSTOM_SHADER_WITH_OVERLAY, false)
-            .expect("wrapper should succeed");
-
-        assert!(wrapped.contains("@location(1) overlay: vec4<f32>"));
-        assert!(wrapped.contains("input.watch_overlay"));
-    }
-
-    #[test]
     fn background_compiles_hand_their_pipelines_to_the_shaders_waiting_for_them() {
         let (device, _queue) = Device::noop(&wgpu::DeviceDescriptor::default());
         let surface_format = TextureFormat::Rgba8Unorm;
         let mut pipelines =
-            Pipelines::new_with(&device, surface_format, true, None, CompileMode::Threads(2));
+            Pipelines::new_with(&device, surface_format, None, CompileMode::Threads(2));
         let uniform_layout = create_camera_bind_group_layout(&device);
         let mut add = |source, uniform| {
             pipelines.add_custom(
@@ -1407,9 +1069,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 vec![CustomBinding::Uniform(uniform)],
             )
         };
-        let first = add(CUSTOM_SHADER_WITH_OVERLAY, 1);
-        let same_program = add(CUSTOM_SHADER_WITH_OVERLAY, 2);
-        let other = add(CUSTOM_SHADER_WITHOUT_OVERLAY, 3);
+        let first = add(CUSTOM_SHADER, 1);
+        let same_program = add(CUSTOM_SHADER, 2);
+        let other = add(OTHER_CUSTOM_SHADER, 3);
 
         // One compile per program, however many shaders share it, after egor's own.
         assert_eq!(pipelines.compiles().1, BUILTINS.len() + 2);
@@ -1417,7 +1079,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             pipelines.wait_for_custom(id);
             assert!(
                 pipelines
-                    .resolve_with_replace(Some(id), false, false, false)
+                    .resolve_with_replace(Some(id), false, false)
                     .is_some()
             );
         }
@@ -1429,15 +1091,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             pipelines.compiles(),
             (BUILTINS.len() + 2, BUILTINS.len() + 2)
         );
-        assert!(
-            pipelines
-                .resolve_with_replace(None, false, false, true)
-                .is_some()
-        );
-        assert!(pipelines.resolve_outline(true, false).is_some());
-        assert!(pipelines.supports_watch_overlay(None));
-        assert!(pipelines.supports_watch_overlay(Some(first)));
-        assert!(!pipelines.supports_watch_overlay(Some(other)));
+        assert!(pipelines.resolve_with_replace(None, false, true).is_some());
+        assert!(pipelines.resolve_outline(false).is_some());
     }
 
     #[test]
@@ -1446,7 +1101,6 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let mut pipelines = Pipelines::new_with(
             &device,
             TextureFormat::Rgba8Unorm,
-            true,
             None,
             CompileMode::Frames,
         );
@@ -1455,31 +1109,27 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             pipelines.take_finished_compiles();
         }
         assert!(pipelines.builtins_ready());
-        assert!(
-            pipelines
-                .resolve_with_replace(None, true, false, false)
-                .is_some()
-        );
+        assert!(pipelines.resolve_with_replace(None, true, false).is_some());
     }
 
     #[test]
     fn custom_pipeline_programs_are_reused_across_uniform_bindings() {
         let (device, _queue) = Device::noop(&wgpu::DeviceDescriptor::default());
         let surface_format = TextureFormat::Rgba8Unorm;
-        let mut pipelines = Pipelines::new(&device, surface_format, true, None);
+        let mut pipelines = Pipelines::new(&device, surface_format, None);
         let uniform_layout = create_camera_bind_group_layout(&device);
 
         let first = pipelines.add_custom(
             &device,
             surface_format,
-            CUSTOM_SHADER_WITH_OVERLAY,
+            CUSTOM_SHADER,
             &[&uniform_layout],
             vec![CustomBinding::Uniform(4)],
         );
         let second = pipelines.add_custom(
             &device,
             surface_format,
-            CUSTOM_SHADER_WITH_OVERLAY,
+            CUSTOM_SHADER,
             &[&uniform_layout],
             vec![CustomBinding::Uniform(9)],
         );
@@ -1488,50 +1138,42 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         assert_eq!(pipelines.custom.len(), 2);
 
         let (first_pipeline, first_uniforms) = pipelines
-            .resolve_with_replace(Some(first), false, false, false)
+            .resolve_with_replace(Some(first), false, false)
             .expect("first custom pipeline should resolve");
         let (second_pipeline, second_uniforms) = pipelines
-            .resolve_with_replace(Some(second), false, false, false)
+            .resolve_with_replace(Some(second), false, false)
             .expect("second custom pipeline should resolve");
         assert_eq!(first_pipeline, second_pipeline);
         assert_eq!(first_uniforms, &[CustomBinding::Uniform(4)]);
         assert_eq!(second_uniforms, &[CustomBinding::Uniform(9)]);
-
-        let (first_watch_pipeline, _) = pipelines
-            .resolve_with_replace(Some(first), false, true, false)
-            .expect("first custom watch pipeline should resolve");
-        let (second_watch_pipeline, _) = pipelines
-            .resolve_with_replace(Some(second), false, true, false)
-            .expect("second custom watch pipeline should resolve");
-        assert_eq!(first_watch_pipeline, second_watch_pipeline);
     }
 
     #[test]
     fn custom_pipeline_cache_keeps_compilation_inputs_separate() {
         let (device, _queue) = Device::noop(&wgpu::DeviceDescriptor::default());
         let surface_format = TextureFormat::Rgba8Unorm;
-        let mut pipelines = Pipelines::new(&device, surface_format, false, None);
+        let mut pipelines = Pipelines::new(&device, surface_format, None);
         let first_layout = create_camera_bind_group_layout(&device);
         let second_layout = create_camera_bind_group_layout(&device);
 
         pipelines.add_custom(
             &device,
             surface_format,
-            CUSTOM_SHADER_WITH_OVERLAY,
+            CUSTOM_SHADER,
             &[&first_layout],
             vec![CustomBinding::Uniform(4)],
         );
         pipelines.add_custom(
             &device,
             surface_format,
-            CUSTOM_SHADER_WITH_OVERLAY,
+            CUSTOM_SHADER,
             &[&second_layout],
             vec![CustomBinding::Uniform(9)],
         );
         pipelines.add_custom(
             &device,
             TextureFormat::Rgba8UnormSrgb,
-            CUSTOM_SHADER_WITH_OVERLAY,
+            CUSTOM_SHADER,
             &[&first_layout],
             vec![CustomBinding::Uniform(12)],
         );

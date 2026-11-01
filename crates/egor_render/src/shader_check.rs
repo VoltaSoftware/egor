@@ -13,10 +13,7 @@ use naga::back::{glsl, hlsl, msl, spv};
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 use wgpu::{Device, DeviceDescriptor, Limits, TextureFormat};
 
-use crate::pipeline::{
-    CustomBinding, Pipelines, custom_shader_source, surface_needs_srgb_encode,
-    wrap_custom_shader_for_watch_output,
-};
+use crate::pipeline::{CustomBinding, Pipelines, custom_shader_source};
 use crate::uniforms::Uniforms;
 
 /// Surface formats that select each output path: one egor sRGB-encodes in the shader, one it does not.
@@ -50,7 +47,7 @@ pub fn check_custom_shader_with_textures(
     let mut errors = Vec::new();
     let uniforms = Uniforms::new(&device);
     for surface_format in SURFACE_FORMATS {
-        let mut pipelines = Pipelines::new(&device, surface_format, true, None);
+        let mut pipelines = Pipelines::new(&device, surface_format, None);
         let texture_layout = pipelines.texture_layout_2d().clone();
         let mut layouts = vec![uniforms.layout(); uniform_sizes.len()];
         layouts.extend(std::iter::repeat_n(&texture_layout, texture_count));
@@ -61,8 +58,7 @@ pub fn check_custom_shader_with_textures(
                 texture_count,
             ))
             .collect();
-        let shader_id =
-            pipelines.add_custom(&device, surface_format, wgsl_source, &layouts, bindings);
+        pipelines.add_custom(&device, surface_format, wgsl_source, &layouts, bindings);
         errors.extend(
             wgpu_errors
                 .lock()
@@ -70,12 +66,6 @@ pub fn check_custom_shader_with_textures(
                 .drain(..)
                 .map(|error| format!("wgpu ({surface_format:?} surface): {error}")),
         );
-        if !pipelines.supports_watch_overlay(Some(shader_id)) {
-            errors.push(format!(
-                "no watch overlay pipeline ({surface_format:?} surface): fs_main must take a struct carrying \
-                 `watch_overlay` and return `@location(0) vec4<f32>`"
-            ));
-        }
     }
 
     errors.extend(check_uniform_sizes(wgsl_source, uniform_sizes));
@@ -147,15 +137,6 @@ fn compiled_modules(wgsl_source: &str) -> Vec<(String, String)> {
                 format!("{texture}, {surface_format:?} surface"),
                 custom_shader_source(&prepared, surface_format).into_owned(),
             ));
-            if let Some(watch) = wrap_custom_shader_for_watch_output(
-                &prepared,
-                surface_needs_srgb_encode(surface_format),
-            ) {
-                modules.push((
-                    format!("{texture}, {surface_format:?} surface, watch overlay"),
-                    watch.into_owned(),
-                ));
-            }
         }
     }
     modules
@@ -341,20 +322,20 @@ mod tests {
     const VALID: &str = r#"
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
-    @location(1) @interpolate(flat) watch_overlay: f32,
+    @location(1) @interpolate(flat) shade: f32,
 };
 
 @vertex
 fn vs_main() -> VertexOutput {
     var out: VertexOutput;
     out.position = vec4<f32>(0.0);
-    out.watch_overlay = 1.0;
+    out.shade = 1.0;
     return out;
 }
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(input.watch_overlay, 0.0, 0.0, 1.0);
+    return vec4<f32>(input.shade, 0.0, 0.0, 1.0);
 }
 "#;
 
@@ -364,45 +345,13 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     #[test]
-    fn rejects_watch_overlay_missing_from_the_fragment_input() {
-        let source = r#"
-struct InstanceInput {
-    @location(8) watch_overlay: f32,
-};
-
-struct VertexOutput {
-    @builtin(position) position: vec4<f32>,
-};
-
-@vertex
-fn vs_main(inst: InstanceInput) -> VertexOutput {
-    var out: VertexOutput;
-    out.position = vec4<f32>(inst.watch_overlay);
-    return out;
-}
-
-@fragment
-fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    return input.position;
-}
-"#;
-        let errors = check_custom_shader(source, &[]);
-        assert!(
-            errors
-                .iter()
-                .any(|error| error.contains("invalid field accessor `watch_overlay`")),
-            "{errors:#?}"
-        );
-    }
-
-    #[test]
     fn rejects_uniforms_the_client_does_not_bind_in_full() {
         let source = VALID
             .replace(
                 "@vertex",
                 "@group(2) @binding(0) var<uniform> params: vec4<f32>;\n\n@vertex",
             )
-            .replace("input.watch_overlay, 0.0", "input.watch_overlay, params.x");
+            .replace("input.shade, 0.0", "input.shade, params.x");
         assert!(check_custom_shader(&source, &[16]).is_empty());
         assert!(!check_custom_shader(&source, &[]).is_empty());
         assert_eq!(
@@ -445,7 +394,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     fn rejects_capabilities_webgl2_lacks() {
         let source = VALID.replace(
             "@fragment\nfn fs_main(input: VertexOutput)",
-            "struct FragmentInput {\n    @builtin(position) position: vec4<f32>,\n    @location(1) @interpolate(flat) watch_overlay: f32,\n    @builtin(sample_index) sample: u32,\n};\n\n@fragment\nfn fs_main(input: FragmentInput)",
+            "struct FragmentInput {\n    @builtin(position) position: vec4<f32>,\n    @location(1) @interpolate(flat) shade: f32,\n    @builtin(sample_index) sample: u32,\n};\n\n@fragment\nfn fs_main(input: FragmentInput)",
         );
         let errors = check_custom_shader(&source, &[]);
         assert!(

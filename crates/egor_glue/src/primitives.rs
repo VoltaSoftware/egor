@@ -37,7 +37,6 @@ pub struct PrimitiveBatch {
     camera_count: usize,
     render_target: Option<usize>,
     draw_depth: f32,
-    watch_overlay: f32,
     has_rt_overrides: bool,
     replace_blend: bool,
 }
@@ -65,7 +64,6 @@ impl PrimitiveBatch {
             camera_count: 0,
             render_target: None,
             draw_depth: 0.0,
-            watch_overlay: 1.0,
             has_rt_overrides: false,
             replace_blend: false,
         }
@@ -293,10 +291,6 @@ impl PrimitiveBatch {
         self.draw_depth = depth;
     }
 
-    pub fn set_watch_overlay(&mut self, watch_overlay: f32) {
-        self.watch_overlay = watch_overlay.clamp(0.0, 1.0);
-    }
-
     pub fn set_replace_blend(&mut self, replace_blend: bool) {
         self.replace_blend = replace_blend;
     }
@@ -304,10 +298,6 @@ impl PrimitiveBatch {
     /// Returns the current draw depth value.
     pub fn draw_depth(&self) -> f32 {
         self.draw_depth
-    }
-
-    pub fn watch_overlay(&self) -> f32 {
-        self.watch_overlay
     }
 
     /// Returns whether any batch targets an offscreen render target.
@@ -349,7 +339,6 @@ impl PrimitiveBatch {
         self.camera_count = 0;
         self.render_target = None;
         self.draw_depth = 0.0;
-        self.watch_overlay = 1.0;
         self.has_rt_overrides = false;
     }
 
@@ -368,7 +357,6 @@ impl PrimitiveBatch {
         self.camera_count = 0;
         self.render_target = None;
         self.draw_depth = 0.0;
-        self.watch_overlay = 1.0;
         self.has_rt_overrides = false;
     }
 }
@@ -517,8 +505,7 @@ impl Drop for RectangleBuilder<'_> {
 
         self.batch.push_instance(
             Instance::new(affine, [center.x, center.y, self.depth], color, self.uvs)
-                .with_texture_layer(self.texture_layer)
-                .with_watch_overlay(self.batch.watch_overlay()),
+                .with_texture_layer(self.texture_layer),
             self.tex_id,
             self.shader_id,
         );
