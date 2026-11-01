@@ -24,9 +24,9 @@ fn render_array_pages(layers: u32) {
             })
             .await
             .unwrap();
-        // Exercise the actual pipeline layout, default/watch shaders and upload path.
+        // Exercise the actual pipeline layout, default shaders and upload path.
         let _pipelines =
-            crate::pipeline::Pipelines::new(&device, TextureFormat::Rgba8UnormSrgb, true, None);
+            crate::pipeline::Pipelines::new(&device, TextureFormat::Rgba8UnormSrgb, None);
         let mut textures = Textures::new(&device, &queue);
         let colors = [
             [255u8, 0, 0, 255],

@@ -29,7 +29,7 @@ use wgpu::{
     Adapter, BindGroup, BindGroupDescriptor, BindGroupEntry, Color, DeviceDescriptor, Instance,
     InstanceDescriptor, LoadOp, Operations, RenderPassColorAttachment,
     RenderPassDepthStencilAttachment, RenderPassDescriptor, RequestAdapterOptions, StoreOp,
-    SurfaceTarget, TextureUsages, TextureView, WindowHandle,
+    SurfaceTarget, TextureView, WindowHandle,
     util::{BufferInitDescriptor, DeviceExt, new_instance_with_webgpu_detection},
 };
 
@@ -166,46 +166,6 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
         .map(str::to_owned)
         .or_else(|| payload.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "unknown panic".to_string())
-}
-
-fn format_supports_usages(adapter: &Adapter, format: TextureFormat, usages: TextureUsages) -> bool {
-    adapter
-        .get_texture_format_features(format)
-        .allowed_usages
-        .contains(usages)
-}
-
-fn watch_overlay_capture_supported(
-    adapter: &Adapter,
-    device: &Device,
-    surface_format: TextureFormat,
-) -> bool {
-    let limits = device.limits();
-    if limits.max_color_attachments < 2 {
-        log::warn!(
-            "[egor] watch overlay capture disabled: max_color_attachments={} is below required 2",
-            limits.max_color_attachments
-        );
-        return false;
-    }
-
-    let render_sample_usage = TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING;
-    if !format_supports_usages(adapter, surface_format, render_sample_usage) {
-        log::warn!(
-            "[egor] watch overlay capture disabled: surface format {:?} cannot be both rendered and sampled",
-            surface_format
-        );
-        return false;
-    }
-    if !format_supports_usages(adapter, TextureFormat::Rgba8Unorm, render_sample_usage) {
-        log::warn!(
-            "[egor] watch overlay capture disabled: overlay format {:?} cannot be both rendered and sampled",
-            TextureFormat::Rgba8Unorm
-        );
-        return false;
-    }
-
-    true
 }
 
 /// A draw's `current_shader` while the default shader's outline pipeline is bound. No custom shader has this id,
@@ -460,11 +420,6 @@ impl Renderer {
                 .map_err(RendererInitError::SurfaceConfig)?;
         #[cfg(not(target_os = "android"))]
         let startup_surface = Some(surface);
-        let watch_overlay_supported =
-            watch_overlay_capture_supported(&adapter, &device, surface_format);
-        log::info!(
-            "[egor] renderer init: watch overlay capture MRT supported: {watch_overlay_supported}"
-        );
         log::info!("[egor] renderer init: creating pipelines and core buffers");
         // A pipeline takes tens of milliseconds to compile on a phone, so pipelines compile on worker threads where
         // the backend allows it, and frames draw nothing until egor's own are in rather than wait for them.
@@ -496,13 +451,7 @@ impl Renderer {
         } else {
             CompileMode::Frames
         };
-        let pipelines = Pipelines::new_with(
-            &device,
-            surface_format,
-            watch_overlay_supported,
-            pipeline_cache,
-            compile_mode,
-        );
+        let pipelines = Pipelines::new_with(&device, surface_format, pipeline_cache, compile_mode);
 
         let quad_vertex_buffer = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("Static Unit Quad VB"),
@@ -919,94 +868,6 @@ impl Renderer {
         })
     }
 
-    pub fn begin_render_pass_with_watch_overlay_depth_clear_color<'a>(
-        &'a self,
-        encoder: &'a mut CommandEncoder,
-        color_view: &'a TextureView,
-        overlay_view: &'a TextureView,
-        depth_view: &'a TextureView,
-        clear_color: wgpu::Color,
-        clear_depth: bool,
-    ) -> RenderPass<'a> {
-        encoder.begin_render_pass(&RenderPassDescriptor {
-            color_attachments: &[
-                Some(RenderPassColorAttachment {
-                    view: color_view,
-                    resolve_target: None,
-                    ops: Operations {
-                        load: LoadOp::Clear(clear_color),
-                        store: StoreOp::Store,
-                    },
-                    depth_slice: None,
-                }),
-                Some(RenderPassColorAttachment {
-                    view: overlay_view,
-                    resolve_target: None,
-                    ops: Operations {
-                        // Server-owned map pixels have zero overlay alpha, so the
-                        // background must stay transparent when we blend over it.
-                        load: LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: StoreOp::Store,
-                    },
-                    depth_slice: None,
-                }),
-            ],
-            depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
-                view: depth_view,
-                depth_ops: Some(Operations {
-                    load: if clear_depth {
-                        LoadOp::Clear(1.0)
-                    } else {
-                        LoadOp::Load
-                    },
-                    store: StoreOp::Store,
-                }),
-                stencil_ops: None,
-            }),
-            ..Default::default()
-        })
-    }
-
-    pub fn begin_render_pass_load_with_watch_overlay_depth<'a>(
-        &'a self,
-        encoder: &'a mut CommandEncoder,
-        color_view: &'a TextureView,
-        overlay_view: &'a TextureView,
-        depth_view: &'a TextureView,
-    ) -> RenderPass<'a> {
-        encoder.begin_render_pass(&RenderPassDescriptor {
-            color_attachments: &[
-                Some(RenderPassColorAttachment {
-                    view: color_view,
-                    resolve_target: None,
-                    ops: Operations {
-                        load: LoadOp::Load,
-                        store: StoreOp::Store,
-                    },
-                    depth_slice: None,
-                }),
-                Some(RenderPassColorAttachment {
-                    view: overlay_view,
-                    resolve_target: None,
-                    ops: Operations {
-                        load: LoadOp::Load,
-                        store: StoreOp::Store,
-                    },
-                    depth_slice: None,
-                }),
-            ],
-            depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
-                view: depth_view,
-                depth_ops: Some(Operations {
-                    load: LoadOp::Load,
-                    store: StoreOp::Store,
-                }),
-                stencil_ops: None,
-            }),
-            ..Default::default()
-        })
-    }
-
     /// Binds pipeline, texture, and shared quad buffers once for a render pass.
     /// Returns the previously bound (texture_id, shader_id) so the caller can
     /// track state and skip redundant calls between batches.
@@ -1017,45 +878,18 @@ impl Renderer {
         shader_id: Option<usize>,
         replace_blend: bool,
     ) {
-        self.bind_pass_state_with_watch_overlay(
-            r_pass,
-            texture_id,
-            shader_id,
-            replace_blend,
-            false,
-        );
-    }
-
-    pub fn bind_pass_state_with_watch_overlay(
-        &self,
-        r_pass: &mut RenderPass<'_>,
-        texture_id: Option<usize>,
-        shader_id: Option<usize>,
-        replace_blend: bool,
-        watch_overlay: bool,
-    ) {
         let texture = self.textures.get(texture_id);
         texture.bind(r_pass, 0);
 
         let (pipeline, bindings) = self
             .pipelines
-            .resolve_with_replace(shader_id, replace_blend, watch_overlay, texture.is_array())
-            .expect("watch overlay pipeline support should be checked before drawing");
+            .resolve_with_replace(shader_id, replace_blend, texture.is_array())
+            .expect("pipelines should be compiled before drawing");
         r_pass.set_pipeline(pipeline);
         self.bind_custom(r_pass, bindings);
 
         r_pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
         r_pass.set_index_buffer(self.quad_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-    }
-
-    pub fn supports_watch_overlay_pipeline(&self, shader_id: Option<usize>) -> bool {
-        self.pipelines.supports_watch_overlay(shader_id)
-    }
-
-    /// Whether the device can capture the watch overlay. egor's own pipelines for it may still be compiling
-    /// ([`Self::startup_pipelines_ready`]).
-    pub fn supports_watch_overlay_capture(&self) -> bool {
-        self.pipelines.watch_overlay_supported()
     }
 
     /// Draws a geometry batch. Call [`bind_pass_state`] first to set pipeline/texture.
@@ -1075,37 +909,6 @@ impl Renderer {
         current_camera_offset: &mut u32,
         quad_bound: &mut bool,
     ) -> u32 {
-        self.draw_batch_with_watch_overlay(
-            r_pass,
-            batch,
-            texture_id,
-            shader_id,
-            replace_blend,
-            camera_offset,
-            current_texture,
-            current_shader,
-            current_replace_blend,
-            current_camera_offset,
-            quad_bound,
-            false,
-        )
-    }
-
-    pub fn draw_batch_with_watch_overlay<'a>(
-        &'a self,
-        r_pass: &mut RenderPass<'a>,
-        batch: &mut GeometryBatch,
-        texture_id: Option<usize>,
-        shader_id: Option<usize>,
-        replace_blend: bool,
-        camera_offset: u32,
-        current_texture: &mut Option<usize>,
-        current_shader: &mut Option<usize>,
-        current_replace_blend: &mut bool,
-        current_camera_offset: &mut u32,
-        quad_bound: &mut bool,
-        watch_overlay: bool,
-    ) -> u32 {
         if batch.is_empty() {
             return 0;
         }
@@ -1124,7 +927,6 @@ impl Renderer {
             current_camera_offset,
             quad_bound,
             None,
-            watch_overlay,
         )
     }
 
@@ -1144,7 +946,6 @@ impl Renderer {
         current_camera_offset: &mut u32,
         quad_bound: &mut bool,
         external_instances: Option<(&'a Buffer, u64)>,
-        watch_overlay: bool,
     ) -> u32 {
         let texture = self.textures.get(texture_id);
         let texture_array = texture.is_array();
@@ -1170,14 +971,14 @@ impl Renderer {
             if outlined {
                 let pipeline = self
                     .pipelines
-                    .resolve_outline(watch_overlay, texture_array)
-                    .expect("watch mask pipeline support should be checked before drawing");
+                    .resolve_outline(texture_array)
+                    .expect("pipelines should be compiled before drawing");
                 r_pass.set_pipeline(pipeline);
             } else {
                 let (pipeline, bindings) = self
                     .pipelines
-                    .resolve_with_replace(shader_id, replace_blend, watch_overlay, texture_array)
-                    .expect("watch mask pipeline support should be checked before drawing");
+                    .resolve_with_replace(shader_id, replace_blend, texture_array)
+                    .expect("pipelines should be compiled before drawing");
                 r_pass.set_pipeline(pipeline);
                 self.bind_custom(r_pass, bindings);
             }
@@ -1227,41 +1028,6 @@ impl Renderer {
         shared_buf: &'a Buffer,
         instance_byte_offset: u64,
     ) -> u32 {
-        self.draw_batch_shared_with_watch_overlay(
-            r_pass,
-            batch,
-            texture_id,
-            shader_id,
-            replace_blend,
-            camera_offset,
-            current_texture,
-            current_shader,
-            current_replace_blend,
-            current_camera_offset,
-            quad_bound,
-            shared_buf,
-            instance_byte_offset,
-            false,
-        )
-    }
-
-    pub fn draw_batch_shared_with_watch_overlay<'a>(
-        &'a self,
-        r_pass: &mut RenderPass<'a>,
-        batch: &mut GeometryBatch,
-        texture_id: Option<usize>,
-        shader_id: Option<usize>,
-        replace_blend: bool,
-        camera_offset: u32,
-        current_texture: &mut Option<usize>,
-        current_shader: &mut Option<usize>,
-        current_replace_blend: &mut bool,
-        current_camera_offset: &mut u32,
-        quad_bound: &mut bool,
-        shared_buf: &'a Buffer,
-        instance_byte_offset: u64,
-        watch_overlay: bool,
-    ) -> u32 {
         if batch.is_empty() {
             return 0;
         }
@@ -1280,7 +1046,6 @@ impl Renderer {
             current_camera_offset,
             quad_bound,
             Some((shared_buf, instance_byte_offset)),
-            watch_overlay,
         )
     }
 

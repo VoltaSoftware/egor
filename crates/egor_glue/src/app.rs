@@ -185,7 +185,6 @@ fn draw_batches<'a>(
     turn: SurfaceTransform,
     camera_slot_stride: u32,
     instance_byte_offsets: &[u64],
-    watch_pass: bool,
 ) -> u32 {
     let Some(first) = batches[range.clone()]
         .iter()
@@ -193,12 +192,11 @@ fn draw_batches<'a>(
     else {
         return 0;
     };
-    renderer.bind_pass_state_with_watch_overlay(
+    renderer.bind_pass_state(
         r_pass,
         first.texture_id,
         first.shader_id,
         first.replace_blend,
-        watch_pass,
     );
     let mut cur_tex = first.texture_id;
     let mut cur_shd = first.shader_id;
@@ -242,7 +240,7 @@ fn draw_batches<'a>(
         }
         let offset = (camera_slot_base + batch.camera_slot) * camera_slot_stride;
         draw_calls += if let Some(shared_buf) = renderer.shared_instance_buffer() {
-            renderer.draw_batch_shared_with_watch_overlay(
+            renderer.draw_batch_shared(
                 r_pass,
                 &mut batch.geometry,
                 batch.texture_id,
@@ -256,10 +254,9 @@ fn draw_batches<'a>(
                 &mut quad_bound,
                 shared_buf,
                 instance_byte_offsets[idx],
-                watch_pass,
             )
         } else {
-            renderer.draw_batch_with_watch_overlay(
+            renderer.draw_batch(
                 r_pass,
                 &mut batch.geometry,
                 batch.texture_id,
@@ -271,7 +268,6 @@ fn draw_batches<'a>(
                 &mut cur_replace_blend,
                 &mut cur_cam_offset,
                 &mut quad_bound,
-                watch_pass,
             )
         };
     }
@@ -334,83 +330,6 @@ impl CaptureFrameTarget {
 
     fn view(&self) -> &egor_render::wgpu::TextureView {
         &self.view
-    }
-}
-
-struct WatchFrameTarget {
-    _color_texture: egor_render::Texture,
-    color_view: egor_render::wgpu::TextureView,
-    _overlay_texture: egor_render::Texture,
-    overlay_view: egor_render::wgpu::TextureView,
-    width: u32,
-    height: u32,
-    format: TextureFormat,
-}
-
-impl WatchFrameTarget {
-    fn new(device: &egor_render::Device, width: u32, height: u32, format: TextureFormat) -> Self {
-        let width = width.max(1);
-        let height = height.max(1);
-        let color_texture = device.create_texture(&egor_render::wgpu::TextureDescriptor {
-            label: Some("Watch Frame Color Target"),
-            size: egor_render::wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: egor_render::wgpu::TextureDimension::D2,
-            format,
-            usage: egor_render::wgpu::TextureUsages::RENDER_ATTACHMENT
-                | egor_render::wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let color_view = color_texture.create_view(&Default::default());
-
-        let overlay_texture = device.create_texture(&egor_render::wgpu::TextureDescriptor {
-            label: Some("Watch Frame Dynamic Overlay Target"),
-            size: egor_render::wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: egor_render::wgpu::TextureDimension::D2,
-            format: TextureFormat::Rgba8Unorm,
-            usage: egor_render::wgpu::TextureUsages::RENDER_ATTACHMENT
-                | egor_render::wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let overlay_view = overlay_texture.create_view(&Default::default());
-
-        Self {
-            _color_texture: color_texture,
-            color_view,
-            _overlay_texture: overlay_texture,
-            overlay_view,
-            width,
-            height,
-            format,
-        }
-    }
-
-    fn ensure(
-        slot: &mut Option<Self>,
-        device: &egor_render::Device,
-        width: u32,
-        height: u32,
-        format: TextureFormat,
-    ) {
-        let width = width.max(1);
-        let height = height.max(1);
-        let needs_new = slot.as_ref().is_none_or(|target| {
-            target.width != width || target.height != height || target.format != format
-        });
-        if needs_new {
-            *slot = Some(Self::new(device, width, height, format));
-        }
     }
 }
 
@@ -573,15 +492,10 @@ pub struct App {
     renderer_backend: RendererBackendPreference,
     render_targets: RenderTargetStore,
     screen_capture: ScreenCaptureState,
-    prewarm_watch_capture: bool,
-    /// The watch renderer's warm-up draw, waiting for the pipelines it draws with.
-    watch_warmup_pending: bool,
     pipeline_cache_dir: Option<std::path::PathBuf>,
     fps_limit: Option<u16>,
     native_refresh_rate_fps: Option<u16>,
     capture_frame_target: Option<CaptureFrameTarget>,
-    watch_frame_target: Option<WatchFrameTarget>,
-    watch_overlay_capture_unsupported_logged: bool,
     offscreen_batches: Vec<PrimitiveBatch>,
     instance_byte_offsets: Vec<u64>,
     surface_acquire_retry_interval: Option<Duration>,
@@ -623,14 +537,10 @@ impl App {
             primitive_batch: PrimitiveBatch::default(),
             render_targets: RenderTargetStore::new(),
             screen_capture: ScreenCaptureState::new(),
-            prewarm_watch_capture: false,
-            watch_warmup_pending: false,
             pipeline_cache_dir: None,
             fps_limit: None,
             native_refresh_rate_fps: None,
             capture_frame_target: None,
-            watch_frame_target: None,
-            watch_overlay_capture_unsupported_logged: false,
             offscreen_batches: Vec::new(),
             instance_byte_offsets: Vec::new(),
             surface_acquire_retry_interval: None,
@@ -666,148 +576,12 @@ impl App {
         self
     }
 
-    /// Prepare watch shaders and reserve the full-size watch attachments
-    /// during initialization, so starting/stopping watch does not allocate
-    /// them during gameplay. Downsample/readback buffers remain on demand.
-    pub fn prewarm_watch_capture(mut self) -> Self {
-        self.prewarm_watch_capture = true;
-        self
-    }
-
     /// Keeps the GPU driver's compiled pipelines in this directory between runs, where the driver can
     /// (Vulkan), so pipelines compiled once don't cost a phone tens of milliseconds each again. Save it with
     /// `Graphics::save_pipeline_cache` after compiling them.
     pub fn pipeline_cache_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
         self.pipeline_cache_dir = Some(dir.into());
         self
-    }
-
-    /// Takes in capture pipelines compiled since the last frame. Once they and egor's own are in, warms up the
-    /// watch renderer if the app asked for that.
-    fn advance_capture_pipelines(&mut self, renderer: &mut Renderer, window: &Window) {
-        self.screen_capture.advance_pipeline_build(renderer.device());
-        if !self.watch_warmup_pending {
-            return;
-        }
-        let Some(backbuffer) = self.backbuffer.as_ref() else {
-            return;
-        };
-        let (format, turn) = (backbuffer.format(), backbuffer.transform());
-        if !self.screen_capture.pipelines_ready(format, turn) {
-            // The surface may have turned since the build started.
-            self.screen_capture.build_pipelines(
-                renderer.device(),
-                format,
-                turn,
-                renderer.allows_worker_threads(),
-            );
-            return;
-        }
-        // The warm-up releases the capture buffers, so it waits for a requested capture to be taken.
-        if !renderer.startup_pipelines_ready() || self.screen_capture.is_requested() {
-            return;
-        }
-        self.watch_warmup_pending = false;
-        let size = window_surface_size(window);
-        let (w, h) = egor_render::target::fit_to_texture_limit(
-            renderer.device(),
-            size.width.max(1),
-            size.height.max(1),
-        );
-        self.prepare_watch_renderer(renderer, format, w, h);
-    }
-
-    /// Draws once through the watch and capture pipelines, which are compiled by now.
-    fn prepare_watch_renderer(
-        &mut self,
-        renderer: &mut Renderer,
-        format: TextureFormat,
-        width: u32,
-        height: u32,
-    ) {
-        let started_at = Instant::now();
-        let (device, queue) = (renderer.device().clone(), renderer.queue().clone());
-        let turn = self
-            .backbuffer
-            .as_ref()
-            .map_or(SurfaceTransform::Identity, Backbuffer::transform);
-
-        // Some GL drivers defer compilation until the first draw. Exercise
-        // the built-in watch and downsample pipelines during initialization.
-        // Keep the full-size attachments initialized: Adreno also defers their
-        // allocation/clear until submission. No surface or GPU wait is used.
-        let target = WatchFrameTarget::new(&device, width, height, format);
-        let presented = CaptureFrameTarget::new(&device, width, height, format);
-        renderer.ensure_depth_size(width, height);
-        let targets_made_in = started_at.elapsed();
-        let depth_view = renderer.depth_view().clone();
-        let mut encoder = device.create_command_encoder(&Default::default());
-        let mut batch = egor_render::batch::GeometryBatch::new(4, 6);
-        renderer.upload_camera_matrix(glam::Mat4::IDENTITY.to_cols_array_2d());
-        for replace_blend in [false, true] {
-            batch.push_instance(Instance::new(
-                [2.0, 0.0, 0.0, 2.0],
-                [-1.0, -1.0, 0.0],
-                [1.0; 4],
-                [0.0, 0.0, 1.0, 1.0],
-            ));
-            let mut pass = renderer.begin_render_pass_with_watch_overlay_depth_clear_color(
-                &mut encoder,
-                &target.color_view,
-                &target.overlay_view,
-                &depth_view,
-                egor_render::wgpu::Color::TRANSPARENT,
-                true,
-            );
-            renderer.bind_pass_state_with_watch_overlay(&mut pass, None, None, replace_blend, true);
-            let (mut texture, mut shader, mut blend, mut camera, mut quad_bound) =
-                (None, None, replace_blend, u32::MAX, true);
-            renderer.draw_batch_with_watch_overlay(
-                &mut pass,
-                &mut batch,
-                None,
-                None,
-                replace_blend,
-                0,
-                &mut texture,
-                &mut shader,
-                &mut blend,
-                &mut camera,
-                &mut quad_bound,
-                true,
-            );
-        }
-        for grayscale in [false, true] {
-            self.screen_capture
-                .request_watch_overlay_capture(8, 8, 8, 8, 1, grayscale, None, None, None);
-            self.screen_capture.capture_from_watch_overlay(
-                &device,
-                &queue,
-                &mut encoder,
-                &target.overlay_view,
-                8,
-                8,
-                format.is_srgb(),
-            );
-        }
-        self.screen_capture.present_sampled_view(
-            &device,
-            &mut encoder,
-            &target.color_view,
-            &presented.view,
-            format,
-            turn,
-        );
-        if let Err(error) = renderer.try_submit_commands(encoder.finish()) {
-            log::warn!("[egor] watch pipeline warmup submission failed: {error:?}");
-        }
-        self.screen_capture.release_buffers();
-        self.watch_frame_target = Some(target);
-        log::info!(
-            "[egor] watch renderer warmed up in {} ms ({} ms making its {width}x{height} targets)",
-            started_at.elapsed().as_millis(),
-            targets_made_in.as_millis()
-        );
     }
 
     /// Set window icon
@@ -1071,10 +845,7 @@ impl App {
         self.backbuffer = None;
         self.render_targets = RenderTargetStore::new();
         self.screen_capture = ScreenCaptureState::new();
-        self.watch_warmup_pending = false;
         self.capture_frame_target = None;
-        self.watch_frame_target = None;
-        self.watch_overlay_capture_unsupported_logged = false;
         self.primitive_batch.drop_gpu_resources();
         self.offscreen_batches.clear();
         self.instance_byte_offsets.clear();
@@ -1262,30 +1033,11 @@ impl AppHandler<Renderer> for App {
             self.gpu_device_recreated_pending_frame = true;
             log::warn!("[egor] GPU renderer recreation complete");
         }
-        let (device, format) = (
-            renderer.device(),
-            self.backbuffer
-                .as_ref()
-                .map(RenderTarget::format)
-                .unwrap_or_else(|| renderer.surface_format()),
-        );
         if let Some(backbuffer) = self.backbuffer.as_mut() {
-            backbuffer.set_vsync(device, hardware_vsync_enabled(self.vsync, self.fps_limit));
-        }
-        if self.prewarm_watch_capture && renderer.supports_watch_overlay_capture() {
-            // The pipelines compile away from this thread; the watch renderer warms up on the first frame they
-            // and egor's own are in.
-            let turn = self
-                .backbuffer
-                .as_ref()
-                .map_or(SurfaceTransform::Identity, Backbuffer::transform);
-            self.screen_capture.prewarm_watch_pipelines(
-                device,
-                format,
-                turn,
-                renderer.allows_worker_threads(),
+            backbuffer.set_vsync(
+                renderer.device(),
+                hardware_vsync_enabled(self.vsync, self.fps_limit),
             );
-            self.watch_warmup_pending = true;
         }
         if let Some(fps_limit) = self.fps_limit {
             set_native_preferred_fps(window, fps_limit);
@@ -1467,7 +1219,9 @@ impl AppHandler<Renderer> for App {
             return;
         }
 
-        self.advance_capture_pipelines(renderer, _window);
+        // Takes in capture pipelines compiled since the last frame.
+        self.screen_capture
+            .advance_pipeline_build(renderer.device());
 
         let Some(backbuffer) = &mut self.backbuffer else {
             self.frame_timer_reset_requested = true;
@@ -1581,9 +1335,6 @@ impl AppHandler<Renderer> for App {
 
         let prep_started_at = Instant::now();
         if self.screen_capture.take_buffers_released() {
-            if !self.prewarm_watch_capture {
-                self.watch_frame_target = None;
-            }
             self.capture_frame_target = None;
         }
 
@@ -1639,46 +1390,7 @@ impl AppHandler<Renderer> for App {
             self.screen_capture.pipelines_ready(format, surface_turn)
                 && renderer.startup_pipelines_ready()
         };
-        let mut capture_active = capture_ready;
-        let mut capture_source_render_target = capture_ready
-            .then(|| self.screen_capture.requested_source_render_target())
-            .flatten();
-        let mut use_watch_frame_target =
-            capture_ready && self.screen_capture.is_watch_overlay_capture_requested();
-        if use_watch_frame_target {
-            let unsupported_capture = !renderer.supports_watch_overlay_capture();
-            let unsupported_shader = batches
-                .iter()
-                .filter(|batch| batch.render_target.is_none())
-                .find_map(|batch| {
-                    (!renderer.supports_watch_overlay_pipeline(batch.shader_id))
-                        .then_some(batch.shader_id)
-                });
-            if unsupported_capture || unsupported_shader.is_some() {
-                if unsupported_capture {
-                    if !self.watch_overlay_capture_unsupported_logged {
-                        log::warn!(
-                            "[egor] watch overlay capture skipped: backend does not support the dynamic overlay MRT path"
-                        );
-                        self.watch_overlay_capture_unsupported_logged = true;
-                    }
-                } else {
-                    log::warn!(
-                        "[egor] watch overlay capture skipped: unsupported main-pass shader {:?}",
-                        unsupported_shader.flatten()
-                    );
-                }
-                self.screen_capture.cancel_request();
-                capture_active = false;
-                capture_source_render_target = None;
-                use_watch_frame_target = false;
-            } else {
-                WatchFrameTarget::ensure(&mut self.watch_frame_target, &device, w, h, format);
-            }
-        }
-        let use_capture_frame_target = capture_active
-            && !use_watch_frame_target
-            && capture_source_render_target.is_none()
+        let use_capture_frame_target = capture_ready
             && (!backbuffer.supports_copy_src() || surface_turn != SurfaceTransform::Identity);
         if use_capture_frame_target {
             CaptureFrameTarget::ensure(&mut self.capture_frame_target, &device, w, h, format);
@@ -1691,8 +1403,8 @@ impl AppHandler<Renderer> for App {
             None
         };
         // The main pass draws turned only when it draws straight into the backbuffer; the
-        // frame targets are blitted into it turned instead.
-        let main_turn = if use_watch_frame_target || use_capture_frame_target {
+        // capture frame target is blitted into it turned instead.
+        let main_turn = if use_capture_frame_target {
             SurfaceTransform::Identity
         } else {
             surface_turn
@@ -1812,19 +1524,7 @@ impl AppHandler<Renderer> for App {
         frame_stats.prep_time += upload_started_at.elapsed();
         frame_stats.instance_upload = renderer.instance_upload_metrics();
 
-        let watch_frame_target = if use_watch_frame_target {
-            self.watch_frame_target.as_ref()
-        } else {
-            None
-        };
-        let main_view = watch_frame_target
-            .map(|target| &target.color_view)
-            .or(capture_frame_view)
-            .unwrap_or(&frame.view);
-        // The watch color attachments have the backbuffer's dimensions and
-        // replace its main pass, so they can share the existing depth target.
-        let main_depth_view = renderer.depth_view();
-        let watch_overlay_view = watch_frame_target.map(|target| &target.overlay_view);
+        let main_view = capture_frame_view.unwrap_or(&frame.view);
 
         let render_pass_started_at = Instant::now();
         {
@@ -1880,25 +1580,13 @@ impl AppHandler<Renderer> for App {
                         SurfaceTransform::Identity,
                         stride,
                         &self.instance_byte_offsets,
-                        false,
                     );
                 }
             }
 
             {
-                let watch_pass = use_watch_frame_target;
-                let mut r_pass = if watch_pass {
-                    renderer.begin_render_pass_with_watch_overlay_depth_clear_color(
-                        &mut frame.encoder,
-                        main_view,
-                        watch_overlay_view.expect("watch overlay view"),
-                        main_depth_view,
-                        renderer.clear_color(),
-                        true,
-                    )
-                } else {
-                    renderer.begin_render_pass_discard_depth(&mut frame.encoder, main_view)
-                };
+                let mut r_pass =
+                    renderer.begin_render_pass_discard_depth(&mut frame.encoder, main_view);
                 let batch_count = batches.len();
                 frame_stats.draw_calls += draw_batches(
                     renderer,
@@ -1910,7 +1598,6 @@ impl AppHandler<Renderer> for App {
                     main_turn,
                     stride,
                     &self.instance_byte_offsets,
-                    watch_pass,
                 );
             }
 
@@ -1922,7 +1609,7 @@ impl AppHandler<Renderer> for App {
         let screen_capture_started_at = Instant::now();
         if let Some(source_rt_id) = self.screen_capture.take_composite_render_target() {
             #[cfg(feature = "profiling")]
-            profiling::scope!("watch_composite");
+            profiling::scope!("composite");
             let source_view = self.render_targets.get(source_rt_id).view();
             self.screen_capture.composite_sampled_view(
                 &device,
@@ -1936,36 +1623,10 @@ impl AppHandler<Renderer> for App {
 
         // Screen capture: blit-downsample the final frame into a small capture
         // texture and encode a copy_texture_to_buffer for async readback.
-        if capture_active {
+        if capture_ready {
             #[cfg(feature = "profiling")]
             profiling::scope!("screen_capture");
-            if let Some(watch_target) = watch_frame_target {
-                self.screen_capture.capture_from_watch_overlay(
-                    &device,
-                    &queue,
-                    &mut frame.encoder,
-                    &watch_target.overlay_view,
-                    w,
-                    h,
-                    format.is_srgb(),
-                );
-                self.screen_capture.present_sampled_view(
-                    &device,
-                    &mut frame.encoder,
-                    &watch_target.color_view,
-                    &frame.view,
-                    format,
-                    surface_turn,
-                );
-            } else if let Some(source_rt_id) = capture_source_render_target {
-                let source_view = self.render_targets.get(source_rt_id).view();
-                self.screen_capture.capture_from_sampled_view(
-                    &device,
-                    &mut frame.encoder,
-                    source_view,
-                    format.is_srgb(),
-                );
-            } else if let Some(source_view) = capture_frame_view {
+            if let Some(source_view) = capture_frame_view {
                 self.screen_capture.capture_from_sampled_view(
                     &device,
                     &mut frame.encoder,
@@ -1994,7 +1655,7 @@ impl AppHandler<Renderer> for App {
                     eprintln!(
                         "[egor] Screen capture requested but no backbuffer texture available"
                     );
-                    self.screen_capture.request(0, 0, false);
+                    self.screen_capture.cancel_request();
                 }
             }
         }
@@ -2029,7 +1690,7 @@ impl AppHandler<Renderer> for App {
             {
                 #[cfg(feature = "profiling")]
                 profiling::scope!("readback_dispatch");
-                if capture_active {
+                if capture_ready {
                     self.screen_capture.begin_readback_map();
                 }
                 self.screen_capture.dispatch_submitted_readbacks();
@@ -2052,7 +1713,7 @@ impl AppHandler<Renderer> for App {
         // Start the async map AFTER submit so the staging buffer isn't
         // in a pending-map state when the command buffer is submitted.
         #[cfg(not(target_os = "windows"))]
-        if capture_active {
+        if capture_ready {
             self.screen_capture.begin_readback_map();
         }
 
