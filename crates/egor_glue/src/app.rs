@@ -476,6 +476,18 @@ impl FrameStats {
     }
 }
 
+/// How long recovery on the web waits before each new try at a renderer, about a minute in all: a browser can
+/// refuse new GPU contexts for a while after GPU resets, as Chrome's WebGPU did right after a third in a row.
+#[cfg(target_arch = "wasm32")]
+const WEB_RECOVERY_RETRY_DELAYS: [Duration; 6] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+];
+
 pub struct App {
     events: Vec<WindowEvent>,
     events_drained: Vec<WindowEvent>,
@@ -881,6 +893,8 @@ impl App {
     }
 
     async fn create_renderer_with_retry(&self, window: Arc<Window>) -> Renderer {
+        #[cfg(target_arch = "wasm32")]
+        let mut retry_delays = WEB_RECOVERY_RETRY_DELAYS.iter();
         loop {
             match Renderer::try_new_with_backend(
                 window.clone(),
@@ -892,11 +906,24 @@ impl App {
             {
                 Ok(renderer) => return renderer,
                 Err(error) => {
-                    log::error!("[egor] renderer init failed: {error:?}; retrying");
                     #[cfg(not(target_arch = "wasm32"))]
-                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                    {
+                        log::error!("[egor] renderer init failed: {error:?}; retrying");
+                        std::thread::sleep(std::time::Duration::from_millis(1000));
+                    }
                     #[cfg(target_arch = "wasm32")]
-                    panic!("failed to initialize egor renderer after GPU recovery: {error:?}");
+                    {
+                        // Starting, a failure is for the page to report; recovering, the browser may come back.
+                        let delay = self
+                            .renderer_recreate_in_progress
+                            .then(|| retry_delays.next())
+                            .flatten();
+                        let Some(&delay) = delay else {
+                            panic!("failed to initialize egor renderer: {error:?}");
+                        };
+                        log::error!("[egor] renderer init failed: {error:?}; retrying in {delay:?}");
+                        egor_app::time::sleep(delay).await;
+                    }
                 }
             }
         }

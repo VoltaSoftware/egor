@@ -12,6 +12,21 @@ fn now() -> f64 {
     web_sys::window().unwrap().performance().unwrap().now() / 1000.0
 }
 
+/// Waits `duration` without holding up the browser.
+#[cfg(target_arch = "wasm32")]
+pub async fn sleep(duration: std::time::Duration) {
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        let millis = i32::try_from(duration.as_millis()).unwrap_or(i32::MAX);
+        let timer = web_sys::window().map(|window| {
+            window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, millis)
+        });
+        if !matches!(timer, Some(Ok(_))) {
+            let _ = resolve.call0(&wasm_bindgen::JsValue::UNDEFINED);
+        }
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+}
+
 #[cfg(target_arch = "wasm32")]
 fn request_web_page_lifecycle_reset() {
     WEB_PAGE_LIFECYCLE_RESET_REQUESTED.with(|requested| requested.set(true));
