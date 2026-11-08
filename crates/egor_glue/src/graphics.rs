@@ -253,6 +253,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+#[cfg(not(target_arch = "wasm32"))]
 fn decode_readback_into(
     buffer: &Buffer,
     dst: &mut Vec<u8>,
@@ -1388,7 +1389,14 @@ impl ScreenCaptureState {
             }
         };
 
-        decode_readback_into(&buffer, &mut self.rgb_buf, cap_w, cap_h, row_pitch);
+        // Device loss can invalidate a range after the mapping callback succeeds.
+        let Ok(data) = buffer.slice(..).get_mapped_range() else {
+            self.slots[idx].pending = false;
+            self.slots[idx].buf_size = 0;
+            return;
+        };
+        decode_readback_bytes(&data, &mut self.rgb_buf, cap_w, cap_h, row_pitch);
+        drop(data);
         let conversion_us = complete_start.elapsed().as_micros() as u64;
         buffer.unmap();
         let complete_us = complete_start.elapsed().as_micros() as u64;
