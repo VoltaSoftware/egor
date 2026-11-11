@@ -13,9 +13,6 @@ use wasm_bindgen::JsCast;
 
 use crate::frame::Presentable;
 
-#[cfg(target_os = "android")]
-const DESIRED_MAXIMUM_FRAME_LATENCY: u32 = 1;
-#[cfg(not(target_os = "android"))]
 const DESIRED_MAXIMUM_FRAME_LATENCY: u32 = 2;
 
 /// The largest size with the same aspect ratio that `device` can render to. A window bigger than the
