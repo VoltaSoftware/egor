@@ -110,6 +110,8 @@ fn configure_renderer_instance_flags(desc: &mut InstanceDescriptor) {
     // Android emulator Vulkan drivers can crash inside vk_common_SetDebugUtilsObjectNameEXT
     // when wgpu DEBUG labels objects. Keep validation requested, but skip driver debug labels.
     desc.flags.remove(wgpu::InstanceFlags::DEBUG);
+    // Adreno drivers can crash in glPushDebugGroup even with GL_DEBUG_OUTPUT disabled.
+    desc.backend_options.gl.debug_fns = wgpu::GlDebugFns::Disabled;
 }
 
 #[cfg(not(target_os = "android"))]
