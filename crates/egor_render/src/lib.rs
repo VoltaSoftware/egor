@@ -510,7 +510,9 @@ impl Renderer {
         let (depth_texture, depth_view) = Self::create_depth_texture(&device, 1, 1);
         log::info!("[egor] renderer init: complete");
 
-        let instance_upload_pool = (cfg!(target_os = "windows")
+        // WebGL emulates MAP_WRITE in WASM memory. Reuse completed staging buffers so each
+        // sprite frame does not allocate another host buffer for the queue write.
+        let instance_upload_pool = (cfg!(any(target_os = "windows", target_arch = "wasm32"))
             && adapter.get_info().backend == wgpu::Backend::Gl)
             .then(instance_upload::InstanceUploadPool::default);
         Ok(Renderer {
